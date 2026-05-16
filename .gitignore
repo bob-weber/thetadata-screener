@@ -1,0 +1,29 @@
+# Credentials — never commit
+creds.txt
+
+# ThetaData terminal binary and downloaded server jars
+ThetaTerminalv3.jar
+lib/
+
+# Scan cache files (regenerated on each run)
+*_cache.json
+options_results_cache.json
+
+# Logs
+*.log
+
+# Python virtual environments
+gui-env/
+thetadata-env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code local settings
+.claude/
+
+# Editor / OS
+.DS_Store
+*.swp
