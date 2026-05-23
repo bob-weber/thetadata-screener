@@ -45,8 +45,6 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
   - `apply_contract_adjustments()` — re-scores per-contract based on OTM% (handles ITM, near-ATM, comfortable, conservative bands).
   - Grading: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F < 40.
 
-- **`watchlist.py`** — builds the symbol watchlist; called from the GUI's Watchlist Builder dialog.
-
 ### GUI (`gui/`)
 
 Built with PyQt6. `run_gui.py` invokes `start_terminal.sh` before creating the `QApplication`, and hooks `stop_terminal.sh` to `aboutToQuit`.
