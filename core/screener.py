@@ -11,6 +11,14 @@ import numpy as np
 
 THETA_BASE = "http://127.0.0.1:25503"
 
+
+def _last_trading_day(ref: date) -> date:
+    """Return the most recent weekday strictly before ref."""
+    d = ref - timedelta(days=1)
+    while d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        d -= timedelta(days=1)
+    return d
+
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 VALID_EXCHANGES  = {"NYSE", "Nasdaq", "NYSE MKT"}
 
@@ -64,6 +72,54 @@ def find_close_col(df: pd.DataFrame) -> str | None:
             return name
     numeric = df.select_dtypes(include=[np.number]).columns.tolist()
     return numeric[-1] if numeric else None
+
+
+def fetch_stock_prices(
+    symbols: list[str],
+    on_log=None,
+    on_progress=None,
+    stop_flag=None,
+    throttle: float = 0.1,
+) -> list[dict]:
+    """Fetch the latest EOD close price for each symbol. Returns [{symbol, price}, ...]."""
+    from thetadata import ThetaClient
+    from thetadata.errors import AuthenticationError
+
+    if on_log:
+        on_log("Connecting to ThetaData terminal …")
+    try:
+        client = ThetaClient(dataframe_type="pandas")
+    except AuthenticationError:
+        raise ScreenerError("Authentication failed — check your ThetaData credentials.")
+
+    today      = date.today()
+    trade_date = _last_trading_day(today)
+    results    = []
+    total      = len(symbols)
+
+    for i, sym in enumerate(symbols):
+        if stop_flag and stop_flag():
+            if on_log:
+                on_log("Stopped by user.")
+            break
+        try:
+            eod = client.stock_history_eod(symbol=sym, start_date=trade_date, end_date=trade_date)
+            if eod is not None and not eod.empty:
+                close_col = find_close_col(eod)
+                if close_col:
+                    closes = eod[close_col].dropna().astype(float)
+                    if not closes.empty:
+                        results.append({"symbol": sym, "price": float(closes.iloc[-1])})
+                        if on_log:
+                            on_log(f"  {sym}: ${closes.iloc[-1]:.2f}")
+        except Exception:
+            if on_log:
+                on_log(f"  {sym}: no data")
+        if on_progress:
+            on_progress(i + 1, total)
+        time.sleep(throttle)
+
+    return results
 
 
 def fetch_option_eod_chain(symbol: str, exp: date, trade_date: date, right: str = "P") -> pd.DataFrame | None:
@@ -157,6 +213,7 @@ def run_stock_filter(
     history_cache_file: str | Path = "tech_history_cache.json",
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
     watchlist_file: str | Path | None = None,
+    skip_candidates_cache: bool = False,
 ) -> list[dict]:
     from thetadata import ThetaClient
     from thetadata.errors import AuthenticationError
@@ -171,7 +228,7 @@ def run_stock_filter(
     stock_throttle   = config.get("stock_throttle",    0.1)
 
     today      = date.today()
-    trade_date = today - timedelta(days=1)
+    trade_date = _last_trading_day(today)
     hist_start = today - timedelta(days=45)
 
     price_key = {
@@ -189,7 +246,7 @@ def run_stock_filter(
 
     # ── Candidates cache (all params match → return immediately) ──────────────
     cand_path = Path(candidates_cache_file)
-    if cand_path.exists():
+    if not skip_candidates_cache and cand_path.exists():
         try:
             cached = json.loads(cand_path.read_text())
             if all(cached.get(k) == v for k, v in full_key.items()):
@@ -380,7 +437,12 @@ def run_stock_filter(
     if on_log:
         on_log(f"Technical filter done — {len(tech_candidates)} candidates.")
 
-    cand_path.write_text(json.dumps({**full_key, "candidates": tech_candidates}))
+    from datetime import datetime
+    cand_path.write_text(json.dumps({
+        **full_key,
+        "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "candidates": tech_candidates,
+    }))
     return tech_candidates
 
 
@@ -399,7 +461,7 @@ def run_options_filter(
     price_col        = "bid" if side == "sell" else "ask"
 
     today      = date.today()
-    trade_date = today - timedelta(days=1)
+    trade_date = _last_trading_day(today)
 
     exp_date_str = config.get("expiration_date")
     if exp_date_str:

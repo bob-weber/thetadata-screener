@@ -34,6 +34,7 @@ class StockWorker(QThread):
                 on_pass2_progress=lambda c, t: self.pass2_progress.emit(c, t),
                 stop_flag=lambda: self._stop,
                 watchlist_file=self._watchlist,
+                skip_candidates_cache=True,
             )
             self.finished.emit(results)
         except ScreenerError as e:
@@ -49,17 +50,18 @@ class OptionsWorker(QThread):
     finished          = pyqtSignal(list)
     error             = pyqtSignal(str)
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, positions: list[str] | None = None):
         super().__init__()
-        self._config = config
-        self._stop   = False
+        self._config    = config
+        self._positions = positions  # None → use stock scan cache; list → fetch prices live
+        self._stop      = False
 
     def stop(self):
         self._stop = True
 
     def _cache_key(self) -> dict:
         c = self._config
-        return {
+        key = {
             "date":            date.today().isoformat(),
             "expiration_date": c.get("expiration_date"),
             "right":           c.get("right", "P"),
@@ -67,46 +69,71 @@ class OptionsWorker(QThread):
             "yield_min":       c.get("yield_min"),
             "yield_max":       c.get("yield_max"),
         }
+        if self._positions is not None:
+            key["ticker_source"] = "positions"
+            key["positions"]     = sorted(self._positions)
+        else:
+            key["ticker_source"] = "scanner"
+        return key
 
-    def run(self):
-        from core.screener import run_options_filter, ScreenerError
-
-        # ── Load stock candidates ─────────────────────────────────────────
+    def _load_scanner_candidates(self) -> list[dict] | None:
         cand_path = Path("tech_candidates_cache.json")
         if not cand_path.exists():
             self.error.emit("No stock scan results found — run the Stock Scanner first.")
-            return
+            return None
         try:
             cached = json.loads(cand_path.read_text())
         except Exception as e:
             self.error.emit(f"Could not read stock scan cache: {e}")
-            return
-        if cached.get("date") != date.today().isoformat():
-            self.error.emit("Stock scan results are from a previous day — run the Stock Scanner first.")
-            return
+            return None
         candidates = cached.get("candidates", [])
         if not candidates:
             self.error.emit("Stock scan returned no candidates — run the Stock Scanner first.")
-            return
+            return None
+        scan_date = cached.get("date", "unknown date")
+        self.log_msg.emit(f"Loaded {len(candidates)} candidates from stock scan ({scan_date}).")
         self.candidates_loaded.emit(len(candidates))
+        return candidates
 
-        # ── Options results cache ─────────────────────────────────────────
-        key        = self._cache_key()
-        opt_path   = Path(OPTIONS_RESULTS_CACHE)
-        if opt_path.exists():
-            try:
-                opt_cached = json.loads(opt_path.read_text())
-                if all(opt_cached.get(k) == v for k, v in key.items()):
-                    self.log_msg.emit(
-                        f"Options results loaded from cache "
-                        f"({len(opt_cached['results'])} contracts)."
-                    )
-                    self.finished.emit(opt_cached["results"])
-                    return
-            except Exception:
-                pass
+    def _fetch_position_candidates(self) -> list[dict] | None:
+        from core.screener import fetch_stock_prices, ScreenerError
+        self.log_msg.emit(f"Fetching current prices for {len(self._positions)} position(s)…")
+        try:
+            candidates = fetch_stock_prices(
+                self._positions,
+                on_log=self.log_msg.emit,
+                on_progress=lambda c, t: self.opts_progress.emit(c, t),
+                stop_flag=lambda: self._stop,
+            )
+        except ScreenerError as e:
+            self.error.emit(str(e))
+            return None
+        except Exception as e:
+            self.error.emit(f"Unexpected error fetching prices: {e}")
+            return None
+        if not candidates:
+            self.error.emit("Could not fetch a current price for any of the specified tickers.")
+            return None
+        self.candidates_loaded.emit(len(candidates))
+        # Reset progress bar for the upcoming options scan
+        self.opts_progress.emit(0, len(candidates))
+        return candidates
 
-        # ── Run live scan ─────────────────────────────────────────────────
+    def run(self):
+        from core.screener import run_options_filter, ScreenerError
+
+        # ── Load or fetch candidates ──────────────────────────────────────
+        if self._positions is not None:
+            candidates = self._fetch_position_candidates()
+        else:
+            candidates = self._load_scanner_candidates()
+
+        if candidates is None:
+            return
+
+        # ── Run live scan (always; cache is only for startup pre-load) ───────
+        key      = self._cache_key()
+        opt_path = Path(OPTIONS_RESULTS_CACHE)
         try:
             results = run_options_filter(
                 candidates,
@@ -149,12 +176,10 @@ class WheelWorker(QThread):
         except Exception as e:
             self.error.emit(f"Could not read options cache: {e}")
             return
-        if cached.get("date") != date.today().isoformat():
-            self.error.emit("Options results are from a previous day — run the Options Scanner first.")
-            return
 
-        results  = cached.get("results", [])
-        exp_str  = cached.get("expiration_date", "")
+        results   = cached.get("results", [])
+        exp_str   = cached.get("expiration_date", "")
+        scan_date = cached.get("date", "unknown date")
         if not results:
             self.error.emit("Options scan returned no results — run the Options Scanner first.")
             return
@@ -168,7 +193,7 @@ class WheelWorker(QThread):
         symbols = sorted({r["symbol"] for r in results})
         self.log_msg.emit(
             f"Analyzing {len(symbols)} unique symbols for wheel suitability "
-            f"(exp {exp_str}) …"
+            f"(exp {exp_str}, scan from {scan_date}) …"
         )
 
         price_lookup: dict[str, float] = {}

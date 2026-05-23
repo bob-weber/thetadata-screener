@@ -9,6 +9,10 @@ lib/
 *_cache.json
 options_results_cache.json
 
+# User data files (personal positions / ticker lists)
+my_option_positions.json
+my_positions.txt
+
 # Logs
 *.log
 

@@ -1,11 +1,16 @@
+import json
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QFileDialog, QSplitter,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 from .workers import StockWorker
+
+CANDIDATES_CACHE = "tech_candidates_cache.json"
 
 _COLS    = ["symbol", "price", "rsi", "bb_pct"]
 _HEADERS = ["Symbol", "Price", "RSI", "BB%"]
@@ -31,12 +36,30 @@ def _make_item(val) -> QTableWidgetItem:
 
 
 class StockScannerTab(QWidget):
+    scan_finished = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self._worker       = None
         self._results_box  = None
         self._table        = None
         self._setup_ui()
+        self._load_cached_results()
+
+    def _load_cached_results(self):
+        path = Path(CANDIDATES_CACHE)
+        if not path.exists():
+            return
+        try:
+            cached = json.loads(path.read_text())
+        except Exception:
+            return
+        candidates = cached.get("candidates", [])
+        if not candidates:
+            return
+        ts = cached.get("scanned_at") or cached.get("date", "unknown")
+        self._populate_table(candidates)
+        self._results_box.setTitle(f"Results — {len(candidates)} candidates  |  last scan: {ts}")
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
@@ -207,15 +230,24 @@ class StockScannerTab(QWidget):
         self._pass1_bar.setValue(100)
         self._pass2_bar.setValue(100)
         self._log.append(f"Done — {len(results)} candidate(s) found.")
-        self._populate_table(results)
+        ts = self._read_scan_timestamp()
+        self._populate_table(results, title=f"Results — {len(results)} candidate(s)  |  last scan: {ts}")
+        self.scan_finished.emit()
+
+    def _read_scan_timestamp(self) -> str:
+        try:
+            cached = json.loads(Path(CANDIDATES_CACHE).read_text())
+            return cached.get("scanned_at") or cached.get("date", "unknown")
+        except Exception:
+            return "unknown"
 
     def _on_error(self, msg: str):
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._log.append(f"ERROR: {msg}")
 
-    def _populate_table(self, results: list):
-        self._results_box.setTitle(f"Results — {len(results)} candidate(s)")
+    def _populate_table(self, results: list, title: str | None = None):
+        self._results_box.setTitle(title or f"Results — {len(results)} candidate(s)")
         self._table.setSortingEnabled(False)
         self._table.setRowCount(len(results))
         for r, row in enumerate(results):

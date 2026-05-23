@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QPushButton, QProgressBar, QTextEdit, QTableWidget,
@@ -8,7 +11,7 @@ from PyQt6.QtGui import QColor
 
 from .claude_dialog import ClaudeAnalysisDialog
 
-from .workers import WheelWorker
+from .workers import WheelWorker, OPTIONS_RESULTS_CACHE
 
 _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct", "capital",
             "sector", "beta", "mkt_cap_b",
@@ -53,6 +56,27 @@ class WheelAnalysisTab(QWidget):
         self._results_box = None
         self._table       = None
         self._setup_ui()
+        self.refresh_options_status()
+
+    def refresh_options_status(self):
+        """Update the status label from the last options scan cache, if any."""
+        path = Path(OPTIONS_RESULTS_CACHE)
+        if not path.exists():
+            self._status_label.setText("Run the Options Scanner first.")
+            return
+        try:
+            cached = json.loads(path.read_text())
+        except Exception:
+            self._status_label.setText("Run the Options Scanner first.")
+            return
+        results   = cached.get("results", [])
+        scan_date = cached.get("date", "unknown date")
+        if results:
+            self._status_label.setText(
+                f"{len(results)} contract(s) from Options Scanner (run {scan_date})"
+            )
+        else:
+            self._status_label.setText("Run the Options Scanner first.")
 
     def _setup_ui(self):
         root = QVBoxLayout(self)

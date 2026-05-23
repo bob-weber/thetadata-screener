@@ -1,12 +1,21 @@
+import json
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter, QDateEdit,
     QRadioButton, QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QDate
+
+from PyQt6.QtCore import pyqtSignal as _pyqtSignal
 
 from .workers import OptionsWorker
+
+POSITIONS_FILE   = Path("my_positions.txt")
+CANDIDATES_CACHE = Path("tech_candidates_cache.json")
+OPTIONS_CACHE    = Path("options_results_cache.json")
 
 _COLS    = ["symbol", "expiration", "dte", "strike", "otm_pct", "premium", "yield_pct", "delta"]
 _HEADERS = ["Symbol", "Expiration", "DTE", "Strike", "OTM%", "Premium", "Yield%", "Delta"]
@@ -34,22 +43,116 @@ def _make_item(key: str, val) -> QTableWidgetItem:
 
 
 class OptionsScannerTab(QWidget):
+    scan_finished = _pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self._worker      = None
         self._results_box = None
         self._table       = None
+
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(800)
+        self._save_timer.timeout.connect(self._save_positions)
+
         self._setup_ui()
+        self._load_positions()
+        self.refresh_scanner_status()
+        self._load_cached_results()
 
     @staticmethod
     def _next_friday(q: QDate) -> QDate:
-        # Qt dayOfWeek: 1=Mon … 5=Fri … 7=Sun
         days = (5 - q.dayOfWeek()) % 7
         return q.addDays(days if days > 0 else 7)
+
+    # ── scanner status ────────────────────────────────────────────────────────
+
+    def refresh_scanner_status(self):
+        """Update the candidates label from the last stock scan cache, if any."""
+        if not self._scanner_btn.isChecked():
+            return
+        if not CANDIDATES_CACHE.exists():
+            self._candidates_label.setText("Run the Stock Scanner first.")
+            return
+        try:
+            cached = json.loads(CANDIDATES_CACHE.read_text())
+        except Exception:
+            self._candidates_label.setText("Run the Stock Scanner first.")
+            return
+        candidates = cached.get("candidates", [])
+        ts = cached.get("scanned_at") or cached.get("date", "unknown")
+        if candidates:
+            self._candidates_label.setText(
+                f"{len(candidates)} candidates from Stock Scanner  |  last scan: {ts}"
+            )
+        else:
+            self._candidates_label.setText("Run the Stock Scanner first.")
+
+    def _load_cached_results(self):
+        if not OPTIONS_CACHE.exists():
+            return
+        try:
+            cached = json.loads(OPTIONS_CACHE.read_text())
+        except Exception:
+            return
+        results = cached.get("results", [])
+        if not results:
+            return
+        scan_date = cached.get("date", "unknown date")
+        self._populate_table(results)
+        self._results_box.setTitle(f"Results — {len(results)} contract(s) (from {scan_date})")
+
+    # ── positions file helpers ────────────────────────────────────────────────
+
+    def _load_positions(self):
+        if POSITIONS_FILE.exists():
+            self._positions_edit.setPlainText(POSITIONS_FILE.read_text())
+
+    def _save_positions(self):
+        POSITIONS_FILE.write_text(self._positions_edit.toPlainText())
+
+    def _get_positions(self) -> list[str]:
+        raw = self._positions_edit.toPlainText()
+        tickers = [t.strip().upper() for t in raw.splitlines()]
+        return [t for t in tickers if t]
+
+    # ── UI construction ───────────────────────────────────────────────────────
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(6)
+
+        # ── Ticker source ─────────────────────────────────────────────────────
+        source_box = QGroupBox("Ticker Source")
+        sh = QHBoxLayout(source_box)
+        sh.setSpacing(16)
+
+        self._scanner_btn   = QRadioButton("Stock Scanner Results")
+        self._positions_btn = QRadioButton("My Positions")
+        self._scanner_btn.setChecked(True)
+        self._source_group = QButtonGroup()
+        self._source_group.addButton(self._scanner_btn,   0)
+        self._source_group.addButton(self._positions_btn, 1)
+        sh.addWidget(self._scanner_btn)
+        sh.addWidget(self._positions_btn)
+        sh.addStretch()
+        root.addWidget(source_box)
+
+        # ── My Positions editor (hidden until radio selected) ─────────────────
+        self._positions_box = QGroupBox("My Positions — one ticker per line")
+        pl = QVBoxLayout(self._positions_box)
+        self._positions_edit = QTextEdit()
+        self._positions_edit.setPlaceholderText("AAPL\nMSFT\nTSLA")
+        self._positions_edit.setFixedHeight(110)
+        self._positions_edit.textChanged.connect(self._save_timer.start)
+        pl.addWidget(self._positions_edit)
+        self._positions_box.setVisible(False)
+        root.addWidget(self._positions_box)
+
+        self._scanner_btn.toggled.connect(
+            lambda checked: self._positions_box.setVisible(not checked)
+        )
 
         # ── Parameters ────────────────────────────────────────────────────────
         params_box = QGroupBox("Parameters")
@@ -78,11 +181,11 @@ class OptionsScannerTab(QWidget):
         self._side_group.addButton(self._sell_btn, 0)
         self._side_group.addButton(self._buy_btn,  1)
         sb_row = QWidget()
-        sh = QHBoxLayout(sb_row)
-        sh.setContentsMargins(0, 0, 0, 0)
-        sh.addWidget(self._sell_btn)
-        sh.addWidget(self._buy_btn)
-        sh.addStretch()
+        sbh = QHBoxLayout(sb_row)
+        sbh.setContentsMargins(0, 0, 0, 0)
+        sbh.addWidget(self._sell_btn)
+        sbh.addWidget(self._buy_btn)
+        sbh.addStretch()
         pf.addRow("Side:", sb_row)
 
         self._exp_date = QDateEdit()
@@ -107,7 +210,7 @@ class OptionsScannerTab(QWidget):
 
         root.addWidget(params_box)
 
-        # ── Buttons + candidates status ───────────────────────────────────────
+        # ── Buttons + status ──────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         self._candidates_label = QLabel("Run the Stock Scanner first.")
         self._run_btn  = QPushButton("Run Options Scanner")
@@ -124,12 +227,12 @@ class OptionsScannerTab(QWidget):
 
         # ── Progress ──────────────────────────────────────────────────────────
         prog_box = QGroupBox("Progress")
-        pl = QFormLayout(prog_box)
+        prog_form = QFormLayout(prog_box)
         self._opts_bar   = QProgressBar()
         self._opts_label = QLabel("—")
         self._opts_bar.setRange(0, 100)
-        pl.addRow("Options scan:", self._opts_bar)
-        pl.addRow("",              self._opts_label)
+        prog_form.addRow("Options scan:", self._opts_bar)
+        prog_form.addRow("",              self._opts_label)
         root.addWidget(prog_box)
 
         # ── Splitter: log + results ───────────────────────────────────────────
@@ -177,6 +280,14 @@ class OptionsScannerTab(QWidget):
             self._log.append(f"Invalid parameter: {e}")
             return
 
+        using_positions = self._positions_btn.isChecked()
+        positions = None
+        if using_positions:
+            positions = self._get_positions()
+            if not positions:
+                self._log.append("No tickers in My Positions — add at least one ticker.")
+                return
+
         self._run_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._log.clear()
@@ -185,7 +296,12 @@ class OptionsScannerTab(QWidget):
         self._opts_bar.setValue(0)
         self._opts_label.setText("—")
 
-        self._worker = OptionsWorker(config)
+        if using_positions:
+            self._candidates_label.setText(f"{len(positions)} position(s) queued")
+        else:
+            self._candidates_label.setText("Loading stock scan results…")
+
+        self._worker = OptionsWorker(config, positions=positions)
         self._worker.log_msg.connect(self._log.append)
         self._worker.candidates_loaded.connect(self._on_candidates_loaded)
         self._worker.opts_progress.connect(self._on_opts_progress)
@@ -199,8 +315,10 @@ class OptionsScannerTab(QWidget):
         self._stop_btn.setEnabled(False)
 
     def _on_candidates_loaded(self, count: int):
-        self._candidates_label.setText(f"{count} candidates from Stock Scanner")
-        self._log.append(f"Loaded {count} candidates from stock scan cache.")
+        if self._positions_btn.isChecked():
+            self._candidates_label.setText(f"{count} position(s) with prices fetched")
+        else:
+            self._candidates_label.setText(f"{count} candidates from Stock Scanner")
 
     def _on_opts_progress(self, current: int, total: int):
         self._opts_label.setText(f"{current:,} / {total:,}")
@@ -213,12 +331,17 @@ class OptionsScannerTab(QWidget):
         self._opts_bar.setValue(100)
         self._log.append(f"Done — {len(results)} contract(s) found.")
         self._populate_table(results)
+        self._results_box.setTitle(f"Results — {len(results)} contract(s)")
+        self.scan_finished.emit()
 
     def _on_error(self, msg: str):
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._log.append(f"ERROR: {msg}")
-        self._candidates_label.setText("Run the Stock Scanner first.")
+        if self._scanner_btn.isChecked():
+            self._candidates_label.setText("Run the Stock Scanner first.")
+        else:
+            self._candidates_label.setText("Ready.")
 
     def _populate_table(self, results: list):
         self._results_box.setTitle(f"Results — {len(results)} contract(s)")
