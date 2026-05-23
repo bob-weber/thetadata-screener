@@ -4,17 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the app
 
-Two separate virtualenvs exist: `gui-env` (PyQt6 + all deps) and `thetadata-env` (headless, for CLI scripts).
+The virtualenv is `gui-env` (PyQt6 + all deps).
 
 ```bash
 # GUI application (starts the ThetaData terminal automatically)
 gui-env/bin/python run_gui.py
-
-# CLI screener (legacy standalone, uses v2 REST API on port 25510)
-thetadata-env/bin/python screener.py
-
-# Build/refresh the watchlist file (run weekly or monthly)
-thetadata-env/bin/python build_watchlist.py
 
 # Start / stop the ThetaData terminal manually
 ./start_terminal.sh
@@ -51,7 +45,7 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
   - `apply_contract_adjustments()` — re-scores per-contract based on OTM% (handles ITM, near-ATM, comfortable, conservative bands).
   - Grading: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F < 40.
 
-- **`watchlist.py`** — reusable version of the CLI `build_watchlist.py` script; called from the GUI's Watchlist Builder dialog.
+- **`watchlist.py`** — builds the symbol watchlist; called from the GUI's Watchlist Builder dialog.
 
 ### GUI (`gui/`)
 
@@ -66,11 +60,6 @@ Built with PyQt6. `run_gui.py` invokes `start_terminal.sh` before creating the `
 - **`options_tab.py`** — Options Scanner UI; can scan from stock-scan candidates or from the Positions tab tickers.
 - **`wheel_tab.py`** — Wheel Analysis UI; reads `options_results_cache.json` and calls `WheelWorker`.
 - **`positions_tab.py`** — Position tracker; persists to `my_option_positions.json`. Imports TOS Account Statement CSVs (parses the `Options` section and matches fees from `Cash Balance TRD` rows). Computes 5%/10% below strike automatically.
-
-### Standalone CLI scripts (legacy)
-
-- **`screener.py`** — self-contained put-selling screener; uses ThetaData v2 REST API on port `25510` (different from the GUI which uses v3 on `25503`). Writes per-day CSV output (`puts_YYYYMMDD.csv`).
-- **`build_watchlist.py`** — standalone watchlist builder using `tqdm` progress bars; outputs `watchlist.txt`.
 
 ### ThetaData terminal
 
