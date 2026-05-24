@@ -557,3 +557,104 @@ def _parse_tos_csv(path: Path) -> tuple[list[dict], list[str]]:
         )
 
     return results, warnings
+
+
+def _parse_tos_equities(path: Path) -> tuple[list[dict], list[str]]:
+    """Parse the Equities section from a TOS Account Statement CSV.
+
+    TOS columns: Symbol, Description, Qty (+400), Trade Price, Mark, Mark Value
+    Returns long positions only (Qty > 0).
+    """
+    results:  list[dict] = []
+    warnings: list[str]  = []
+
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception as e:
+        return [], [str(e)]
+
+    rows = list(csv.reader(io.StringIO(text)))
+
+    _EQUITY_BREAKS = {
+        "Options", "Profits and Losses", "Account Summary",
+        "Futures Statements", "Forex Statements",
+        "Cash Balance", "Account Trade History",
+    }
+
+    in_equities = False
+    col: dict[str, int] = {}
+
+    for row in rows:
+        if not row:
+            continue
+        cells = [c.strip().strip('"') for c in row]
+        first = cells[0]
+
+        if first == "Equities":
+            in_equities = True
+            col = {}
+            continue
+
+        if not in_equities:
+            continue
+
+        if not col:
+            col = {h.strip().lower(): i for i, h in enumerate(cells)}
+            continue
+
+        if first in _EQUITY_BREAKS:
+            break
+
+        joined = " ".join(cells)
+        if "OVERALL" in joined.upper() or not first:
+            continue
+
+        try:
+            sym = cells[col["symbol"]].upper().strip()
+        except (KeyError, IndexError):
+            continue
+
+        if not sym or sym == "SYMBOL":
+            continue
+
+        try:
+            qty_raw = cells[col["qty"]].strip().lstrip("+").replace(",", "")
+            qty_f   = float(qty_raw)
+            if qty_f <= 0:
+                continue
+            shares = str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f)
+        except (KeyError, IndexError, ValueError):
+            warnings.append(f"Skipped {sym}: could not parse qty")
+            continue
+
+        cost_basis = ""
+        try:
+            cost_basis = cells[col["trade price"]].strip().replace("$", "").replace(",", "")
+        except (KeyError, IndexError):
+            pass
+
+        current_price = ""
+        for name in ("mark", "close price", "last price", "last"):
+            if name in col:
+                try:
+                    val = cells[col[name]].strip().replace("$", "").replace(",", "")
+                    if val:
+                        current_price = val
+                        break
+                except IndexError:
+                    pass
+
+        results.append({
+            "symbol":        sym,
+            "shares":        shares,
+            "cost_basis":    cost_basis,
+            "current_price": current_price,
+        })
+
+    if not results and not warnings:
+        warnings.append(
+            "Could not find an 'Equities' section. "
+            "Make sure you exported an Account Statement from TOS."
+        )
+
+    return results, warnings

@@ -4,6 +4,7 @@ from .stock_tab     import StockScannerTab
 from .options_tab   import OptionsScannerTab
 from .wheel_tab     import WheelAnalysisTab
 from .positions_tab import PositionsTab
+from .stocks_tab    import ActiveStocksTab
 
 
 class MainWindow(QMainWindow):
@@ -20,8 +21,9 @@ class MainWindow(QMainWindow):
         options_tab.scan_finished.connect(wheel_tab.refresh_options_status)
 
         tabs = QTabWidget()
-        tabs.addTab(stock_tab,    "Stock Scanner")
-        tabs.addTab(options_tab,  "Options Scanner")
-        tabs.addTab(wheel_tab,    "Wheel Analysis")
-        tabs.addTab(PositionsTab(), "Positions")
+        tabs.addTab(stock_tab,         "Stock Scanner")
+        tabs.addTab(options_tab,       "Options Scanner")
+        tabs.addTab(wheel_tab,         "Wheel Analysis")
+        tabs.addTab(PositionsTab(),    "Active Options")
+        tabs.addTab(ActiveStocksTab(), "Active Stocks")
         self.setCentralWidget(tabs)

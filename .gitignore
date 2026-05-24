@@ -11,6 +11,7 @@ options_results_cache.json
 
 # User data files (personal positions / ticker lists)
 my_option_positions.json
+my_stock_positions.json
 my_positions.txt
 
 # Logs
