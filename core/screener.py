@@ -12,12 +12,79 @@ import numpy as np
 THETA_BASE = "http://127.0.0.1:25503"
 
 
+def _us_market_holidays(year: int) -> set[date]:
+    """Return NYSE/Nasdaq market holidays for the given year."""
+    def nth_weekday(y, m, wd, n):
+        first = date(y, m, 1)
+        delta = (wd - first.weekday()) % 7
+        return first + timedelta(days=delta + 7 * (n - 1))
+
+    def last_monday(y, m):
+        last = date(y, m + 1, 1) - timedelta(days=1) if m < 12 else date(y, 12, 31)
+        return last - timedelta(days=(last.weekday()) % 7)
+
+    def observed(d):
+        if d.weekday() == 5: return d - timedelta(days=1)
+        if d.weekday() == 6: return d + timedelta(days=1)
+        return d
+
+    # Easter (Anonymous Gregorian algorithm) → Good Friday
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    ll = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ll) // 451
+    month = (h + ll - 7 * m + 114) // 31
+    day   = (h + ll - 7 * m + 114) % 31 + 1
+    good_friday = date(year, month, day) - timedelta(days=2)
+
+    return {
+        observed(date(year, 1, 1)),          # New Year's Day
+        nth_weekday(year, 1, 0, 3),          # MLK Day        (3rd Mon Jan)
+        nth_weekday(year, 2, 0, 3),          # Presidents Day (3rd Mon Feb)
+        good_friday,                          # Good Friday
+        last_monday(year, 5),                 # Memorial Day   (last Mon May)
+        observed(date(year, 6, 19)),          # Juneteenth
+        observed(date(year, 7, 4)),           # Independence Day
+        nth_weekday(year, 9, 0, 1),          # Labor Day      (1st Mon Sep)
+        nth_weekday(year, 11, 3, 4),         # Thanksgiving   (4th Thu Nov)
+        observed(date(year, 12, 25)),         # Christmas
+    }
+
+
 def _last_trading_day(ref: date) -> date:
-    """Return the most recent weekday strictly before ref."""
-    d = ref - timedelta(days=1)
-    while d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+    """Return ref if it is a trading day, otherwise the most recent trading day before ref."""
+    holidays = _us_market_holidays(ref.year) | _us_market_holidays(ref.year - 1)
+    d = ref
+    while d.weekday() >= 5 or d in holidays:
         d -= timedelta(days=1)
     return d
+
+
+def _prev_trading_day() -> date:
+    """Return the most recent trading day strictly before today."""
+    today    = date.today()
+    holidays = _us_market_holidays(today.year) | _us_market_holidays(today.year - 1)
+    d = today - timedelta(days=1)
+    while d.weekday() >= 5 or d in holidays:
+        d -= timedelta(days=1)
+    return d
+
+
+def _current_trade_date() -> date:
+    """Return today if the market has closed (4:00 PM ET), otherwise the previous trading day."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ET    = ZoneInfo("America/New_York")
+    today = date.today()
+    if _last_trading_day(today) == today:
+        close_et = datetime(today.year, today.month, today.day, 16, 0, tzinfo=ET)
+        if datetime.now(ET) >= close_et:
+            return today
+    return _prev_trading_day()
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 VALID_EXCHANGES  = {"NYSE", "Nasdaq", "NYSE MKT"}
@@ -74,6 +141,23 @@ def find_close_col(df: pd.DataFrame) -> str | None:
     return numeric[-1] if numeric else None
 
 
+def _current_price(eod: pd.DataFrame) -> float | None:
+    """Return bid/ask midpoint when both are positive, otherwise the close price."""
+    try:
+        bid = float(eod["bid"].iloc[-1])
+        ask = float(eod["ask"].iloc[-1])
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+    except (KeyError, IndexError, ValueError):
+        pass
+    close_col = find_close_col(eod)
+    if close_col:
+        closes = eod[close_col].dropna().astype(float)
+        if not closes.empty:
+            return float(closes.iloc[-1])
+    return None
+
+
 def fetch_stock_prices(
     symbols: list[str],
     on_log=None,
@@ -81,21 +165,11 @@ def fetch_stock_prices(
     stop_flag=None,
     throttle: float = 0.1,
 ) -> list[dict]:
-    """Fetch the latest EOD close price for each symbol. Returns [{symbol, price}, ...]."""
-    from thetadata import ThetaClient
-    from thetadata.errors import AuthenticationError
+    """Fetch the latest price for each symbol via yfinance. Returns [{symbol, price}, ...]."""
+    import yfinance as yf
 
-    if on_log:
-        on_log("Connecting to ThetaData terminal …")
-    try:
-        client = ThetaClient(dataframe_type="pandas")
-    except AuthenticationError:
-        raise ScreenerError("Authentication failed — check your ThetaData credentials.")
-
-    today      = date.today()
-    trade_date = _last_trading_day(today)
-    results    = []
-    total      = len(symbols)
+    results = []
+    total   = len(symbols)
 
     for i, sym in enumerate(symbols):
         if stop_flag and stop_flag():
@@ -103,21 +177,19 @@ def fetch_stock_prices(
                 on_log("Stopped by user.")
             break
         try:
-            eod = client.stock_history_eod(symbol=sym, start_date=trade_date, end_date=trade_date)
-            if eod is not None and not eod.empty:
-                close_col = find_close_col(eod)
-                if close_col:
-                    closes = eod[close_col].dropna().astype(float)
-                    if not closes.empty:
-                        results.append({"symbol": sym, "price": float(closes.iloc[-1])})
-                        if on_log:
-                            on_log(f"  {sym}: ${closes.iloc[-1]:.2f}")
+            price = yf.Ticker(sym).fast_info.last_price
+            if price and price > 0:
+                results.append({"symbol": sym, "price": price})
+                if on_log:
+                    on_log(f"  {sym}: ${price:.2f}")
+            else:
+                if on_log:
+                    on_log(f"  {sym}: no data")
         except Exception:
             if on_log:
                 on_log(f"  {sym}: no data")
         if on_progress:
             on_progress(i + 1, total)
-        time.sleep(throttle)
 
     return results
 
@@ -228,7 +300,7 @@ def run_stock_filter(
     stock_throttle   = config.get("stock_throttle",    0.1)
 
     today      = date.today()
-    trade_date = _last_trading_day(today)
+    trade_date = _current_trade_date()
     hist_start = today - timedelta(days=45)
 
     price_key = {
@@ -313,23 +385,15 @@ def run_stock_filter(
                     on_pass1_progress(i + 1, total)
                 continue
 
-            close_col = find_close_col(eod)
-            if close_col is None:
+            last_price = _current_price(eod)
+            if last_price is None:
                 skipped += 1
                 if on_pass1_progress:
                     on_pass1_progress(i + 1, total)
                 continue
 
-            closes = eod[close_col].dropna().astype(float)
-            if closes.empty:
-                skipped += 1
-                if on_pass1_progress:
-                    on_pass1_progress(i + 1, total)
-                continue
-
-            last_price = float(closes.iloc[-1])
             if price_min <= last_price <= price_max:
-                price_qualified.append({"symbol": sym, "price": last_price})
+                price_qualified.append({"symbol": sym, "price": round(last_price, 2)})
 
             if on_pass1_progress:
                 on_pass1_progress(i + 1, total)
@@ -460,8 +524,8 @@ def run_options_filter(
     side             = config.get("side",             "sell") # "sell" or "buy"
     price_col        = "bid" if side == "sell" else "ask"
 
-    today      = date.today()
-    trade_date = _last_trading_day(today)
+    today       = date.today()
+    trade_date  = _prev_trading_day()
 
     exp_date_str = config.get("expiration_date")
     if exp_date_str:
@@ -472,15 +536,6 @@ def run_options_filter(
         expirations = [today + timedelta(days=d) for d in range(dte_min, dte_max + 1)]
     results = []
     total   = len(candidates)
-
-    # Fail fast if the terminal isn't reachable
-    try:
-        requests.get(f"{THETA_BASE}/v2/list/roots", params={"sec": "stock"}, timeout=3)
-    except Exception:
-        raise ScreenerError(
-            f"Cannot reach ThetaData terminal at {THETA_BASE}. "
-            "Start ThetaTerminalv3.jar (run start_terminal.sh) and try again."
-        )
 
     if on_log:
         label = f"{'Put' if right == 'P' else 'Call'} {'sells' if side == 'sell' else 'buys'}"

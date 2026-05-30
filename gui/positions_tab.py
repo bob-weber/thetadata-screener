@@ -6,7 +6,8 @@ import re
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QPushButton, QTableWidget, QTableWidgetItem,
@@ -15,30 +16,71 @@ from PyQt6.QtWidgets import (
 )
 
 POSITIONS_FILE = Path("my_option_positions.json")
+STOCKS_FILE    = Path("my_stock_positions.json")
 
-# ── column layout ─────────────────────────────────────────────────────────────
-# Editable columns the user fills in (manually or via CSV import)
-_E = ["symbol", "type", "expiration", "strike", "qty", "premium", "fees", "opened"]
-# Computed (read-only) columns
-_C = ["5pct_below", "10pct_below", "weekly_ror", "weeks_held"]
-_ALL_COLS = _E + _C
-_HEADERS  = ["Symbol", "P/C", "Expiration", "Strike", "Qty",
-             "Premium", "Fees", "Opened", "5% Below Strike", "10% Below Strike",
-             "Weekly ROR", "Weeks Held"]
+# ── Options column layout ──────────────────────────────────────────────────────
+_OE     = ["symbol", "type", "expiration", "strike", "qty", "premium", "fees", "opened"]
+_OC     = ["5pct_below", "10pct_below", "weekly_ror", "weeks_held"]
+_O_HDRS = ["Symbol", "P/C", "Expiration", "Strike", "Qty",
+           "Premium", "Fees", "Opened", "5% Below", "10% Below",
+           "Weekly ROR", "Weeks Held"]
 
-_STRIKE_COL      = _E.index("strike")       # col 3
-_EXP_COL         = _E.index("expiration")   # col 2
-_PREMIUM_COL     = _E.index("premium")      # col 5
-_OPENED_COL      = _E.index("opened")       # col 7
-_5PCT_COL        = len(_E)                  # col 8
-_10PCT_COL       = len(_E) + 1             # col 9
-_WEEKLY_ROR_COL  = len(_E) + 2             # col 10
-_WEEKS_HELD_COL  = len(_E) + 3             # col 11
+_O_STRIKE_COL  = _OE.index("strike")
+_O_EXP_COL     = _OE.index("expiration")
+_O_PREMIUM_COL = _OE.index("premium")
+_O_OPENED_COL  = _OE.index("opened")
+_O_5PCT_COL    = len(_OE)
+_O_10PCT_COL   = len(_OE) + 1
+_O_ROR_COL     = len(_OE) + 2
+_O_WEEKS_COL   = len(_OE) + 3
+
+# ── Stocks column layout ───────────────────────────────────────────────────────
+_SE     = ["symbol", "shares", "cost_basis", "current_price", "opened"]
+_SC     = ["total_cost", "current_value", "gain_loss", "ror_pct"]
+_S_HDRS = ["Symbol", "Shares", "Cost Basis", "Current Price", "Opened",
+           "Total Cost", "Current Value", "Gain/Loss $", "RoR %"]
+
+_S_SYM_COL    = 0
+_S_SHARES_COL = 1
+_S_COST_COL   = 2
+_S_PRICE_COL  = 3
+_S_OPENED_COL = 4
+_S_TCOST_COL  = 5
+_S_CVAL_COL   = 6
+_S_GL_COL     = 7
+_S_ROR_COL    = 8
+
+_GREEN = QColor("#2e7d32")
+_RED   = QColor("#c62828")
 
 
-class PositionsTab(QWidget):
+class _PriceFetcher(QThread):
+    price_ready = pyqtSignal(str, float)
+    log_msg     = pyqtSignal(str)
+    done        = pyqtSignal()
+
+    def __init__(self, symbols: list[str]):
+        super().__init__()
+        self._symbols = symbols
+
+    def run(self):
+        import yfinance as yf
+        for sym in self._symbols:
+            try:
+                hist = yf.Ticker(sym).history(period="2d")
+                if not hist.empty:
+                    self.price_ready.emit(sym, float(hist["Close"].iloc[-1]))
+                else:
+                    self.log_msg.emit(f"{sym}: no price data")
+            except Exception as e:
+                self.log_msg.emit(f"{sym}: {e}")
+        self.done.emit()
+
+
+class PortfolioTab(QWidget):
     def __init__(self):
         super().__init__()
+        self._fetcher = None
         self._setup_ui()
         self._load_saved()
 
@@ -48,77 +90,105 @@ class PositionsTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
-        # toolbar
         toolbar = QHBoxLayout()
-        import_btn = QPushButton("Import TOS CSV…")
-        add_btn    = QPushButton("Add Row")
-        del_btn    = QPushButton("Delete Selected")
+        import_btn        = QPushButton("Import TOS CSV…")
+        add_opt_btn       = QPushButton("Add Option")
+        del_opt_btn       = QPushButton("Delete Option")
+        self._refresh_btn = QPushButton("Refresh Prices")
+        del_stk_btn       = QPushButton("Delete Stock")
         import_btn.clicked.connect(self._import_csv)
-        add_btn.clicked.connect(lambda: self._add_row())
-        del_btn.clicked.connect(self._delete_selected)
-        toolbar.addWidget(import_btn)
-        toolbar.addWidget(add_btn)
-        toolbar.addWidget(del_btn)
+        add_opt_btn.clicked.connect(lambda: self._add_option_row())
+        del_opt_btn.clicked.connect(self._delete_selected_options)
+        self._refresh_btn.clicked.connect(self._refresh_prices)
+        del_stk_btn.clicked.connect(self._delete_selected_stocks)
+        for w in (import_btn, add_opt_btn, del_opt_btn):
+            toolbar.addWidget(w)
+        toolbar.addSpacing(12)
+        for w in (self._refresh_btn, del_stk_btn):
+            toolbar.addWidget(w)
         toolbar.addStretch()
         self._status_label = QLabel("")
         toolbar.addWidget(self._status_label)
         root.addLayout(toolbar)
 
-        # hint
         hint = QLabel(
-            "Strike, 5%/10% below are in dollars.  "
-            "Qty is negative for short (sold) positions."
+            "Options: Strike / 5%–10% below are in dollars; Qty negative = short.  "
+            "Stocks: Cost Basis and Current Price are per share."
         )
         hint.setStyleSheet("color: grey; font-size: 11px;")
         root.addWidget(hint)
 
-        # table
-        box = QGroupBox("Option Positions")
-        bl  = QVBoxLayout(box)
-        self._table = QTableWidget(0, len(_HEADERS))
-        self._table.setHorizontalHeaderLabels(_HEADERS)
-        self._table.setSortingEnabled(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked |
-                                    QTableWidget.EditTrigger.SelectedClicked)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._table.verticalHeader().setVisible(False)
-        self._table.itemChanged.connect(self._on_item_changed)
-        bl.addWidget(self._table)
-        root.addWidget(box, 1)
+        opt_box = QGroupBox("Option Positions")
+        ol = QVBoxLayout(opt_box)
+        self._opt_table = QTableWidget(0, len(_O_HDRS))
+        self._opt_table.setHorizontalHeaderLabels(_O_HDRS)
+        self._opt_table.setSortingEnabled(True)
+        self._opt_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._opt_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked |
+                                        QTableWidget.EditTrigger.SelectedClicked)
+        self._opt_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._opt_table.verticalHeader().setVisible(False)
+        self._opt_table.itemChanged.connect(self._on_opt_item_changed)
+        ol.addWidget(self._opt_table)
+        root.addWidget(opt_box, 2)
 
-    # ── row helpers ───────────────────────────────────────────────────────────
+        stk_box = QGroupBox("Long Stock Positions")
+        sl = QVBoxLayout(stk_box)
+        self._stk_table = QTableWidget(0, len(_S_HDRS))
+        self._stk_table.setHorizontalHeaderLabels(_S_HDRS)
+        self._stk_table.setSortingEnabled(True)
+        self._stk_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._stk_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked |
+                                        QTableWidget.EditTrigger.SelectedClicked)
+        self._stk_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._stk_table.verticalHeader().setVisible(False)
+        self._stk_table.itemChanged.connect(self._on_stk_item_changed)
+        sl.addWidget(self._stk_table)
+        root.addWidget(stk_box, 1)
+
+        sum_box = QGroupBox("Portfolio Summary")
+        sml = QHBoxLayout(sum_box)
+        self._lbl_cost    = QLabel("Total Cost: —")
+        self._lbl_val     = QLabel("Current Value: —")
+        self._lbl_gl      = QLabel("Gain/Loss: —")
+        self._lbl_ror     = QLabel("Total RoR: —")
+        self._lbl_ann_ror = QLabel("Annualized RoR: —")
+        for lbl in (self._lbl_cost, self._lbl_val, self._lbl_gl,
+                    self._lbl_ror, self._lbl_ann_ror):
+            lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
+            sml.addWidget(lbl)
+        root.addWidget(sum_box)
+
+    # ── shared helpers ────────────────────────────────────────────────────────
 
     def _make_item(self, text: str, editable: bool = True) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
         if not editable:
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            item.setForeground(item.foreground())  # keep default colour
         return item
 
-    def _add_row(self, data: dict | None = None):
-        # Disable sorting before writing cells: Qt re-sorts the moment the sort
-        # column's item is set, which shifts the row to a new index and makes
-        # all subsequent setItem calls target the wrong row.
-        self._table.setSortingEnabled(False)
-        self._table.blockSignals(True)
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-        d = data or {}
-        for ci, col in enumerate(_E):
-            self._table.setItem(row, ci, self._make_item(str(d.get(col, ""))))
-        self._table.setItem(row, _5PCT_COL,        self._make_item("", editable=False))
-        self._table.setItem(row, _10PCT_COL,       self._make_item("", editable=False))
-        self._table.setItem(row, _WEEKLY_ROR_COL,  self._make_item("", editable=False))
-        self._table.setItem(row, _WEEKS_HELD_COL,  self._make_item("", editable=False))
-        self._table.blockSignals(False)
-        self._recompute_row(row)
-        self._table.setSortingEnabled(True)
-        self._save()
+    # ── Options rows ──────────────────────────────────────────────────────────
 
-    def _recompute_row(self, row: int):
+    def _add_option_row(self, data: dict | None = None):
+        self._opt_table.setSortingEnabled(False)
+        self._opt_table.blockSignals(True)
+        row = self._opt_table.rowCount()
+        self._opt_table.insertRow(row)
+        d = data or {}
+        for ci, col in enumerate(_OE):
+            self._opt_table.setItem(row, ci, self._make_item(str(d.get(col, ""))))
+        self._opt_table.setItem(row, _O_5PCT_COL,  self._make_item("", editable=False))
+        self._opt_table.setItem(row, _O_10PCT_COL, self._make_item("", editable=False))
+        self._opt_table.setItem(row, _O_ROR_COL,   self._make_item("", editable=False))
+        self._opt_table.setItem(row, _O_WEEKS_COL, self._make_item("", editable=False))
+        self._opt_table.blockSignals(False)
+        self._recompute_option_row(row)
+        self._opt_table.setSortingEnabled(True)
+        self._save_options()
+
+    def _recompute_option_row(self, row: int):
         def _float(col):
-            it = self._table.item(row, col)
+            it = self._opt_table.item(row, col)
             if not it:
                 return None
             try:
@@ -126,45 +196,38 @@ class PositionsTab(QWidget):
             except ValueError:
                 return None
 
-        strike  = _float(_STRIKE_COL)
-        premium = _float(_PREMIUM_COL)
+        strike  = _float(_O_STRIKE_COL)
+        premium = _float(_O_PREMIUM_COL)
 
-        exp_text = ""
-        it = self._table.item(row, _EXP_COL)
-        if it:
-            exp_text = it.text().strip()
+        it = self._opt_table.item(row, _O_EXP_COL)
+        exp_text = it.text().strip() if it else ""
+        it = self._opt_table.item(row, _O_OPENED_COL)
+        opened_text = it.text().strip() if it else ""
 
-        opened_text = ""
-        it = self._table.item(row, _OPENED_COL)
-        if it:
-            opened_text = it.text().strip()
-
-        self._table.blockSignals(True)
+        self._opt_table.blockSignals(True)
 
         if strike is not None:
-            self._table.item(row, _5PCT_COL).setText(f"{strike * 0.95:.2f}")
-            self._table.item(row, _10PCT_COL).setText(f"{strike * 0.90:.2f}")
+            self._opt_table.item(row, _O_5PCT_COL).setText(f"{strike * 0.95:.2f}")
+            self._opt_table.item(row, _O_10PCT_COL).setText(f"{strike * 0.90:.2f}")
         else:
-            self._table.item(row, _5PCT_COL).setText("")
-            self._table.item(row, _10PCT_COL).setText("")
+            self._opt_table.item(row, _O_5PCT_COL).setText("")
+            self._opt_table.item(row, _O_10PCT_COL).setText("")
 
         # Weekly ROR uses total days deployed (initial open → expiry), not just DTE
         # remaining, so near-expiry rolls don't show an artificially inflated rate.
         ror_text = ""
-        if strike and strike > 0 and premium is not None and exp_text:
+        if strike and strike > 0 and premium is not None and exp_text and opened_text:
             try:
                 em, ed, ey = (int(p) for p in exp_text.split("/"))
                 dte = (date(ey, em, ed) - date.today()).days
-                total_days = dte
-                if opened_text:
-                    om, od, oy = (int(p) for p in opened_text.split("/"))
-                    days_held  = (date.today() - date(oy, om, od)).days
-                    total_days = days_held + dte
+                om, od, oy = (int(p) for p in opened_text.split("/"))
+                days_held  = (date.today() - date(oy, om, od)).days
+                total_days = days_held + dte
                 if total_days > 0:
                     ror_text = f"{(premium / strike) * (7 / total_days) * 100:.2f}%"
             except (ValueError, ZeroDivisionError):
                 pass
-        self._table.item(row, _WEEKLY_ROR_COL).setText(ror_text)
+        self._opt_table.item(row, _O_ROR_COL).setText(ror_text)
 
         weeks_text = ""
         if opened_text:
@@ -175,76 +238,286 @@ class PositionsTab(QWidget):
                     weeks_text = f"{days_held / 7:.1f}"
             except ValueError:
                 pass
-        self._table.item(row, _WEEKS_HELD_COL).setText(weeks_text)
+        self._opt_table.item(row, _O_WEEKS_COL).setText(weeks_text)
 
-        self._table.blockSignals(False)
+        self._opt_table.blockSignals(False)
 
-    def _on_item_changed(self, item: QTableWidgetItem):
-        if item.column() in (_STRIKE_COL, _EXP_COL, _PREMIUM_COL, _OPENED_COL):
-            self._recompute_row(item.row())
-        self._save()
+    def _on_opt_item_changed(self, item: QTableWidgetItem):
+        if item.column() in (_O_STRIKE_COL, _O_EXP_COL, _O_PREMIUM_COL, _O_OPENED_COL):
+            self._recompute_option_row(item.row())
+        self._save_options()
 
-    def _delete_selected(self):
-        rows = sorted({i.row() for i in self._table.selectedItems()}, reverse=True)
+    def _delete_selected_options(self):
+        rows = sorted({i.row() for i in self._opt_table.selectedItems()}, reverse=True)
         if not rows:
             return
-        self._table.blockSignals(True)
+        self._opt_table.blockSignals(True)
         for r in rows:
-            self._table.removeRow(r)
-        self._table.blockSignals(False)
-        self._save()
-        self._status_label.setText(f"Deleted {len(rows)} row(s).")
+            self._opt_table.removeRow(r)
+        self._opt_table.blockSignals(False)
+        self._save_options()
+        self._status_label.setText(f"Deleted {len(rows)} option row(s).")
+
+    # ── Stocks rows ───────────────────────────────────────────────────────────
+
+    def _add_stock_row(self, data: dict | None = None):
+        self._stk_table.setSortingEnabled(False)
+        self._stk_table.blockSignals(True)
+        row = self._stk_table.rowCount()
+        self._stk_table.insertRow(row)
+        d = data or {}
+        for ci, col in enumerate(_SE):
+            self._stk_table.setItem(row, ci, self._make_item(str(d.get(col, ""))))
+        for ci in range(len(_SE), len(_SE) + len(_SC)):
+            self._stk_table.setItem(row, ci, self._make_item("", editable=False))
+        self._stk_table.blockSignals(False)
+        self._recompute_stock_row(row)
+        self._stk_table.setSortingEnabled(True)
+        self._update_summary()
+        self._save_stocks()
+
+    def _cell_float_stk(self, row: int, col: int) -> float | None:
+        it = self._stk_table.item(row, col)
+        if not it:
+            return None
+        try:
+            return float(it.text().replace("$", "").replace(",", "").replace("%", ""))
+        except ValueError:
+            return None
+
+    def _recompute_stock_row(self, row: int):
+        shares = self._cell_float_stk(row, _S_SHARES_COL)
+        cost   = self._cell_float_stk(row, _S_COST_COL)
+        price  = self._cell_float_stk(row, _S_PRICE_COL)
+
+        self._stk_table.blockSignals(True)
+        if shares is not None and cost is not None and shares > 0 and cost > 0:
+            total_cost = shares * cost
+            self._stk_table.item(row, _S_TCOST_COL).setText(f"{total_cost:,.2f}")
+            if price is not None:
+                current_val = shares * price
+                gain_loss   = current_val - total_cost
+                ror         = gain_loss / total_cost * 100
+                color       = _GREEN if gain_loss >= 0 else _RED
+                sign        = "+" if gain_loss >= 0 else ""
+                self._stk_table.item(row, _S_CVAL_COL).setText(f"{current_val:,.2f}")
+                gl_item  = self._stk_table.item(row, _S_GL_COL)
+                ror_item = self._stk_table.item(row, _S_ROR_COL)
+                gl_item.setText(f"{sign}{gain_loss:,.2f}")
+                gl_item.setForeground(color)
+                ror_item.setText(f"{sign}{ror:.2f}%")
+                ror_item.setForeground(color)
+            else:
+                for ci in (_S_CVAL_COL, _S_GL_COL, _S_ROR_COL):
+                    self._stk_table.item(row, ci).setText("")
+        else:
+            for ci in (_S_TCOST_COL, _S_CVAL_COL, _S_GL_COL, _S_ROR_COL):
+                self._stk_table.item(row, ci).setText("")
+        self._stk_table.blockSignals(False)
+
+    def _update_summary(self):
+        total_cost = 0.0
+        total_val  = 0.0
+        has_prices = False
+
+        # For annualized RoR: cost-weighted average across positions with an opened date
+        ann_weight = 0.0
+        ann_sum    = 0.0
+
+        for row in range(self._stk_table.rowCount()):
+            tc = self._cell_float_stk(row, _S_TCOST_COL)
+            cv = self._cell_float_stk(row, _S_CVAL_COL)
+            if tc is not None:
+                total_cost += tc
+            if cv is not None:
+                total_val  += cv
+                has_prices  = True
+
+            if tc and tc > 0 and cv is not None:
+                it = self._stk_table.item(row, _S_OPENED_COL)
+                opened_text = it.text().strip() if it else ""
+                if opened_text:
+                    try:
+                        m, d, y = (int(p) for p in opened_text.split("/"))
+                        days_held = (date.today() - date(y, m, d)).days
+                        if days_held > 0:
+                            ann_ror = ((cv / tc) ** (365 / days_held) - 1) * 100
+                            ann_sum    += ann_ror * tc
+                            ann_weight += tc
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
+        self._lbl_cost.setText(f"Total Cost: ${total_cost:,.2f}")
+        self._lbl_cost.setStyleSheet("font-weight: bold; font-size: 13px;")
+
+        if has_prices and total_cost > 0:
+            gain  = total_val - total_cost
+            ror   = gain / total_cost * 100
+            sign  = "+" if gain >= 0 else ""
+            color = "#2e7d32" if gain >= 0 else "#c62828"
+            style = f"font-weight: bold; font-size: 13px; color: {color};"
+            self._lbl_val.setText(f"Current Value: ${total_val:,.2f}")
+            self._lbl_val.setStyleSheet("font-weight: bold; font-size: 13px;")
+            self._lbl_gl.setText(f"Gain/Loss: {sign}${gain:,.2f}")
+            self._lbl_gl.setStyleSheet(style)
+            self._lbl_ror.setText(f"Total RoR: {sign}{ror:.2f}%")
+            self._lbl_ror.setStyleSheet(style)
+        else:
+            self._lbl_val.setText("Current Value: —")
+            self._lbl_gl.setText("Gain/Loss: —")
+            self._lbl_ror.setText("Total RoR: —")
+            for lbl in (self._lbl_val, self._lbl_gl, self._lbl_ror):
+                lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
+
+        if ann_weight > 0:
+            ann = ann_sum / ann_weight
+            sign  = "+" if ann >= 0 else ""
+            color = "#2e7d32" if ann >= 0 else "#c62828"
+            self._lbl_ann_ror.setText(f"Annualized RoR: {sign}{ann:.2f}%")
+            self._lbl_ann_ror.setStyleSheet(
+                f"font-weight: bold; font-size: 13px; color: {color};"
+            )
+        else:
+            self._lbl_ann_ror.setText("Annualized RoR: —")
+            self._lbl_ann_ror.setStyleSheet("font-weight: bold; font-size: 13px;")
+
+    def _on_stk_item_changed(self, item: QTableWidgetItem):
+        if item.column() in (_S_SHARES_COL, _S_COST_COL, _S_PRICE_COL):
+            self._recompute_stock_row(item.row())
+        if item.column() in (_S_SHARES_COL, _S_COST_COL, _S_PRICE_COL, _S_OPENED_COL):
+            self._update_summary()
+        self._save_stocks()
+
+    def _delete_selected_stocks(self):
+        rows = sorted({i.row() for i in self._stk_table.selectedItems()}, reverse=True)
+        if not rows:
+            return
+        self._stk_table.blockSignals(True)
+        for r in rows:
+            self._stk_table.removeRow(r)
+        self._stk_table.blockSignals(False)
+        self._update_summary()
+        self._save_stocks()
+        self._status_label.setText(f"Deleted {len(rows)} stock row(s).")
 
     # ── persistence ───────────────────────────────────────────────────────────
 
-    def _row_to_dict(self, row: int) -> dict:
+    def _opt_row_to_dict(self, row: int) -> dict:
         return {
-            col: (self._table.item(row, ci).text()
-                  if self._table.item(row, ci) else "")
-            for ci, col in enumerate(_E)
+            col: (self._opt_table.item(row, ci).text()
+                  if self._opt_table.item(row, ci) else "")
+            for ci, col in enumerate(_OE)
         }
 
-    def _save(self):
-        rows = [self._row_to_dict(r) for r in range(self._table.rowCount())]
+    def _stk_row_to_dict(self, row: int) -> dict:
+        return {
+            col: (self._stk_table.item(row, ci).text()
+                  if self._stk_table.item(row, ci) else "")
+            for ci, col in enumerate(_SE)
+        }
+
+    def _save_options(self):
+        rows = [self._opt_row_to_dict(r) for r in range(self._opt_table.rowCount())]
         POSITIONS_FILE.write_text(json.dumps(rows, indent=2))
 
+    def _save_stocks(self):
+        rows = [self._stk_row_to_dict(r) for r in range(self._stk_table.rowCount())]
+        STOCKS_FILE.write_text(json.dumps(rows, indent=2))
+
     def _load_saved(self):
-        if not POSITIONS_FILE.exists():
-            return
-        try:
-            rows = json.loads(POSITIONS_FILE.read_text())
-        except Exception:
-            return
-        for row in rows:
-            self._add_row(row)
-        if rows:
-            self._status_label.setText(f"Loaded {len(rows)} saved position(s).")
+        if POSITIONS_FILE.exists():
+            try:
+                for row in json.loads(POSITIONS_FILE.read_text()):
+                    self._add_option_row(row)
+            except Exception:
+                pass
+
+        if STOCKS_FILE.exists():
+            try:
+                for row in json.loads(STOCKS_FILE.read_text()):
+                    self._add_stock_row(row)
+            except Exception:
+                pass
 
     # ── CSV import ────────────────────────────────────────────────────────────
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import TOS Position CSV", "",
+            self, "Import TOS Account Statement", "",
             "CSV files (*.csv);;All files (*)"
         )
         if not path:
             return
-        parsed, warnings = _parse_tos_csv(Path(path))
-        if not parsed:
-            msg = "No option positions found in that file."
-            if warnings:
-                msg += "\n\n" + "\n".join(warnings[:5])
+
+        opts, opt_warns, stks, stk_warns = _parse_tos_csv(Path(path))
+
+        if not opts and not stks:
+            all_warns = opt_warns + stk_warns
+            msg = "No option or equity positions found."
+            if all_warns:
+                msg += "\n\n" + "\n".join(all_warns[:5])
             QMessageBox.warning(self, "Import", msg)
             return
-        self._table.blockSignals(True)
-        self._table.setRowCount(0)
-        self._table.blockSignals(False)
-        for row in parsed:
-            self._add_row(row)
-        note = f"Imported {len(parsed)} position(s)."
-        if warnings:
-            note += f"  ({len(warnings)} row(s) skipped)"
+
+        if opts:
+            self._opt_table.blockSignals(True)
+            self._opt_table.setRowCount(0)
+            self._opt_table.blockSignals(False)
+            for row in opts:
+                self._add_option_row(row)
+
+        if stks:
+            self._stk_table.blockSignals(True)
+            self._stk_table.setRowCount(0)
+            self._stk_table.blockSignals(False)
+            for row in stks:
+                self._add_stock_row(row)
+
+        parts = []
+        if opts:
+            parts.append(f"{len(opts)} option(s)")
+        if stks:
+            parts.append(f"{len(stks)} stock(s)")
+        note = "Imported " + " and ".join(parts) + "."
+        all_warns = opt_warns + stk_warns
+        if all_warns:
+            note += f"  ({len(all_warns)} row(s) skipped)"
         self._status_label.setText(note)
+
+    # ── price refresh ─────────────────────────────────────────────────────────
+
+    def _refresh_prices(self):
+        symbols = []
+        for row in range(self._stk_table.rowCount()):
+            it = self._stk_table.item(row, _S_SYM_COL)
+            if it and it.text().strip():
+                symbols.append(it.text().strip().upper())
+        if not symbols:
+            self._status_label.setText("No stock positions to refresh.")
+            return
+        self._refresh_btn.setEnabled(False)
+        self._status_label.setText(f"Fetching prices for {len(symbols)} symbol(s)…")
+        self._fetcher = _PriceFetcher(symbols)
+        self._fetcher.price_ready.connect(self._on_price_ready)
+        self._fetcher.log_msg.connect(self._status_label.setText)
+        self._fetcher.done.connect(self._on_refresh_done)
+        self._fetcher.start()
+
+    def _on_price_ready(self, symbol: str, price: float):
+        for row in range(self._stk_table.rowCount()):
+            it = self._stk_table.item(row, _S_SYM_COL)
+            if it and it.text().strip().upper() == symbol:
+                self._stk_table.blockSignals(True)
+                self._stk_table.item(row, _S_PRICE_COL).setText(f"{price:.2f}")
+                self._stk_table.blockSignals(False)
+                self._recompute_stock_row(row)
+                break
+        self._update_summary()
+
+    def _on_refresh_done(self):
+        self._refresh_btn.setEnabled(True)
+        self._status_label.setText("Prices refreshed.")
+        self._save_stocks()
 
 
 # ── TOS CSV parsing ───────────────────────────────────────────────────────────
@@ -274,6 +547,14 @@ _TRD_SINGLE_RE = re.compile(
 )
 
 
+def _norm_strike(s: str) -> str:
+    """Normalize strike to a canonical string ('22.0' and '22' both → '22')."""
+    try:
+        return str(float(s.strip())).rstrip("0").rstrip(".")
+    except ValueError:
+        return s.strip()
+
+
 def _parse_exp(exp: str) -> str:
     """Convert TOS expiration to MM/DD/YYYY.
     '29 MAY 26' → '05/29/2026'   '5/22/26' → '05/22/2026'
@@ -291,6 +572,65 @@ def _parse_exp(exp: str) -> str:
     if len(slash) == 3 and len(slash[2]) == 2:
         slash[2] = "20" + slash[2]
     return "/".join(slash) if len(slash) == 3 else exp
+
+
+def _build_equity_date_lookup(rows: list[list[str]]) -> dict[str, str]:
+    """Return {SYMBOL: oldest_open_date} for equity BUY TO OPEN from Account Trade History.
+
+    History is newest-first, so overwriting on each match leaves the oldest date.
+    """
+    lookup: dict[str, str] = {}
+    in_section = False
+    col: dict[str, int] = {}
+
+    for row in rows:
+        if not row:
+            continue
+        cells = [c.strip().strip('"') for c in row]
+        first = cells[0]
+
+        if first == "Account Trade History":
+            in_section = True
+            col = {}
+            continue
+
+        if not in_section:
+            continue
+        if first:
+            break
+        if not col:
+            col = {h.strip().lower(): i for i, h in enumerate(cells)}
+            continue
+
+        try:
+            exec_time  = cells[col["exec time"]].strip()
+            side       = cells[col["side"]].strip()
+            pos_effect = cells[col["pos effect"]].strip()
+            sym        = cells[col["symbol"]].strip().upper()
+            exp        = cells[col["exp"]].strip()
+            typ        = cells[col["type"]].strip().upper()
+        except (KeyError, IndexError):
+            continue
+
+        if side != "BUY" or pos_effect != "TO OPEN":
+            continue
+        if typ in ("PUT", "CALL") or exp:   # skip options
+            continue
+        if not sym or not exec_time:
+            continue
+
+        date_part = exec_time.split()[0]
+        parts = date_part.split("/")
+        if len(parts) == 3:
+            try:
+                m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
+                if y < 100:
+                    y += 2000
+                lookup[sym] = f"{m:02d}/{d:02d}/{y}"   # overwrite → keeps oldest
+            except ValueError:
+                pass
+
+    return lookup
 
 
 def _build_premium_lookup(rows: list[list[str]]) -> dict[tuple, dict]:
@@ -354,7 +694,7 @@ def _build_premium_lookup(rows: list[list[str]]) -> dict[tuple, dict]:
             continue
 
         exp_fmt = _parse_exp(exp)
-        key     = (sym, exp_fmt, strike, typ)
+        key     = (sym, exp_fmt, _norm_strike(strike), typ)
 
         if side == "SELL" and pos_effect == "TO OPEN":
             try:
@@ -451,39 +791,39 @@ def _build_fee_lookup(rows: list[list[str]]) -> dict[tuple, float]:
             m = _TRD_CAL_RE.search(desc)
             if m:
                 sym, exp, strike, typ = m.groups()
-                key = (sym.upper(), _parse_exp(exp.strip()), strike.strip(), typ.upper())
+                key = (sym.upper(), _parse_exp(exp.strip()), _norm_strike(strike), typ.upper())
                 lookup[key] = round(lookup.get(key, 0.0) + total, 2)
         else:
             m = _TRD_SINGLE_RE.search(desc)
             if m:
                 sym, exp, strike, typ = m.groups()
-                key = (sym.upper(), _parse_exp(exp.strip()), strike.strip(), typ.upper())
+                key = (sym.upper(), _parse_exp(exp.strip()), _norm_strike(strike), typ.upper())
                 lookup[key] = round(lookup.get(key, 0.0) + total, 2)
 
     return lookup
 
 
-def _parse_tos_csv(path: Path) -> tuple[list[dict], list[str]]:
-    """Parse a TOS Account Statement CSV.
-
-    Reads the 'Options' section for current open positions and matches
-    fees from the Cash Balance TRD rows.
-    """
-    results:  list[dict] = []
-    warnings: list[str]  = []
+def _parse_tos_csv(
+    path: Path,
+) -> tuple[list[dict], list[str], list[dict], list[str]]:
+    """Parse a TOS Account Statement CSV. Returns (options, opt_warnings, equities, eq_warnings)."""
+    opt_results:  list[dict] = []
+    opt_warnings: list[str]  = []
+    eq_results:   list[dict] = []
+    eq_warnings:  list[str]  = []
 
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")
     except Exception as e:
-        return [], [str(e)]
+        return [], [str(e)], [], []
 
     rows = list(csv.reader(io.StringIO(text)))
 
-    # Build lookups from the full row list before scanning Options section
-    fee_lookup     = _build_fee_lookup(rows)
-    premium_lookup = _build_premium_lookup(rows)
+    fee_lookup        = _build_fee_lookup(rows)
+    premium_lookup    = _build_premium_lookup(rows)
+    equity_date_lookup = _build_equity_date_lookup(rows)
 
-    # Now find and parse the Options section
+    # ── Options section ───────────────────────────────────────────────────────
     in_options = False
     col: dict[str, int] = {}
 
@@ -501,7 +841,6 @@ def _parse_tos_csv(path: Path) -> tuple[list[dict], list[str]]:
         if not in_options:
             continue
 
-        # First row after "Options" is the column header
         if not col:
             col = {h.strip().lower(): i for i, h in enumerate(cells)}
             continue
@@ -521,25 +860,22 @@ def _parse_tos_csv(path: Path) -> tuple[list[dict], list[str]]:
             qty    = cells[col["qty"]]
             price  = cells[col["trade price"]]
         except (KeyError, IndexError) as e:
-            warnings.append(f"Skipped row (missing column {e}): {cells[:5]}")
+            opt_warnings.append(f"Skipped row (missing column {e}): {cells[:5]}")
             continue
 
         if not sym or sym in ("SYMBOL",):
             continue
 
-        exp_fmt     = _parse_exp(exp)
-        contract_key = (sym, exp_fmt, strike.strip(), typ.upper())
+        exp_fmt      = _parse_exp(exp)
+        contract_key = (sym, exp_fmt, _norm_strike(strike), typ.upper())
         fees         = f"{fee_lookup[contract_key]:.2f}" if contract_key in fee_lookup else ""
-        # Prefer Account Trade History Net Price — it reflects the actual credit
-        # received for the roll rather than the individual leg price shown in
-        # the Options section (which overstates premium for calendar spreads).
-        opened = ""
+        opened       = ""
         if contract_key in premium_lookup:
             entry  = premium_lookup[contract_key]
             price  = entry["price"]
             opened = entry["opened"]
 
-        results.append({
+        opt_results.append({
             "symbol":     sym,
             "type":       typ,
             "expiration": exp_fmt,
@@ -550,31 +886,7 @@ def _parse_tos_csv(path: Path) -> tuple[list[dict], list[str]]:
             "opened":     opened,
         })
 
-    if not results and not warnings:
-        warnings.append(
-            "Could not find an 'Options' section. "
-            "Make sure you exported an Account Statement from TOS."
-        )
-
-    return results, warnings
-
-
-def _parse_tos_equities(path: Path) -> tuple[list[dict], list[str]]:
-    """Parse the Equities section from a TOS Account Statement CSV.
-
-    TOS columns: Symbol, Description, Qty (+400), Trade Price, Mark, Mark Value
-    Returns long positions only (Qty > 0).
-    """
-    results:  list[dict] = []
-    warnings: list[str]  = []
-
-    try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except Exception as e:
-        return [], [str(e)]
-
-    rows = list(csv.reader(io.StringIO(text)))
-
+    # ── Equities section ──────────────────────────────────────────────────────
     _EQUITY_BREAKS = {
         "Options", "Profits and Losses", "Account Summary",
         "Futures Statements", "Forex Statements",
@@ -582,7 +894,7 @@ def _parse_tos_equities(path: Path) -> tuple[list[dict], list[str]]:
     }
 
     in_equities = False
-    col: dict[str, int] = {}
+    col = {}
 
     for row in rows:
         if not row:
@@ -624,7 +936,7 @@ def _parse_tos_equities(path: Path) -> tuple[list[dict], list[str]]:
                 continue
             shares = str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f)
         except (KeyError, IndexError, ValueError):
-            warnings.append(f"Skipped {sym}: could not parse qty")
+            eq_warnings.append(f"Skipped {sym}: could not parse qty")
             continue
 
         cost_basis = ""
@@ -644,17 +956,12 @@ def _parse_tos_equities(path: Path) -> tuple[list[dict], list[str]]:
                 except IndexError:
                     pass
 
-        results.append({
+        eq_results.append({
             "symbol":        sym,
             "shares":        shares,
             "cost_basis":    cost_basis,
             "current_price": current_price,
+            "opened":        equity_date_lookup.get(sym, ""),
         })
 
-    if not results and not warnings:
-        warnings.append(
-            "Could not find an 'Equities' section. "
-            "Make sure you exported an Account Statement from TOS."
-        )
-
-    return results, warnings
+    return opt_results, opt_warnings, eq_results, eq_warnings
