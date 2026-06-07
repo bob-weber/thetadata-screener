@@ -96,16 +96,20 @@ class PortfolioTab(QWidget):
         del_opt_btn       = QPushButton("Delete Option")
         self._refresh_btn = QPushButton("Refresh Prices")
         del_stk_btn       = QPushButton("Delete Stock")
+        clear_btn         = QPushButton("Clear All")
         import_btn.clicked.connect(self._import_csv)
         add_opt_btn.clicked.connect(lambda: self._add_option_row())
         del_opt_btn.clicked.connect(self._delete_selected_options)
         self._refresh_btn.clicked.connect(self._refresh_prices)
         del_stk_btn.clicked.connect(self._delete_selected_stocks)
+        clear_btn.clicked.connect(self._clear_all)
         for w in (import_btn, add_opt_btn, del_opt_btn):
             toolbar.addWidget(w)
         toolbar.addSpacing(12)
         for w in (self._refresh_btn, del_stk_btn):
             toolbar.addWidget(w)
+        toolbar.addSpacing(12)
+        toolbar.addWidget(clear_btn)
         toolbar.addStretch()
         self._status_label = QLabel("")
         toolbar.addWidget(self._status_label)
@@ -459,30 +463,109 @@ class PortfolioTab(QWidget):
             QMessageBox.warning(self, "Import", msg)
             return
 
-        if opts:
-            self._opt_table.blockSignals(True)
-            self._opt_table.setRowCount(0)
-            self._opt_table.blockSignals(False)
-            for row in opts:
-                self._add_option_row(row)
+        # Build existing key sets so we can skip duplicates
+        def _cell(table, row, col):
+            it = table.item(row, col)
+            return it.text().strip() if it else ""
 
-        if stks:
-            self._stk_table.blockSignals(True)
-            self._stk_table.setRowCount(0)
-            self._stk_table.blockSignals(False)
-            for row in stks:
+        existing_opts = {
+            (
+                _cell(self._opt_table, r, 0).upper(),  # symbol
+                _cell(self._opt_table, r, 1).upper(),  # type
+                _cell(self._opt_table, r, _O_EXP_COL),
+                _cell(self._opt_table, r, _O_STRIKE_COL),
+            )
+            for r in range(self._opt_table.rowCount())
+        }
+        existing_stks = {
+            _cell(self._stk_table, r, _S_SYM_COL).upper()
+            for r in range(self._stk_table.rowCount())
+        }
+
+        added_opts = skipped_opts = 0
+        for row in opts:
+            key = (
+                row.get("symbol", "").upper(),
+                row.get("type", "").upper(),
+                row.get("expiration", ""),
+                row.get("strike", ""),
+            )
+            if key in existing_opts:
+                # Fill in opened date if the existing row has it blank
+                new_opened = row.get("opened", "").strip()
+                if new_opened:
+                    for r in range(self._opt_table.rowCount()):
+                        if (
+                            _cell(self._opt_table, r, 0).upper() == key[0]
+                            and _cell(self._opt_table, r, 1).upper() == key[1]
+                            and _cell(self._opt_table, r, _O_EXP_COL) == key[2]
+                            and _cell(self._opt_table, r, _O_STRIKE_COL) == key[3]
+                            and not _cell(self._opt_table, r, _O_OPENED_COL)
+                        ):
+                            self._opt_table.item(r, _O_OPENED_COL).setText(new_opened)
+                            break
+                skipped_opts += 1
+            else:
+                self._add_option_row(row)
+                existing_opts.add(key)
+                added_opts += 1
+
+        added_stks = skipped_stks = 0
+        for row in stks:
+            sym = row.get("symbol", "").upper()
+            if sym in existing_stks:
+                # Fill in opened date if the existing row has it blank
+                new_opened = row.get("opened", "").strip()
+                if new_opened:
+                    for r in range(self._stk_table.rowCount()):
+                        if (
+                            _cell(self._stk_table, r, _S_SYM_COL).upper() == sym
+                            and not _cell(self._stk_table, r, _S_OPENED_COL)
+                        ):
+                            self._stk_table.item(r, _S_OPENED_COL).setText(new_opened)
+                            break
+                skipped_stks += 1
+            else:
                 self._add_stock_row(row)
+                existing_stks.add(sym)
+                added_stks += 1
 
         parts = []
-        if opts:
-            parts.append(f"{len(opts)} option(s)")
-        if stks:
-            parts.append(f"{len(stks)} stock(s)")
-        note = "Imported " + " and ".join(parts) + "."
+        if added_opts:
+            parts.append(f"{added_opts} option(s)")
+        if added_stks:
+            parts.append(f"{added_stks} stock(s)")
+        note = ("Imported " + " and ".join(parts) + ".") if parts else "No new positions found."
+        extras = []
+        skipped = skipped_opts + skipped_stks
+        if skipped:
+            extras.append(f"{skipped} duplicate(s) skipped")
         all_warns = opt_warns + stk_warns
         if all_warns:
-            note += f"  ({len(all_warns)} row(s) skipped)"
+            extras.append(f"{len(all_warns)} row(s) skipped")
+        if extras:
+            note += f"  ({', '.join(extras)})"
         self._status_label.setText(note)
+
+    def _clear_all(self):
+        reply = QMessageBox.question(
+            self, "Clear All Positions",
+            "Clear all option and stock positions?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._opt_table.blockSignals(True)
+        self._stk_table.blockSignals(True)
+        self._opt_table.setRowCount(0)
+        self._stk_table.setRowCount(0)
+        self._opt_table.blockSignals(False)
+        self._stk_table.blockSignals(False)
+        POSITIONS_FILE.unlink(missing_ok=True)
+        STOCKS_FILE.unlink(missing_ok=True)
+        self._update_summary()
+        self._status_label.setText("All positions cleared.")
 
     # ── price refresh ─────────────────────────────────────────────────────────
 
