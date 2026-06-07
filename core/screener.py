@@ -217,9 +217,14 @@ def fetch_option_eod_chain(symbol: str, exp: date, trade_date: date, right: str 
         text = r.text.strip()
         if text.startswith("No data"):
             return None
+        # Plain-text response (no commas) = terminal error message, not CSV data.
+        if "," not in text.split("\n")[0]:
+            raise ScreenerError(f"ThetaData terminal error: {text[:300]}")
         df = pd.read_csv(io.StringIO(text))
         df.columns = [c.strip().lower() for c in df.columns]
         return df if not df.empty else None
+    except ScreenerError:
+        raise
     except Exception:
         return None
 
