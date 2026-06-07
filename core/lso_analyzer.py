@@ -11,7 +11,7 @@ _SECTOR_SCORES: dict[str, tuple[int, str]] = {
     "Industrials":          (+2,  "Moderate stability; watch macro cycle"),
     "Consumer Cyclical":    (0,   "Economic cycle exposure; monitor earnings"),
     "Communication Services":(0,  "Mixed — some stable, some high-growth volatile"),
-    "Technology":           (-5,  "Earnings gap risk; higher implied vol"),
+    "Technology":           (0,   ""),
     "Financial Services":   (-8,  "Interest-rate sensitive; credit cycle exposure"),
     "Healthcare":           (-10, "Large-pharma stable; biotech is binary-event risk"),
     "Basic Materials":      (-15, "Commodity-price exposure; cyclical"),
@@ -37,12 +37,12 @@ def _score_beta(beta: float | None) -> tuple[int, str]:
     if beta < 0.8:
         return +5,  f"Beta {beta:.2f} — below-market volatility"
     if beta < 1.2:
-        return 0,   ""
+        return 0, ""
     if beta < 1.5:
-        return -8,  f"Beta {beta:.2f} — elevated volatility"
+        return 0, f"Beta {beta:.2f} — elevated volatility; size conservatively"
     if beta < 2.0:
-        return -15, f"Beta {beta:.2f} — high volatility; larger gap risk"
-    return -25, f"Beta {beta:.2f} — very high volatility; avoid near events"
+        return 0, f"Beta {beta:.2f} — high volatility; use wider OTM cushion"
+    return 0, f"Beta {beta:.2f} — very high volatility; high risk tier sizing"
 
 
 def _score_market_cap(cap: int | None) -> tuple[int, str]:
@@ -73,16 +73,26 @@ def _score_otm(otm_pct: float) -> tuple[int, str, str | None]:
             f"Strike is {abs(otm_pct):.1f}% ITM — put is in-the-money; "
             "immediate assignment risk"
         ), "ITM STRIKE"
-    if otm_pct < 1:
-        return -15, (
-            f"Strike {otm_pct:.1f}% OTM — nearly ATM; "
-            "high assignment risk on any small dip"
+    if otm_pct < 2:
+        return -30, (
+            f"Strike {otm_pct:.1f}% OTM — market pricing real downside risk; "
+            "insufficient cushion for 1% rule"
         ), "NEAR ATM"
-    if otm_pct < 3:
-        return 0, f"Strike {otm_pct:.1f}% OTM — slightly OTM", None
-    if otm_pct < 7:
-        return +3, f"Strike {otm_pct:.1f}% OTM — comfortable cushion", None
-    return +5, f"Strike {otm_pct:.1f}% OTM — conservative; good downside protection", None
+    if otm_pct < 4:
+        return -10, (
+            f"Strike {otm_pct:.1f}% OTM — marginal cushion; "
+            "only acceptable for low-beta, high-dividend names"
+        ), "MARGINAL OTM"
+    if otm_pct < 8:
+        return +3, f"Strike {otm_pct:.1f}% OTM — good cushion", None
+    if otm_pct < 12:
+        return +5, f"Strike {otm_pct:.1f}% OTM — excellent cushion; strong downside protection", None
+    if otm_pct <= 16:
+        return -5, f"Strike {otm_pct:.1f}% OTM — wide; verify premium is still meaningful", None
+    return -30, (
+        f"Strike {otm_pct:.1f}% OTM — market warning label; "
+        "wide OTM for 1% premium signals severe downside priced in"
+    ), "WIDE OTM"
 
 
 def apply_contract_adjustments(result: dict, otm_pct: float | None) -> dict:
