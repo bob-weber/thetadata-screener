@@ -150,7 +150,7 @@ class OptionsWorker(QThread):
             self.error.emit(f"Unexpected error: {e}")
 
 
-class WheelWorker(QThread):
+class LsoWorker(QThread):
     log_msg    = pyqtSignal(str)
     progress   = pyqtSignal(int, int)
     finished   = pyqtSignal(list)
@@ -165,7 +165,7 @@ class WheelWorker(QThread):
 
     def run(self):
         from datetime import datetime
-        from core.wheel_analyzer import analyze_symbols, apply_contract_adjustments
+        from core.lso_analyzer import analyze_symbols, apply_contract_adjustments
 
         opt_path = Path(OPTIONS_RESULTS_CACHE)
         if not opt_path.exists():
@@ -192,7 +192,7 @@ class WheelWorker(QThread):
 
         symbols = sorted({r["symbol"] for r in results})
         self.log_msg.emit(
-            f"Analyzing {len(symbols)} unique symbols for wheel suitability "
+            f"Analyzing {len(symbols)} unique symbols for LSO suitability "
             f"(exp {exp_str}, scan from {scan_date}) …"
         )
 

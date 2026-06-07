@@ -11,7 +11,7 @@ from PyQt6.QtGui import QColor
 
 from .claude_dialog import ClaudeAnalysisDialog
 
-from .workers import WheelWorker, OPTIONS_RESULTS_CACHE
+from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
 _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct", "capital",
             "sector", "beta", "mkt_cap_b",
@@ -49,7 +49,7 @@ def _grade_sort_key(grade: str) -> int:
     return {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}.get(grade, 5)
 
 
-class WheelAnalysisTab(QWidget):
+class LsoAnalysisTab(QWidget):
     def __init__(self):
         super().__init__()
         self._worker      = None
@@ -85,7 +85,7 @@ class WheelAnalysisTab(QWidget):
         # ── Controls ──────────────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
         self._status_label = QLabel("Run the Options Scanner first.")
-        self._run_btn  = QPushButton("Analyze for Wheel")
+        self._run_btn  = QPushButton("Analyze for LSO")
         self._stop_btn = QPushButton("Stop")
         self._run_btn.setFixedHeight(32)
         self._stop_btn.setFixedHeight(32)
@@ -158,7 +158,7 @@ class WheelAnalysisTab(QWidget):
         self._progress_bar.setValue(0)
         self._progress_label.setText("—")
 
-        self._worker = WheelWorker()
+        self._worker = LsoWorker()
         self._worker.log_msg.connect(self._log.append)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
