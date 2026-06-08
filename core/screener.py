@@ -249,10 +249,13 @@ def _get_company_symbols(client, on_log=None) -> list[str]:
 
         df = df[df["exchange"].isin(VALID_EXCHANGES)].copy()
         df["ticker"] = df["ticker"].str.upper().str.strip()
+        # Single-char suffixes W/R denote warrants/rights at any length.
+        # U denotes SPAC units only when appended to a 4-char base (5+ chars total);
+        # shorter tickers like LULU/ROKU are legitimate standalone symbols.
         df = df[
             ~df["ticker"].str.endswith("W") &
             ~df["ticker"].str.endswith("R") &
-            ~df["ticker"].str.endswith("U") &
+            ~(df["ticker"].str.endswith("U") & (df["ticker"].str.len() >= 5)) &
             ~df["ticker"].str.contains(r"[\^~\+]", regex=True)
         ]
         df = df[~df["name"].apply(_is_fund)]
