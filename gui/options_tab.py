@@ -198,7 +198,7 @@ class OptionsScannerTab(QWidget):
         yh = QHBoxLayout(yield_row)
         yh.setContentsMargins(0, 0, 0, 0)
         self._yield_min = QLineEdit("0.9")
-        self._yield_max = QLineEdit("1.1")
+        self._yield_max = QLineEdit("2.0")
         yh.addWidget(self._yield_min)
         yh.addWidget(QLabel("–"))
         yh.addWidget(self._yield_max)

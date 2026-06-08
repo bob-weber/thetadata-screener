@@ -299,7 +299,7 @@ def run_stock_filter(
     from thetadata.errors import AuthenticationError
 
     price_min        = config.get("price_min",        10.0)
-    price_max        = config.get("price_max",        75.0)
+    price_max        = config.get("price_max",       200.0)
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
     bb_std_mult      = config.get("bb_std_mult",       2.0)
@@ -526,7 +526,7 @@ def run_options_filter(
     stop_flag=None,
 ) -> list[dict]:
     yield_min        = config.get("yield_min",        0.009)
-    yield_max        = config.get("yield_max",        0.011)
+    yield_max        = config.get("yield_max",        0.020)
     options_throttle = config.get("options_throttle", 0.5)
     right            = config.get("right",            "P")    # "P" or "C"
     side             = config.get("side",             "sell") # "sell" or "buy"

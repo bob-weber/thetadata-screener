@@ -74,7 +74,7 @@ class StockScannerTab(QWidget):
         ph = QHBoxLayout(price_row)
         ph.setContentsMargins(0, 0, 0, 0)
         self._price_min = QLineEdit("10.0")
-        self._price_max = QLineEdit("75.0")
+        self._price_max = QLineEdit("200.0")
         ph.addWidget(self._price_min)
         ph.addWidget(QLabel("–"))
         ph.addWidget(self._price_max)
