@@ -216,15 +216,19 @@ class LsoWorker(QThread):
 
         merged = []
         for contract in results:
-            sym     = contract["symbol"]
-            strike  = contract.get("strike")
-            otm_pct = contract.get("otm_pct")
+            sym        = contract["symbol"]
+            strike     = contract.get("strike")
+            stock_price = price_lookup.get(sym)
             if sym not in sym_analysis:
                 continue
+            if strike is not None and stock_price is not None:
+                otm_pct = round((stock_price - strike) / stock_price * 100, 2)
+            else:
+                otm_pct = contract.get("otm_pct")
             adjusted = apply_contract_adjustments(sym_analysis[sym], otm_pct)
             merged.append({
                 **adjusted,
-                "stock_price": price_lookup.get(sym),
+                "stock_price": stock_price,
                 "strike":      strike,
                 "premium":     contract.get("yield_pct"),
                 "otm_pct":     otm_pct,
