@@ -1,9 +1,8 @@
 from PyQt6.QtWidgets import QMainWindow, QTabWidget
 
-from .stock_tab     import StockScannerTab
-from .options_tab   import OptionsScannerTab
-from .lso_tab       import LsoAnalysisTab
-from .positions_tab import PortfolioTab
+from .stock_tab   import StockScannerTab
+from .options_tab import OptionsScannerTab
+from .lso_tab     import LsoAnalysisTab
 
 
 class MainWindow(QMainWindow):
@@ -20,8 +19,7 @@ class MainWindow(QMainWindow):
         options_tab.scan_finished.connect(lso_tab.refresh_options_status)
 
         tabs = QTabWidget()
-        tabs.addTab(stock_tab,      "Stock Scanner")
-        tabs.addTab(options_tab,    "Options Scanner")
-        tabs.addTab(lso_tab,        "LSO Analysis")
-        tabs.addTab(PortfolioTab(), "Portfolio")
+        tabs.addTab(stock_tab,   "Stock Scanner")
+        tabs.addTab(options_tab, "Options Scanner")
+        tabs.addTab(lso_tab,     "LSO Analysis")
         self.setCentralWidget(tabs)
