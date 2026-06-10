@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -7,7 +8,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QLabel, QSplitter,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QGuiApplication
 
 from .claude_dialog import ClaudeAnalysisDialog
 
@@ -55,6 +56,7 @@ class LsoAnalysisTab(QWidget):
         self._worker      = None
         self._results_box = None
         self._table       = None
+        self._results     = []
         self._setup_ui()
         self.refresh_options_status()
 
@@ -85,16 +87,21 @@ class LsoAnalysisTab(QWidget):
         # ── Controls ──────────────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
         self._status_label = QLabel("Run the Options Scanner first.")
-        self._run_btn  = QPushButton("Analyze for LSO")
-        self._stop_btn = QPushButton("Stop")
+        self._run_btn    = QPushButton("Analyze for LSO")
+        self._stop_btn   = QPushButton("Stop")
+        self._export_btn = QPushButton("Export for Claude")
         self._run_btn.setFixedHeight(32)
         self._stop_btn.setFixedHeight(32)
+        self._export_btn.setFixedHeight(32)
         self._stop_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
         self._run_btn.clicked.connect(self._run)
         self._stop_btn.clicked.connect(self._stop)
+        self._export_btn.clicked.connect(self._export)
         ctrl_row.addWidget(self._status_label, 1)
         ctrl_row.addWidget(self._run_btn)
         ctrl_row.addWidget(self._stop_btn)
+        ctrl_row.addWidget(self._export_btn)
         root.addLayout(ctrl_row)
 
         # ── Progress ──────────────────────────────────────────────────────
@@ -176,8 +183,10 @@ class LsoAnalysisTab(QWidget):
             self._progress_bar.setValue(int(current * 100 / total))
 
     def _on_finished(self, results: list):
+        self._results = results
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._export_btn.setEnabled(bool(results))
         self._progress_bar.setValue(100)
         self._status_label.setText(f"{len(results)} contracts analyzed.")
         self._log.append(f"Done — {len(results)} contracts analyzed.")
@@ -201,6 +210,63 @@ class LsoAnalysisTab(QWidget):
             return
         dlg = ClaudeAnalysisDialog(symbol, row_data, self)
         dlg.exec()
+
+    def _export(self):
+        if not self._results:
+            return
+
+        try:
+            meta = json.loads(Path(OPTIONS_RESULTS_CACHE).read_text())
+        except Exception:
+            meta = {}
+
+        lines = [
+            f"# LSO Analysis — {date.today()}",
+            f"",
+            f"- Scan date: {meta.get('date', 'unknown')}",
+            f"- Expiration: {meta.get('expiration_date', 'unknown')}",
+            f"- Right: {meta.get('right', 'P')}  Side: {meta.get('side', 'sell')}",
+            f"- Yield range: {meta.get('yield_min', 0)*100:.1f}% – {meta.get('yield_max', 0)*100:.1f}%",
+            f"- Contracts: {len(self._results)}",
+            f"",
+            f"| Grade | Symbol | Stock | Strike | Premium | OTM% | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
+            f"|-------|--------|-------|--------|---------|------|---------|--------|------|--------------|----------|-----------|-------|-------|",
+        ]
+
+        sorted_results = sorted(
+            self._results,
+            key=lambda r: (_grade_sort_key(r.get("grade", "?")), r.get("symbol", ""))
+        )
+        for r in sorted_results:
+            def _v(key, prefix="", suffix="", fmt=""):
+                val = r.get(key)
+                if val is None:
+                    return ""
+                formatted = format(val, fmt) if fmt else str(val)
+                return f"{prefix}{formatted}{suffix}"
+
+            cap = r.get("capital")
+            cap_str = f"${int(cap):,}" if cap is not None else ""
+            cells = [
+                r.get("grade", "?"),
+                r.get("symbol", ""),
+                _v("stock_price", "$", "", ".2f"),
+                _v("strike",      "$", "", ".2f"),
+                _v("premium",     "",  "%", ".2f"),
+                _v("otm_pct",     "",  "%", ".1f"),
+                cap_str,
+                r.get("sector", ""),
+                _v("beta",        "",  "", ".2f"),
+                _v("mkt_cap_b",   "",  "", ".1f"),
+                r.get("earnings_date", ""),
+                "YES" if r.get("earnings_in_period") else "no",
+                r.get("flags", ""),
+                r.get("notes", ""),
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+
+        QGuiApplication.clipboard().setText("\n".join(lines))
+        self._status_label.setText(f"Copied {len(self._results)} contracts to clipboard.")
 
     def _populate_table(self, results: list):
         results = sorted(results, key=lambda r: (_grade_sort_key(r.get("grade", "?")), r.get("symbol", "")))
