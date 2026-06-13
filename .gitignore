@@ -13,6 +13,7 @@ options_results_cache.json
 my_option_positions.json
 my_stock_positions.json
 my_option_superseded.json
+my_option_events.json
 my_positions.txt
 gains_history.json
 

@@ -3,122 +3,130 @@ import csv
 import io
 import json
 import re
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QPushButton, QTableWidget, QTableWidgetItem,
-    QHeaderView, QLabel, QFileDialog,
-    QAbstractItemView, QMessageBox,
+    QWidget, QVBoxLayout,
+    QTableWidget, QTableWidgetItem,
+    QHeaderView, QLabel, QFileDialog, QMessageBox,
+    QAbstractItemView,
 )
 
 POSITIONS_FILE   = Path("my_option_positions.json")
 STOCKS_FILE      = Path("my_stock_positions.json")
-SUPERSEDED_FILE  = Path("my_option_superseded.json")   # rolled-away legs, across imports
+SUPERSEDED_FILE  = Path("my_option_superseded.json")   # legacy (pre-lifecycle), cleaned up
+EVENTS_FILE      = Path("my_option_events.json")        # accumulated cash events for wheel reconstruction
 
 # ── Options column layout ──────────────────────────────────────────────────────
 # (field, header, kind)   kind: "edit" = stored & editable, "calc" = computed,
 #                                "hidden" = stored but not shown (used for calc)
 _OPT_COLUMNS = [
-    ("symbol",     "Symbol",         "edit"),
-    ("opened",     "Opened",         "edit"),
-    ("type",       "P/C",            "edit"),
-    ("qty",        "Qty",            "edit"),
-    ("strike",     "Strike",         "edit"),
-    ("premium",    "Premium",        "edit"),   # net credit/share; drives cost basis & RoR
-    ("expiration", "Expiration",     "edit"),
-    ("status",     "Status",         "edit"),
-    ("weeks_held", "Weeks Held",     "calc"),
-    ("fees",       "Fees",           "edit"),
-    ("weekly_ror", "Avg Weekly RoR", "calc"),
-    ("cost_basis", "Cost Basis",     "calc"),
+    ("symbol",     "Symbol",            "edit"),
+    ("opened",     "Opened",            "edit"),
+    ("lifecycle",  "Lifecycle",         "edit"),   # Put → Assigned → Sold, etc.
+    ("qty",        "Qty",               "edit"),
+    ("strike",     "Strike",            "edit"),
+    ("premium",    "Premium ($)",       "edit"),   # total option premium collected (puts + calls)
+    ("expiration", "Expiration",        "edit"),
+    ("status",     "Status",            "edit"),
+    ("weeks_held", "Weeks Held",        "calc"),
+    ("fees",       "Fees",              "edit"),
+    ("weekly_ror", "Avg Weekly RoR",    "calc"),
+    ("cost_basis", "Cost Basis / P&L",  "calc"),
 ]
 _OPT_FIELDS = [c[0] for c in _OPT_COLUMNS]
 _O_HDRS     = [c[1] for c in _OPT_COLUMNS]
-_OPT_STORE  = [c[0] for c in _OPT_COLUMNS if c[2] in ("edit", "hidden")]
-_OPT_CALC   = {c[0] for c in _OPT_COLUMNS if c[2] == "calc"}
 _OPT_HIDDEN_COLS = [i for i, c in enumerate(_OPT_COLUMNS) if c[2] == "hidden"]
 
 def _oc(field: str) -> int:
     return _OPT_FIELDS.index(field)
 
-_O_SYM_COL     = _oc("symbol")
-_O_TYPE_COL    = _oc("type")
-_O_STRIKE_COL  = _oc("strike")
-_O_CB_COL      = _oc("cost_basis")
-_O_OPENED_COL  = _oc("opened")
-_O_EXP_COL     = _oc("expiration")
-_O_STATUS_COL  = _oc("status")
-_O_WEEKS_COL   = _oc("weeks_held")
-_O_ROR_COL     = _oc("weekly_ror")
-_O_PREMIUM_COL = _oc("premium")
+_O_SYM_COL       = _oc("symbol")
+_O_LIFECYCLE_COL = _oc("lifecycle")
+_O_STRIKE_COL    = _oc("strike")
+_O_CB_COL        = _oc("cost_basis")
+_O_OPENED_COL    = _oc("opened")
+_O_EXP_COL       = _oc("expiration")
+_O_STATUS_COL    = _oc("status")
+_O_WEEKS_COL     = _oc("weeks_held")
+_O_ROR_COL       = _oc("weekly_ror")
+_O_PREMIUM_COL   = _oc("premium")
 
-# ── Stocks column layout ───────────────────────────────────────────────────────
-_SE     = ["symbol", "shares", "cost_basis", "current_price", "opened"]
-_SC     = ["total_cost", "current_value", "gain_loss", "ror_pct"]
-_S_HDRS = ["Symbol", "Shares", "Cost Basis", "Current Price", "Opened",
-           "Total Cost", "Current Value", "Gain/Loss $", "RoR %"]
-
-_S_SYM_COL    = 0
-_S_SHARES_COL = 1
-_S_COST_COL   = 2
-_S_PRICE_COL  = 3
-_S_OPENED_COL = 4
-_S_TCOST_COL  = 5
-_S_CVAL_COL   = 6
-_S_GL_COL     = 7
-_S_ROR_COL    = 8
-
-_GREEN = QColor("#2e7d32")
-_RED   = QColor("#c62828")
+_STATUS_SORT = {"Open": 0, "Holding": 1, "Closed": 2, "Called away": 3,
+                "Assigned": 4, "Sold": 5, "Expired": 6}
+_DATE_FILTERS = ["All time", "Last 12 months", "Last month"]
 
 
-class _PriceFetcher(QThread):
-    price_ready = pyqtSignal(str, float)
-    log_msg     = pyqtSignal(str)
-    done        = pyqtSignal()
-
-    def __init__(self, symbols: list[str]):
-        super().__init__()
-        self._symbols = symbols
-
-    def run(self):
-        import yfinance as yf
-        for sym in self._symbols:
-            try:
-                hist = yf.Ticker(sym).history(period="2d")
-                if not hist.empty:
-                    self.price_ready.emit(sym, float(hist["Close"].iloc[-1]))
-                else:
-                    self.log_msg.emit(f"{sym}: no price data")
-            except Exception as e:
-                self.log_msg.emit(f"{sym}: {e}")
-        self.done.emit()
+class _StatusItem(QTableWidgetItem):
+    """Table item that sorts Status by wheel-cycle progression, not alphabetically."""
+    def __lt__(self, other):
+        if isinstance(other, _StatusItem):
+            return (_STATUS_SORT.get(self.text(), 99) <
+                    _STATUS_SORT.get(other.text(), 99))
+        return super().__lt__(other)
 
 
 class PortfolioTab(QWidget):
-    csv_imported = pyqtSignal(str)   # emits the file path after a successful import
+    csv_imported    = pyqtSignal(str)   # file path after a successful import
+    account_changed = pyqtSignal(str)   # account label text
+    status_changed  = pyqtSignal(str)   # status bar text
 
     def __init__(self):
         super().__init__()
-        self._fetcher = None
-        self._superseded = self._load_superseded()
+        self._events, self._outcomes, self._account = self._load_events()
+        self._date_filter_text = "All time"
         self._setup_ui()
         self._load_saved()
+        self._rebuild_options_table()
+        self.account_changed.emit(self._account)
 
-    def _load_superseded(self) -> set:
-        if SUPERSEDED_FILE.exists():
+    def _load_events(self) -> tuple[list[dict], dict, str]:
+        if EVENTS_FILE.exists():
             try:
-                return {tuple(k) for k in json.loads(SUPERSEDED_FILE.read_text())}
+                data = json.loads(EVENTS_FILE.read_text())
+                events   = data.get("events", [])
+                outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
+                return events, outcomes, data.get("account", "")
             except Exception:
                 pass
-        return set()
+        return [], {}, ""
 
-    def _save_superseded(self):
-        SUPERSEDED_FILE.write_text(json.dumps([list(k) for k in sorted(self._superseded)]))
+    def _save_events(self):
+        EVENTS_FILE.write_text(json.dumps({
+            "account":  self._account,
+            "events":   self._events,
+            "outcomes": {_outcome_key(k): v for k, v in self._outcomes.items()},
+        }, indent=2))
+
+    def set_date_filter(self, text: str):
+        self._date_filter_text = text
+        self._rebuild_options_table()
+
+    def _rebuild_options_table(self):
+        from datetime import timedelta
+        rows = _reconstruct_wheels(self._events, self._outcomes)
+
+        # Date-range filter — active (Open/Holding) positions always shown
+        sel = self._date_filter_text
+        if sel != "All time":
+            days = 365 if sel == "Last 12 months" else 30
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = [r for r in rows
+                    if r["status"] in ("Open", "Holding") or r["opened"] >= cutoff]
+
+        rows.sort(key=lambda r: (_STATUS_SORT.get(r["status"], 99), r["symbol"], r["opened"]))
+        self._opt_table.setSortingEnabled(False)
+        self._opt_table.blockSignals(True)
+        self._opt_table.setRowCount(0)
+        for r in rows:
+            self._insert_option_row(r)
+        self._opt_table.blockSignals(False)
+        self._opt_table.setSortingEnabled(True)
+        self._opt_table.sortByColumn(_O_STATUS_COL, Qt.SortOrder.AscendingOrder)
+        self._opt_table.resizeColumnsToContents()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -126,80 +134,26 @@ class PortfolioTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
-        toolbar = QHBoxLayout()
-        import_btn        = QPushButton("Import TOS CSV…")
-        add_opt_btn       = QPushButton("Add Option")
-        del_opt_btn       = QPushButton("Delete Option")
-        self._refresh_btn = QPushButton("Refresh Prices")
-        del_stk_btn       = QPushButton("Delete Stock")
-        clear_btn         = QPushButton("Clear All")
-        import_btn.clicked.connect(self._import_csv)
-        add_opt_btn.clicked.connect(lambda: self._add_option_row())
-        del_opt_btn.clicked.connect(self._delete_selected_options)
-        self._refresh_btn.clicked.connect(self._refresh_prices)
-        del_stk_btn.clicked.connect(self._delete_selected_stocks)
-        clear_btn.clicked.connect(self._clear_all)
-        for w in (import_btn, add_opt_btn, del_opt_btn):
-            toolbar.addWidget(w)
-        toolbar.addSpacing(12)
-        for w in (self._refresh_btn, del_stk_btn):
-            toolbar.addWidget(w)
-        toolbar.addSpacing(12)
-        toolbar.addWidget(clear_btn)
-        toolbar.addStretch()
-        self._status_label = QLabel("")
-        toolbar.addWidget(self._status_label)
-        root.addLayout(toolbar)
-
         hint = QLabel(
-            "Options: one line per rolled position; Cost Basis & RoR are net of commissions + fees.  "
-            "Stocks: Cost Basis and Current Price are per share."
+            "One line per wheel cycle (Put → Assigned → … ). "
+            "P&L and RoR include all premiums + stock outcome, net of fees. "
+            "Derived from imported TOS statements."
         )
         hint.setStyleSheet("color: grey; font-size: 11px;")
         root.addWidget(hint)
 
-        opt_box = QGroupBox("Option Positions")
-        ol = QVBoxLayout(opt_box)
         self._opt_table = QTableWidget(0, len(_O_HDRS))
         self._opt_table.setHorizontalHeaderLabels(_O_HDRS)
         self._opt_table.setSortingEnabled(True)
         self._opt_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._opt_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked |
-                                        QTableWidget.EditTrigger.SelectedClicked)
-        self._opt_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._opt_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _oh = self._opt_table.horizontalHeader()
+        _oh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        _oh.setStretchLastSection(True)
         self._opt_table.verticalHeader().setVisible(False)
         for ci in _OPT_HIDDEN_COLS:
             self._opt_table.setColumnHidden(ci, True)
-        self._opt_table.itemChanged.connect(self._on_opt_item_changed)
-        ol.addWidget(self._opt_table)
-        root.addWidget(opt_box, 2)
-
-        stk_box = QGroupBox("Long Stock Positions")
-        sl = QVBoxLayout(stk_box)
-        self._stk_table = QTableWidget(0, len(_S_HDRS))
-        self._stk_table.setHorizontalHeaderLabels(_S_HDRS)
-        self._stk_table.setSortingEnabled(True)
-        self._stk_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._stk_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked |
-                                        QTableWidget.EditTrigger.SelectedClicked)
-        self._stk_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._stk_table.verticalHeader().setVisible(False)
-        self._stk_table.itemChanged.connect(self._on_stk_item_changed)
-        sl.addWidget(self._stk_table)
-        root.addWidget(stk_box, 1)
-
-        sum_box = QGroupBox("Portfolio Summary")
-        sml = QHBoxLayout(sum_box)
-        self._lbl_cost    = QLabel("Total Cost: —")
-        self._lbl_val     = QLabel("Current Value: —")
-        self._lbl_gl      = QLabel("Gain/Loss: —")
-        self._lbl_ror     = QLabel("Total RoR: —")
-        self._lbl_ann_ror = QLabel("Annualized RoR: —")
-        for lbl in (self._lbl_cost, self._lbl_val, self._lbl_gl,
-                    self._lbl_ror, self._lbl_ann_ror):
-            lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
-            sml.addWidget(lbl)
-        root.addWidget(sum_box)
+        root.addWidget(self._opt_table, 1)
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
@@ -212,290 +166,28 @@ class PortfolioTab(QWidget):
     # ── Options rows ──────────────────────────────────────────────────────────
 
     def _insert_option_row(self, data: dict | None = None) -> int:
-        """Insert a row and recompute it. Does NOT toggle sorting or save —
-        callers manage those so batch upserts keep stable row indices."""
-        self._opt_table.blockSignals(True)
+        """Insert one derived lifecycle row (all fields supplied; read-only)."""
         row = self._opt_table.rowCount()
         self._opt_table.insertRow(row)
         d = data or {}
         for ci, field in enumerate(_OPT_FIELDS):
-            if field in _OPT_CALC:
-                self._opt_table.setItem(row, ci, self._make_item("", editable=False))
+            val = str(d.get(field, ""))
+            if field == "status":
+                item = _StatusItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             else:
-                self._opt_table.setItem(row, ci, self._make_item(str(d.get(field, ""))))
-        self._opt_table.blockSignals(False)
-        self._recompute_option_row(row)
+                item = self._make_item(val, editable=False)
+            self._opt_table.setItem(row, ci, item)
         return row
-
-    def _add_option_row(self, data: dict | None = None):
-        self._opt_table.setSortingEnabled(False)
-        self._insert_option_row(data)
-        self._opt_table.setSortingEnabled(True)
-        self._save_options()
-
-    def _recompute_option_row(self, row: int):
-        def _float(col):
-            it = self._opt_table.item(row, col)
-            if not it:
-                return None
-            try:
-                return float(it.text().replace("$", "").replace(",", "").replace("%", ""))
-            except ValueError:
-                return None
-
-        def _text(col):
-            it = self._opt_table.item(row, col)
-            return it.text().strip() if it else ""
-
-        strike   = _float(_O_STRIKE_COL)
-        premium  = _float(_O_PREMIUM_COL)
-        qty      = _float(_oc("qty"))
-        fees     = _float(_oc("fees"))
-        typ      = _text(_O_TYPE_COL).upper()
-        exp_text = _text(_O_EXP_COL)
-        opened_text = _text(_O_OPENED_COL)
-        status   = _text(_O_STATUS_COL) or "Open"
-
-        # Net premium per share, after all costs (commissions + fees).
-        # Fees are total dollars across the chain; spread over qty × 100 shares.
-        net_premium = premium
-        if premium is not None and fees and qty:
-            net_premium = premium - fees / (abs(qty) * 100)
-
-        self._opt_table.blockSignals(True)
-
-        # Cost basis (puts): strike − net premium/share
-        cb_text = ""
-        if typ.startswith("P") and strike is not None and net_premium is not None:
-            cb_text = f"{strike - net_premium:.2f}"
-        self._opt_table.item(row, _O_CB_COL).setText(cb_text)
-
-        # Parse dates once
-        opened_d = _parse_mdy(opened_text)
-        exp_d    = _parse_mdy(exp_text)
-
-        # Avg weekly RoR (net of costs) over the full contract term (open → expiration)
-        ror_text = ""
-        if strike and strike > 0 and net_premium is not None and opened_d and exp_d:
-            total_days = (exp_d - opened_d).days
-            if total_days > 0:
-                ror_text = f"{(net_premium / strike) * (7 / total_days) * 100:.2f}%"
-        self._opt_table.item(row, _O_ROR_COL).setText(ror_text)
-
-        # Weeks held: open → today for live positions, open → expiry once closed
-        weeks_text = ""
-        if opened_d:
-            end_d = date.today() if status.lower() == "open" else (exp_d or date.today())
-            days = (end_d - opened_d).days
-            if days >= 0:
-                weeks_text = f"{days / 7:.1f}"
-        self._opt_table.item(row, _O_WEEKS_COL).setText(weeks_text)
-
-        self._opt_table.blockSignals(False)
-
-    def _on_opt_item_changed(self, item: QTableWidgetItem):
-        if item.column() in (_O_TYPE_COL, _O_STRIKE_COL, _O_EXP_COL,
-                             _O_OPENED_COL, _O_STATUS_COL, _O_PREMIUM_COL,
-                             _oc("qty"), _oc("fees")):
-            self._recompute_option_row(item.row())
-        self._save_options()
-
-    def _delete_selected_options(self):
-        rows = sorted({i.row() for i in self._opt_table.selectedItems()}, reverse=True)
-        if not rows:
-            return
-        self._opt_table.blockSignals(True)
-        for r in rows:
-            self._opt_table.removeRow(r)
-        self._opt_table.blockSignals(False)
-        self._save_options()
-        self._status_label.setText(f"Deleted {len(rows)} option row(s).")
-
-    # ── Stocks rows ───────────────────────────────────────────────────────────
-
-    def _add_stock_row(self, data: dict | None = None):
-        self._stk_table.setSortingEnabled(False)
-        self._stk_table.blockSignals(True)
-        row = self._stk_table.rowCount()
-        self._stk_table.insertRow(row)
-        d = data or {}
-        for ci, col in enumerate(_SE):
-            self._stk_table.setItem(row, ci, self._make_item(str(d.get(col, ""))))
-        for ci in range(len(_SE), len(_SE) + len(_SC)):
-            self._stk_table.setItem(row, ci, self._make_item("", editable=False))
-        self._stk_table.blockSignals(False)
-        self._recompute_stock_row(row)
-        self._stk_table.setSortingEnabled(True)
-        self._update_summary()
-        self._save_stocks()
-
-    def _cell_float_stk(self, row: int, col: int) -> float | None:
-        it = self._stk_table.item(row, col)
-        if not it:
-            return None
-        try:
-            return float(it.text().replace("$", "").replace(",", "").replace("%", ""))
-        except ValueError:
-            return None
-
-    def _recompute_stock_row(self, row: int):
-        shares = self._cell_float_stk(row, _S_SHARES_COL)
-        cost   = self._cell_float_stk(row, _S_COST_COL)
-        price  = self._cell_float_stk(row, _S_PRICE_COL)
-
-        self._stk_table.blockSignals(True)
-        if shares is not None and cost is not None and shares > 0 and cost > 0:
-            total_cost = shares * cost
-            self._stk_table.item(row, _S_TCOST_COL).setText(f"{total_cost:,.2f}")
-            if price is not None:
-                current_val = shares * price
-                gain_loss   = current_val - total_cost
-                ror         = gain_loss / total_cost * 100
-                color       = _GREEN if gain_loss >= 0 else _RED
-                sign        = "+" if gain_loss >= 0 else ""
-                self._stk_table.item(row, _S_CVAL_COL).setText(f"{current_val:,.2f}")
-                gl_item  = self._stk_table.item(row, _S_GL_COL)
-                ror_item = self._stk_table.item(row, _S_ROR_COL)
-                gl_item.setText(f"{sign}{gain_loss:,.2f}")
-                gl_item.setForeground(color)
-                ror_item.setText(f"{sign}{ror:.2f}%")
-                ror_item.setForeground(color)
-            else:
-                for ci in (_S_CVAL_COL, _S_GL_COL, _S_ROR_COL):
-                    self._stk_table.item(row, ci).setText("")
-        else:
-            for ci in (_S_TCOST_COL, _S_CVAL_COL, _S_GL_COL, _S_ROR_COL):
-                self._stk_table.item(row, ci).setText("")
-        self._stk_table.blockSignals(False)
-
-    def _update_summary(self):
-        total_cost = 0.0
-        total_val  = 0.0
-        has_prices = False
-
-        # For annualized RoR: cost-weighted average across positions with an opened date
-        ann_weight = 0.0
-        ann_sum    = 0.0
-
-        for row in range(self._stk_table.rowCount()):
-            tc = self._cell_float_stk(row, _S_TCOST_COL)
-            cv = self._cell_float_stk(row, _S_CVAL_COL)
-            if tc is not None:
-                total_cost += tc
-            if cv is not None:
-                total_val  += cv
-                has_prices  = True
-
-            if tc and tc > 0 and cv is not None:
-                it = self._stk_table.item(row, _S_OPENED_COL)
-                opened_text = it.text().strip() if it else ""
-                if opened_text:
-                    try:
-                        m, d, y = (int(p) for p in opened_text.split("/"))
-                        days_held = (date.today() - date(y, m, d)).days
-                        if days_held > 0:
-                            ann_ror = ((cv / tc) ** (365 / days_held) - 1) * 100
-                            ann_sum    += ann_ror * tc
-                            ann_weight += tc
-                    except (ValueError, ZeroDivisionError):
-                        pass
-
-        self._lbl_cost.setText(f"Total Cost: ${total_cost:,.2f}")
-        self._lbl_cost.setStyleSheet("font-weight: bold; font-size: 13px;")
-
-        if has_prices and total_cost > 0:
-            gain  = total_val - total_cost
-            ror   = gain / total_cost * 100
-            sign  = "+" if gain >= 0 else ""
-            color = "#2e7d32" if gain >= 0 else "#c62828"
-            style = f"font-weight: bold; font-size: 13px; color: {color};"
-            self._lbl_val.setText(f"Current Value: ${total_val:,.2f}")
-            self._lbl_val.setStyleSheet("font-weight: bold; font-size: 13px;")
-            self._lbl_gl.setText(f"Gain/Loss: {sign}${gain:,.2f}")
-            self._lbl_gl.setStyleSheet(style)
-            self._lbl_ror.setText(f"Total RoR: {sign}{ror:.2f}%")
-            self._lbl_ror.setStyleSheet(style)
-        else:
-            self._lbl_val.setText("Current Value: —")
-            self._lbl_gl.setText("Gain/Loss: —")
-            self._lbl_ror.setText("Total RoR: —")
-            for lbl in (self._lbl_val, self._lbl_gl, self._lbl_ror):
-                lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
-
-        if ann_weight > 0:
-            ann = ann_sum / ann_weight
-            sign  = "+" if ann >= 0 else ""
-            color = "#2e7d32" if ann >= 0 else "#c62828"
-            self._lbl_ann_ror.setText(f"Annualized RoR: {sign}{ann:.2f}%")
-            self._lbl_ann_ror.setStyleSheet(
-                f"font-weight: bold; font-size: 13px; color: {color};"
-            )
-        else:
-            self._lbl_ann_ror.setText("Annualized RoR: —")
-            self._lbl_ann_ror.setStyleSheet("font-weight: bold; font-size: 13px;")
-
-    def _on_stk_item_changed(self, item: QTableWidgetItem):
-        if item.column() in (_S_SHARES_COL, _S_COST_COL, _S_PRICE_COL):
-            self._recompute_stock_row(item.row())
-        if item.column() in (_S_SHARES_COL, _S_COST_COL, _S_PRICE_COL, _S_OPENED_COL):
-            self._update_summary()
-        self._save_stocks()
-
-    def _delete_selected_stocks(self):
-        rows = sorted({i.row() for i in self._stk_table.selectedItems()}, reverse=True)
-        if not rows:
-            return
-        self._stk_table.blockSignals(True)
-        for r in rows:
-            self._stk_table.removeRow(r)
-        self._stk_table.blockSignals(False)
-        self._update_summary()
-        self._save_stocks()
-        self._status_label.setText(f"Deleted {len(rows)} stock row(s).")
 
     # ── persistence ───────────────────────────────────────────────────────────
 
-    def _opt_row_to_dict(self, row: int) -> dict:
-        out = {}
-        for field in _OPT_STORE:
-            ci = _oc(field)
-            it = self._opt_table.item(row, ci)
-            out[field] = it.text() if it else ""
-        return out
-
-    def _stk_row_to_dict(self, row: int) -> dict:
-        return {
-            col: (self._stk_table.item(row, ci).text()
-                  if self._stk_table.item(row, ci) else "")
-            for ci, col in enumerate(_SE)
-        }
-
-    def _save_options(self):
-        rows = [self._opt_row_to_dict(r) for r in range(self._opt_table.rowCount())]
-        POSITIONS_FILE.write_text(json.dumps(rows, indent=2))
-
-    def _save_stocks(self):
-        rows = [self._stk_row_to_dict(r) for r in range(self._stk_table.rowCount())]
-        STOCKS_FILE.write_text(json.dumps(rows, indent=2))
-
     def _load_saved(self):
-        if POSITIONS_FILE.exists():
-            try:
-                for row in json.loads(POSITIONS_FILE.read_text()):
-                    self._add_option_row(row)
-            except Exception:
-                pass
-
-        if STOCKS_FILE.exists():
-            try:
-                for row in json.loads(STOCKS_FILE.read_text()):
-                    self._add_stock_row(row)
-            except Exception:
-                pass
+        pass  # Option lifecycles are rebuilt from accumulated events in __init__.
 
     # ── CSV import ────────────────────────────────────────────────────────────
 
-    def _import_csv(self):
+    def import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Import TOS Account Statement", "",
             "CSV files (*.csv);;All files (*)"
@@ -505,10 +197,12 @@ class PortfolioTab(QWidget):
 
         rows = list(csv.reader(io.StringIO(
             Path(path).read_text(encoding="utf-8-sig", errors="replace"))))
-        opts, superseded = _derive_option_positions(rows)
+        account      = _parse_account(rows)
+        new_events   = _collect_cash_events(rows)
+        new_outcomes = _build_rad_outcomes(rows)
         _, opt_warns, stks, stk_warns = _parse_tos_csv(Path(path))
 
-        if not opts and not stks:
+        if not new_events and not stks:
             all_warns = opt_warns + stk_warns
             msg = "No option or equity positions found."
             if all_warns:
@@ -516,157 +210,63 @@ class PortfolioTab(QWidget):
             QMessageBox.warning(self, "Import", msg)
             return
 
+        # A different account replaces the view — we track one account at a time.
+        switched = bool(account and self._account and account != self._account)
+        if switched:
+            self._reset_data()
+        if account:
+            self._account = account
+
         def _cell(table, row, col):
             it = table.item(row, col)
             return it.text().strip() if it else ""
 
-        def _opt_key(r):
-            return (
-                _cell(self._opt_table, r, _O_SYM_COL).upper(),
-                _cell(self._opt_table, r, _O_EXP_COL),
-                _norm_strike(_cell(self._opt_table, r, _O_STRIKE_COL)),
-                _cell(self._opt_table, r, _O_TYPE_COL).upper(),
-            )
+        # Accumulate cash events across imports by MAX multiplicity per uid.
+        # A statement is complete for its date range, so identical partial fills
+        # within one statement are kept, while overlapping statements (which
+        # repeat the same fills) don't double-count.
+        existing_counts = Counter(_event_uid(e) for e in self._events)
+        new_counts = Counter()
+        templates: dict[tuple, dict] = {}
+        for e in new_events:
+            uid = _event_uid(e)
+            new_counts[uid] += 1
+            templates.setdefault(uid, e)
 
-        # Accumulate rolled-away legs across all imports, so importing an older
-        # statement (which predates a later roll) can't re-add a stale leg.
-        self._superseded |= superseded
-        self._save_superseded()
+        added_evs = 0
+        for uid, n in new_counts.items():
+            deficit = n - existing_counts.get(uid, 0)
+            for _ in range(deficit):
+                self._events.append(templates[uid])
+                added_evs += 1
 
-        # Sorting must stay off through the whole upsert, or re-sorts would
-        # shuffle rows and invalidate the indices in row_by_key.
-        self._opt_table.setSortingEnabled(False)
+        self._outcomes.update(new_outcomes)
+        self._save_events()
+        self._rebuild_options_table()
 
-        # Drop rows that have since been rolled away (pre-roll legs)
-        for r in range(self._opt_table.rowCount() - 1, -1, -1):
-            if _opt_key(r) in self._superseded:
-                self._opt_table.removeRow(r)
-
-        # Upsert each derived position by key
-        row_by_key = {_opt_key(r): r for r in range(self._opt_table.rowCount())}
-
-        added_opts = updated_opts = 0
-        for pos in opts:
-            key = (pos["symbol"].upper(), pos["expiration"],
-                   _norm_strike(pos["strike"]), pos["type"].upper())
-            if key in self._superseded:
-                continue   # this leg was later rolled away
-            if key in row_by_key:
-                r = row_by_key[key]
-                self._opt_table.blockSignals(True)
-                for field in _OPT_STORE:
-                    self._opt_table.item(r, _oc(field)).setText(str(pos.get(field, "")))
-                self._opt_table.blockSignals(False)
-                self._recompute_option_row(r)
-                updated_opts += 1
-            else:
-                row_by_key[key] = self._insert_option_row(pos)
-                added_opts += 1
-
-        self._opt_table.setSortingEnabled(True)
-        self._save_options()
-
-        existing_stks = {
-            _cell(self._stk_table, r, _S_SYM_COL).upper()
-            for r in range(self._stk_table.rowCount())
-        }
-        skipped_opts = 0
-
-        added_stks = skipped_stks = 0
-        for row in stks:
-            sym = row.get("symbol", "").upper()
-            if sym in existing_stks:
-                # Fill in opened date if the existing row has it blank
-                new_opened = row.get("opened", "").strip()
-                if new_opened:
-                    for r in range(self._stk_table.rowCount()):
-                        if (
-                            _cell(self._stk_table, r, _S_SYM_COL).upper() == sym
-                            and not _cell(self._stk_table, r, _S_OPENED_COL)
-                        ):
-                            self._stk_table.item(r, _S_OPENED_COL).setText(new_opened)
-                            break
-                skipped_stks += 1
-            else:
-                self._add_stock_row(row)
-                existing_stks.add(sym)
-                added_stks += 1
-
-        parts = []
-        if added_opts:
-            parts.append(f"{added_opts} option(s) added")
-        if updated_opts:
-            parts.append(f"{updated_opts} option(s) updated")
-        if added_stks:
-            parts.append(f"{added_stks} stock(s)")
-        note = ("Imported " + ", ".join(parts) + ".") if parts else "No new positions found."
-        extras = []
-        if skipped_stks:
-            extras.append(f"{skipped_stks} duplicate stock(s) skipped")
-        all_warns = stk_warns
-        if all_warns:
-            extras.append(f"{len(all_warns)} row(s) skipped")
-        if extras:
-            note += f"  ({', '.join(extras)})"
-        self._status_label.setText(note)
+        opt_rows = self._opt_table.rowCount()
+        note = f"Imported {added_evs} new event(s) → {opt_rows} cycle(s)."
+        if switched:
+            note = f"Switched to account {account}. " + note
+        self.status_changed.emit(note)
+        self.account_changed.emit(self._account)
         self.csv_imported.emit(path)
 
-    def _clear_all(self):
-        reply = QMessageBox.question(
-            self, "Clear All Positions",
-            "Clear all option and stock positions?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+    def _reset_data(self):
+        """Wipe all in-memory and on-disk position data (no confirmation)."""
         self._opt_table.blockSignals(True)
-        self._stk_table.blockSignals(True)
         self._opt_table.setRowCount(0)
-        self._stk_table.setRowCount(0)
         self._opt_table.blockSignals(False)
-        self._stk_table.blockSignals(False)
         POSITIONS_FILE.unlink(missing_ok=True)
         STOCKS_FILE.unlink(missing_ok=True)
         SUPERSEDED_FILE.unlink(missing_ok=True)
-        self._superseded = set()
-        self._update_summary()
-        self._status_label.setText("All positions cleared.")
+        EVENTS_FILE.unlink(missing_ok=True)
+        self._events, self._outcomes, self._account = [], {}, ""
 
-    # ── price refresh ─────────────────────────────────────────────────────────
-
-    def _refresh_prices(self):
-        symbols = []
-        for row in range(self._stk_table.rowCount()):
-            it = self._stk_table.item(row, _S_SYM_COL)
-            if it and it.text().strip():
-                symbols.append(it.text().strip().upper())
-        if not symbols:
-            self._status_label.setText("No stock positions to refresh.")
-            return
-        self._refresh_btn.setEnabled(False)
-        self._status_label.setText(f"Fetching prices for {len(symbols)} symbol(s)…")
-        self._fetcher = _PriceFetcher(symbols)
-        self._fetcher.price_ready.connect(self._on_price_ready)
-        self._fetcher.log_msg.connect(self._status_label.setText)
-        self._fetcher.done.connect(self._on_refresh_done)
-        self._fetcher.start()
-
-    def _on_price_ready(self, symbol: str, price: float):
-        for row in range(self._stk_table.rowCount()):
-            it = self._stk_table.item(row, _S_SYM_COL)
-            if it and it.text().strip().upper() == symbol:
-                self._stk_table.blockSignals(True)
-                self._stk_table.item(row, _S_PRICE_COL).setText(f"{price:.2f}")
-                self._stk_table.blockSignals(False)
-                self._recompute_stock_row(row)
-                break
-        self._update_summary()
-
-    def _on_refresh_done(self):
-        self._refresh_btn.setEnabled(True)
-        self._status_label.setText("Prices refreshed.")
-        self._save_stocks()
+    def clear_all(self):
+        self._reset_data()
+        self.account_changed.emit("")
+        self.status_changed.emit("All positions cleared.")
 
 
 # ── TOS CSV parsing ───────────────────────────────────────────────────────────
@@ -951,73 +551,257 @@ def _build_rad_outcomes(rows: list[list[str]]) -> dict[tuple, str]:
     return out
 
 
-def _build_open_option_keys(rows: list[list[str]]) -> set:
-    """Parse the Options snapshot section → set of currently-open option keys."""
-    keys: set = set()
-    in_opt = False
-    col: dict[str, int] = {}
+# ── Wheel lifecycle reconstruction ──────────────────────────────────────────────
+
+_OPT_QTY_RE  = re.compile(r'(?:SOLD|BOT)\s+([+-]?\d+)', re.IGNORECASE)
+_STK_DESC_RE = re.compile(
+    r'(BOT|SOLD)\s+([+-]?\d+(?:\.\d+)?)\s+([A-Z]+)\s+(@|UPON)', re.IGNORECASE)
+
+
+def _money(s: str) -> float:
+    s = s.strip().replace(",", "").replace("$", "")
+    if not s:
+        return 0.0
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    try:
+        return -float(s) if neg else float(s)
+    except ValueError:
+        return 0.0
+
+
+def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
+    """Parse Cash Balance into per-symbol option-premium and stock events (dollars)."""
+    events: list[dict] = []
+    in_cb = False
     for row in rows:
         cells = [c.strip().strip('"') for c in row]
         if not cells:
             continue
-        first = cells[0]
-        if first == "Options":
-            in_opt = True
-            col = {}
+        if cells[0] == "Cash Balance":
+            in_cb = True
             continue
-        if not in_opt:
-            continue
-        if not col:
-            col = {h.strip().lower(): i for i, h in enumerate(cells)}
-            continue
-        if first in _SECTION_BREAKS:
+        if cells[0] == "Account Trade History":
             break
-        if "OVERALL" in " ".join(cells).upper() or not first:
+        if not in_cb or len(cells) < 8:
             continue
-        try:
-            sym    = cells[col["symbol"]].upper()
-            exp    = cells[col["exp"]]
-            strike = cells[col["strike"]]
-            typ    = cells[col["type"]].upper()
-        except (KeyError, IndexError):
+
+        d = _parse_mdy(cells[0])
+        if d is None:
             continue
-        if not sym or sym == "SYMBOL":
+        date_str = f"{d.month:02d}/{d.day:02d}/{d.year}"
+        typ    = cells[2]
+        desc   = cells[4] if len(cells) > 4 else ""
+        fees   = (abs(_money(cells[5])) + abs(_money(cells[6]))) if len(cells) > 6 else 0.0
+        amount = _money(cells[7])
+
+        if typ == "TRD" and re.search(r'\b(PUT|CALL)\b', desc, re.IGNORECASE):
+            m = _TRD_CAL_RE.search(desc) or _TRD_SINGLE_RE.search(desc)
+            if not m:
+                continue
+            sym, exp, strike, otyp = m.groups()
+            qm  = _OPT_QTY_RE.search(desc)
+            qty = abs(int(qm.group(1))) if qm else 0
+            events.append({
+                "sym": sym.upper(), "date": date_str, "kind": "opt",
+                "otype": otyp.upper(), "amount": round(amount, 2), "fees": round(fees, 2),
+                "strike": _norm_strike(strike), "exp": _parse_exp(exp.strip()), "qty": qty,
+            })
+        elif typ in ("TRD", "EXP"):
+            m = _STK_DESC_RE.search(desc)
+            if not m:
+                continue
+            action, sh, sym, how = m.groups()
+            events.append({
+                "sym": sym.upper(), "date": date_str, "kind": "stock",
+                "action": action.upper(), "shares": abs(float(sh)),
+                "amount": round(amount, 2), "fees": round(fees, 2),
+                "assigned": how.upper() == "UPON",
+            })
+    return events
+
+
+def _parse_account(rows: list[list[str]]) -> str:
+    """Extract the account label from the statement header line."""
+    for row in rows[:3]:
+        if not row:
             continue
-        keys.add((sym, _parse_exp(exp), _norm_strike(strike), typ))
-    return keys
+        m = re.search(r'Account Statement for (.+?)\s+since', row[0])
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
-def _derive_option_positions(rows: list[list[str]]) -> tuple[list[dict], set]:
-    """Derive one consolidated position per roll chain (open + closed).
+def _event_uid(e: dict) -> tuple:
+    if e["kind"] == "opt":
+        return (e["sym"], e["date"], "opt", e["otype"], e["strike"], e["exp"],
+                e["qty"], e["amount"])
+    return (e["sym"], e["date"], "stock", e["action"], e["shares"], e["amount"])
 
-    Returns (positions, superseded_keys) where superseded_keys are the
-    pre-roll legs that have been rolled away (so stale rows can be removed).
-    """
-    legs     = _scan_option_legs(rows)
-    fees     = _build_fee_lookup(rows)
-    rad      = _build_rad_outcomes(rows)
-    open_keys = _build_open_option_keys(rows)
 
-    superseded = set(legs["rolled_from"].values())
-    heads      = set(legs["prices"]) - superseded
+def _outcome_key(k: tuple) -> str:
+    return "|".join(k)
 
-    positions = []
-    for head in heads:
-        sym, exp, strike, typ = head
-        chain  = _walk_chain(head, legs, fees)
-        status = "Open" if head in open_keys else rad.get(head, "Closed")
-        positions.append({
-            "symbol":     sym,
-            "type":       "Put" if typ == "PUT" else "Call",
-            "qty":        str(legs["qty"].get(head, "")),
-            "strike":     strike,
-            "opened":     chain["opened"],
-            "expiration": exp,
-            "status":     status,
-            "fees":       f"{chain['fees']:.2f}" if chain["fees"] else "",
-            "premium":    str(chain["premium"]),
-        })
-    return positions, superseded
+
+def _outcome_unkey(s: str) -> tuple:
+    return tuple(s.split("|"))
+
+
+def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[dict]:
+    """Group per-symbol events into wheel cycles → one display row per cycle."""
+    by_sym: dict[str, list[dict]] = {}
+    for e in events:
+        by_sym.setdefault(e["sym"], []).append(e)
+
+    cycles: list[dict] = []
+    for sym, evs in by_sym.items():
+        evs.sort(key=lambda e: _parse_mdy(e["date"]) or date.min)
+        cycle = None
+        shares = 0.0
+        total_cost = 0.0
+        latest_exp = None
+
+        def _new(open_date):
+            return {"sym": sym, "open_date": open_date, "premium": 0.0, "fees": 0.0,
+                    "stock_pnl": 0.0, "stages": [], "put_strike": None, "put_exp": None,
+                    "qty_by_exp": {}, "end_date": None, "shares": 0.0, "total_cost": 0.0,
+                    "has_option": False}
+
+        for e in evs:
+            if e["kind"] == "opt":
+                is_put = e["otype"] == "PUT"
+                start = cycle is None or (
+                    is_put and shares == 0 and latest_exp
+                    and (_parse_mdy(e["date"]) or date.min) > latest_exp
+                )
+                if start:
+                    if cycle is not None:
+                        cycles.append(cycle)
+                    cycle = _new(e["date"])
+                    shares = total_cost = 0.0
+                    latest_exp = None
+                cycle["has_option"] = True
+                cycle["premium"] += e["amount"]
+                cycle["fees"]    += e["fees"]
+                if is_put:
+                    cycle["put_strike"] = e["strike"]
+                    cycle["put_exp"]    = e["exp"]
+                    cycle["qty_by_exp"][e["exp"]] = cycle["qty_by_exp"].get(e["exp"], 0) + e["qty"]
+                    cycle["stages"].append("Put")
+                else:
+                    cycle["stages"].append("Call")
+                ed = _parse_mdy(e["exp"])
+                if ed:
+                    latest_exp = max(latest_exp, ed) if latest_exp else ed
+                cycle["end_date"] = e["exp"]
+            else:  # stock
+                # Only assignments tie into the wheel cycle. A direct stock buy
+                # with no active cycle is a standalone position — skip it here.
+                if cycle is None and e["action"] == "BOT" and not e["assigned"]:
+                    continue
+                if cycle is None:
+                    cycle = _new(e["date"])
+                cycle["fees"] += e["fees"]
+                if e["action"] == "BOT":
+                    shares += e["shares"]
+                    total_cost += abs(e["amount"])
+                    cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
+                else:  # SOLD
+                    if shares > 0:
+                        avg = total_cost / shares
+                        q = min(e["shares"], shares)
+                        cycle["stock_pnl"] += e["amount"] - avg * q
+                        total_cost -= avg * q
+                        shares -= q
+                    else:
+                        cycle["stock_pnl"] += e["amount"]
+                    cycle["stages"].append("Called away" if e["assigned"] else "Sold")
+                    cycle["end_date"] = e["date"]
+                cycle["shares"] = shares
+                cycle["total_cost"] = total_cost
+        if cycle is not None:
+            cycles.append(cycle)
+
+    # Only wheel cycles (those with at least one option leg) belong here;
+    # pure stock buys/sells live in the Long Stock Positions table.
+    return [_cycle_to_row(c, outcomes) for c in cycles if c["has_option"]]
+
+
+def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
+    strike = float(c["put_strike"]) if c["put_strike"] else 0.0
+    qty    = c["qty_by_exp"].get(c["put_exp"], 0)
+    premium    = round(c["premium"], 2)
+    fees       = round(c["fees"], 2)
+    stock_pnl  = round(c["stock_pnl"], 2)
+    total_pnl  = round(premium + stock_pnl - fees, 2)
+
+    # Status
+    if c["shares"] > 0:
+        status = "Holding"
+    elif "Sold" in c["stages"]:
+        status = "Sold"
+    elif "Called away" in c["stages"]:
+        status = "Called away"
+    else:
+        key = (c["sym"], c["put_exp"], c["put_strike"], "PUT")
+        status = outcomes.get(key, "Open")
+
+    # Lifecycle path (dedup consecutive)
+    path = []
+    for s in c["stages"]:
+        if not path or path[-1] != s:
+            path.append(s)
+    if path and path[-1] not in ("Sold", "Called away") and status not in path:
+        path.append(status)
+    lifecycle = " → ".join(path)
+
+    completed = status in ("Sold", "Called away", "Expired", "Closed")
+
+    # Timing
+    open_d = _parse_mdy(c["open_date"])
+    close_d = _parse_mdy(c["end_date"]) if c["end_date"] else None
+
+    # Weeks Held = actual elapsed time (open → today for live, open → close for done)
+    held_end  = date.today() if status in ("Open", "Holding") else (close_d or date.today())
+    days_held = (held_end - open_d).days if open_d else 0
+    weeks     = f"{days_held / 7:.1f}" if days_held >= 0 else ""
+
+    # RoR denominator = full capital commitment: open → expiration for live positions,
+    # open → close date for completed ones. Capital is locked until expiration, so
+    # dividing by only days-held would overstate the annualised rate.
+    ror_end  = close_d if completed else (close_d or date.today())
+    days_ror = (ror_end - open_d).days if open_d else 0
+
+    # Weekly RoR on deployed capital
+    capital = strike * 100 * qty
+    ror = ""
+    if capital > 0 and days_ror > 0:
+        ror = f"{(total_pnl / capital) * (7 / days_ror) * 100:.2f}%"
+
+    # Cost Basis (open/holding) vs Total P&L (completed)
+    if status == "Holding" and c["shares"] > 0:
+        cb = (c["total_cost"] - (premium - fees)) / c["shares"]
+        pnl_cell = f"{cb:.2f}"
+    elif status == "Open" and capital > 0:
+        cb = strike - (premium - fees) / (qty * 100)
+        pnl_cell = f"{cb:.2f}"
+    else:
+        pnl_cell = f"{total_pnl:+,.2f}"
+
+    return {
+        "symbol":     c["sym"],
+        "opened":     c["open_date"],
+        "lifecycle":  lifecycle,
+        "qty":        str(qty),
+        "strike":     c["put_strike"] or "",
+        "premium":    f"{premium:.2f}",
+        "expiration": c["end_date"] or "",
+        "status":     status,
+        "weeks_held": weeks,
+        "fees":       f"{fees:.2f}",
+        "weekly_ror": ror,
+        "cost_basis": pnl_cell,
+    }
 
 
 def _build_fee_lookup(rows: list[list[str]]) -> dict[tuple, float]:
