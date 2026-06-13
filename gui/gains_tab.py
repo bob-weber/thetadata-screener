@@ -12,8 +12,8 @@ import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QMessageBox,
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel,
 )
 
 GAINS_FILE = Path("gains_history.json")
@@ -304,18 +304,6 @@ class GainsTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
-        bar = QHBoxLayout()
-        refresh_btn = QPushButton("Refresh Chart")
-        clear_btn   = QPushButton("Clear History")
-        refresh_btn.clicked.connect(self._refresh_chart)
-        clear_btn.clicked.connect(self._clear)
-        bar.addWidget(refresh_btn)
-        bar.addWidget(clear_btn)
-        bar.addStretch()
-        self._status = QLabel("Import a TOS CSV in the Positions tab to populate this chart.")
-        bar.addWidget(self._status)
-        root.addLayout(bar)
-
         summary = QHBoxLayout()
         self._lbl_dep      = QLabel("Net deposits: —")
         self._lbl_realized = QLabel("Realized: —")
@@ -336,28 +324,16 @@ class GainsTab(QWidget):
         """Called by PortfolioTab after a successful CSV import."""
         try:
             parsed = parse_statement(Path(path))
-        except ValueError as e:
-            self._status.setText(f"P&L chart error: {e}")
+        except ValueError:
             return
-        counts = merge_statement(self._data, parsed)
+        merge_statement(self._data, parsed)
         _save_history(self._data)
-        self._status.setText(
-            f"Updated — {counts['deposits']} transfer(s), {counts['balances']} balance(s), "
-            f"{counts['opt_trades']} option trade(s), {counts['stk_trades']} stock trade(s)."
-        )
         self._refresh_chart()
 
-    def _clear(self):
-        reply = QMessageBox.question(
-            self, "Clear History", "Clear all gains history?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+    def clear_history(self):
+        """Called by PortfolioWindow when the user clears all data."""
         self._data = {"deposits": [], "balances": [], "opt_trades": [], "stk_trades": []}
         _save_history(self._data)
-        self._status.setText("History cleared.")
         self._refresh_chart()
 
     def _refresh_chart(self):
