@@ -24,17 +24,17 @@ SUPERSEDED_FILE  = Path("my_option_superseded.json")   # rolled-away legs, acros
 #                                "hidden" = stored but not shown (used for calc)
 _OPT_COLUMNS = [
     ("symbol",     "Symbol",         "edit"),
+    ("opened",     "Opened",         "edit"),
     ("type",       "P/C",            "edit"),
     ("qty",        "Qty",            "edit"),
     ("strike",     "Strike",         "edit"),
-    ("cost_basis", "Cost Basis",     "calc"),
-    ("opened",     "Opened",         "edit"),
+    ("premium",    "Premium",        "edit"),   # net credit/share; drives cost basis & RoR
     ("expiration", "Expiration",     "edit"),
     ("status",     "Status",         "edit"),
     ("weeks_held", "Weeks Held",     "calc"),
-    ("weekly_ror", "Avg Weekly RoR", "calc"),
     ("fees",       "Fees",           "edit"),
-    ("premium",    "Premium",        "hidden"),   # net credit/share; drives cost basis & RoR
+    ("weekly_ror", "Avg Weekly RoR", "calc"),
+    ("cost_basis", "Cost Basis",     "calc"),
 ]
 _OPT_FIELDS = [c[0] for c in _OPT_COLUMNS]
 _O_HDRS     = [c[1] for c in _OPT_COLUMNS]
