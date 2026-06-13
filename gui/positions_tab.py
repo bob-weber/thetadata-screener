@@ -152,7 +152,7 @@ class PortfolioTab(QWidget):
         root.addLayout(toolbar)
 
         hint = QLabel(
-            "Options: one line per rolled position; Cost Basis = strike − premium/share.  "
+            "Options: one line per rolled position; Cost Basis & RoR are net of commissions + fees.  "
             "Stocks: Cost Basis and Current Price are per share."
         )
         hint.setStyleSheet("color: grey; font-size: 11px;")
@@ -249,29 +249,37 @@ class PortfolioTab(QWidget):
 
         strike   = _float(_O_STRIKE_COL)
         premium  = _float(_O_PREMIUM_COL)
+        qty      = _float(_oc("qty"))
+        fees     = _float(_oc("fees"))
         typ      = _text(_O_TYPE_COL).upper()
         exp_text = _text(_O_EXP_COL)
         opened_text = _text(_O_OPENED_COL)
         status   = _text(_O_STATUS_COL) or "Open"
 
+        # Net premium per share, after all costs (commissions + fees).
+        # Fees are total dollars across the chain; spread over qty × 100 shares.
+        net_premium = premium
+        if premium is not None and fees and qty:
+            net_premium = premium - fees / (abs(qty) * 100)
+
         self._opt_table.blockSignals(True)
 
-        # Cost basis (puts): strike − premium/share
+        # Cost basis (puts): strike − net premium/share
         cb_text = ""
-        if typ.startswith("P") and strike is not None and premium is not None:
-            cb_text = f"{strike - premium:.2f}"
+        if typ.startswith("P") and strike is not None and net_premium is not None:
+            cb_text = f"{strike - net_premium:.2f}"
         self._opt_table.item(row, _O_CB_COL).setText(cb_text)
 
         # Parse dates once
         opened_d = _parse_mdy(opened_text)
         exp_d    = _parse_mdy(exp_text)
 
-        # Avg weekly RoR over the full contract term (open → expiration)
+        # Avg weekly RoR (net of costs) over the full contract term (open → expiration)
         ror_text = ""
-        if strike and strike > 0 and premium is not None and opened_d and exp_d:
+        if strike and strike > 0 and net_premium is not None and opened_d and exp_d:
             total_days = (exp_d - opened_d).days
             if total_days > 0:
-                ror_text = f"{(premium / strike) * (7 / total_days) * 100:.2f}%"
+                ror_text = f"{(net_premium / strike) * (7 / total_days) * 100:.2f}%"
         self._opt_table.item(row, _O_ROR_COL).setText(ror_text)
 
         # Weeks held: open → today for live positions, open → expiry once closed
@@ -287,7 +295,8 @@ class PortfolioTab(QWidget):
 
     def _on_opt_item_changed(self, item: QTableWidgetItem):
         if item.column() in (_O_TYPE_COL, _O_STRIKE_COL, _O_EXP_COL,
-                             _O_OPENED_COL, _O_STATUS_COL, _O_PREMIUM_COL):
+                             _O_OPENED_COL, _O_STATUS_COL, _O_PREMIUM_COL,
+                             _oc("qty"), _oc("fees")):
             self._recompute_option_row(item.row())
         self._save_options()
 
