@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter, QDateEdit,
-    QRadioButton, QButtonGroup,
+    QRadioButton, QButtonGroup, QApplication,
 )
 
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal
@@ -14,6 +14,7 @@ from PyQt6.QtCore import pyqtSignal as _pyqtSignal
 from .workers import OptionsWorker
 
 POSITIONS_FILE   = Path("my_positions.txt")
+REJECT_FILE      = Path("reject_list.txt")
 CANDIDATES_CACHE = Path("tech_candidates_cache.json")
 OPTIONS_CACHE    = Path("options_results_cache.json")
 
@@ -56,8 +57,20 @@ class OptionsScannerTab(QWidget):
         self._save_timer.setInterval(800)
         self._save_timer.timeout.connect(self._save_positions)
 
+        self._reject_save_timer = QTimer()
+        self._reject_save_timer.setSingleShot(True)
+        self._reject_save_timer.setInterval(800)
+        self._reject_save_timer.timeout.connect(self._save_reject)
+
+        # Flush any pending debounced saves before the app exits, so edits made
+        # right before quitting aren't lost to the 800ms timer window.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._flush_saves)
+
         self._setup_ui()
         self._load_positions()
+        self._load_reject()
         self.refresh_scanner_status()
         self._load_cached_results()
 
@@ -117,6 +130,28 @@ class OptionsScannerTab(QWidget):
         tickers = [t.strip().upper() for t in raw.splitlines()]
         return [t for t in tickers if t]
 
+    # ── reject-list file helpers ──────────────────────────────────────────────
+
+    def _load_reject(self):
+        if REJECT_FILE.exists():
+            self._reject_edit.setPlainText(REJECT_FILE.read_text())
+
+    def _save_reject(self):
+        REJECT_FILE.write_text(self._reject_edit.toPlainText())
+
+    def _flush_saves(self):
+        """Write out any edits still waiting on a debounce timer (e.g. on quit)."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._save_positions()
+        if self._reject_save_timer.isActive():
+            self._reject_save_timer.stop()
+            self._save_reject()
+
+    def _get_reject(self) -> set[str]:
+        raw = self._reject_edit.toPlainText()
+        return {t.strip().upper() for t in raw.splitlines() if t.strip()}
+
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _setup_ui(self):
@@ -153,6 +188,16 @@ class OptionsScannerTab(QWidget):
         self._scanner_btn.toggled.connect(
             lambda checked: self._positions_box.setVisible(not checked)
         )
+
+        # ── Reject list (always applied, both ticker sources) ─────────────────
+        reject_box = QGroupBox("Reject List — never scan these (one ticker per line)")
+        rj = QVBoxLayout(reject_box)
+        self._reject_edit = QTextEdit()
+        self._reject_edit.setPlaceholderText("TSLA\nGME\nMSTR")
+        self._reject_edit.setFixedHeight(80)
+        self._reject_edit.textChanged.connect(self._reject_save_timer.start)
+        rj.addWidget(self._reject_edit)
+        root.addWidget(reject_box)
 
         # ── Parameters ────────────────────────────────────────────────────────
         params_box = QGroupBox("Parameters")
@@ -301,7 +346,7 @@ class OptionsScannerTab(QWidget):
         else:
             self._candidates_label.setText("Loading stock scan results…")
 
-        self._worker = OptionsWorker(config, positions=positions)
+        self._worker = OptionsWorker(config, positions=positions, reject=self._get_reject())
         self._worker.log_msg.connect(self._log.append)
         self._worker.candidates_loaded.connect(self._on_candidates_loaded)
         self._worker.opts_progress.connect(self._on_opts_progress)

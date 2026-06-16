@@ -15,6 +15,7 @@ my_stock_positions.json
 my_option_superseded.json
 my_option_events.json
 my_positions.txt
+reject_list.txt
 gains_history.json
 
 # Logs
