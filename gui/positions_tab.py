@@ -57,7 +57,6 @@ _O_PREMIUM_COL   = _oc("premium")
 
 _STATUS_SORT = {"Open": 0, "Holding": 1, "Closed": 2, "Called away": 3,
                 "Assigned": 4, "Sold": 5, "Expired": 6}
-_DATE_FILTERS = ["All time", "Last 12 months", "Last month"]
 
 
 class _StatusItem(QTableWidgetItem):
@@ -77,7 +76,9 @@ class PortfolioTab(QWidget):
     def __init__(self):
         super().__init__()
         self._events, self._outcomes, self._account = self._load_events()
-        self._date_filter_text = "All time"
+        self._range_sel  = None   # None → all time; int → days back; "custom"
+        self._range_from = None   # ISO date string when custom
+        self._range_to   = None
         self._setup_ui()
         self._load_saved()
         self._rebuild_options_table()
@@ -101,8 +102,11 @@ class PortfolioTab(QWidget):
             "outcomes": {_outcome_key(k): v for k, v in self._outcomes.items()},
         }, indent=2))
 
-    def set_date_filter(self, text: str):
-        self._date_filter_text = text
+    def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
+        """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
+        self._range_sel  = sel
+        self._range_from = date_from
+        self._range_to   = date_to
         self._rebuild_options_table()
 
     def _rebuild_options_table(self):
@@ -110,12 +114,16 @@ class PortfolioTab(QWidget):
         rows = _reconstruct_wheels(self._events, self._outcomes)
 
         # Date-range filter — active (Open/Holding) positions always shown
-        sel = self._date_filter_text
-        if sel != "All time":
-            days = 365 if sel == "Last 12 months" else 30
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+        sel = self._range_sel
+        active = ("Open", "Holding")
+        if sel == "custom" and self._range_from and self._range_to:
             rows = [r for r in rows
-                    if r["status"] in ("Open", "Holding") or r["opened"] >= cutoff]
+                    if r["status"] in active
+                    or self._range_from <= r["opened"] <= self._range_to]
+        elif isinstance(sel, int):
+            cutoff = (date.today() - timedelta(days=sel)).isoformat()
+            rows = [r for r in rows
+                    if r["status"] in active or r["opened"] >= cutoff]
 
         rows.sort(key=lambda r: (_STATUS_SORT.get(r["status"], 99), r["symbol"], r["opened"]))
         self._opt_table.setSortingEnabled(False)

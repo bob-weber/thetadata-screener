@@ -13,8 +13,19 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel,
+    QLabel, QCheckBox,
 )
+
+# Time-range presets: (label, value). int → days back from last data point;
+# None → all time; "custom" → use the From/To date pickers.
+_RANGE_OPTIONS = [
+    ("1 Week",   7),
+    ("3 Weeks",  21),
+    ("3 Months", 91),
+    ("1 Year",   365),
+    ("All Time", None),
+    ("Custom…",  "custom"),
+]
 
 GAINS_FILE = Path("gains_history.json")
 
@@ -213,16 +224,6 @@ def reconstruct(data: dict) -> dict:
       dates, deposits, realized, total, and final summary values.
     """
     balances = sorted(data["balances"], key=lambda b: b["date"])
-    if not balances:
-        return {}
-
-    bal_dates = [b["date"] for b in balances]
-    start_d   = date.fromisoformat(bal_dates[0])
-    end_d     = date.fromisoformat(bal_dates[-1])
-
-    # All symbols ever traded → fetch price history once
-    symbols = sorted({t["symbol"] for t in data["stk_trades"]})
-    price_hist = _fetch_price_history(symbols, start_d, end_d)
 
     # Combine and sort all trades chronologically
     opt = [{**t, "kind": "opt"} for t in data["opt_trades"]]
@@ -230,6 +231,21 @@ def reconstruct(data: dict) -> dict:
     trades = sorted(opt + stk, key=lambda t: t["date"])
 
     deposits = sorted(data["deposits"], key=lambda d: d["date"])
+
+    # Timeline = every date that has an event (balance, trade, or deposit), so a
+    # trading day still plots even when its end-of-day BAL row hasn't posted yet.
+    timeline = sorted({b["date"] for b in balances}
+                      | {t["date"] for t in trades}
+                      | {d["date"] for d in deposits})
+    if not timeline:
+        return {}
+
+    start_d = date.fromisoformat(timeline[0])
+    end_d   = date.fromisoformat(timeline[-1])
+
+    # All symbols ever traded → fetch price history once
+    symbols = sorted({t["symbol"] for t in data["stk_trades"]})
+    price_hist = _fetch_price_history(symbols, start_d, end_d)
 
     holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
     cum_opt = 0.0
@@ -240,7 +256,7 @@ def reconstruct(data: dict) -> dict:
 
     dep_series, realized_series, total_series = [], [], []
 
-    for bd in bal_dates:
+    for bd in timeline:
         # advance deposits
         while di < len(deposits) and deposits[di]["date"] <= bd:
             dep_cum += deposits[di]["amount"]
@@ -286,7 +302,7 @@ def reconstruct(data: dict) -> dict:
         total_series.append(realized + unreal)
 
     return {
-        "dates":    [datetime.fromisoformat(d) for d in bal_dates],
+        "dates":    [datetime.fromisoformat(d) for d in timeline],
         "deposits": dep_series,
         "realized": realized_series,
         "total":    total_series,
@@ -297,6 +313,9 @@ class GainsTab(QWidget):
     def __init__(self):
         super().__init__()
         self._data = _load_history()
+        self._range_sel  = None   # None → all time; int → days back; "custom"
+        self._range_from = None   # ISO date string when custom
+        self._range_to   = None
         self._setup_ui()
         self._refresh_chart()
 
@@ -312,6 +331,14 @@ class GainsTab(QWidget):
             lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
             summary.addWidget(lbl)
         summary.addStretch()
+
+        self._cb_deposits = QCheckBox("Show deposits")
+        self._cb_pnl      = QCheckBox("Show gains/losses")
+        self._cb_deposits.setChecked(True)
+        self._cb_pnl.setChecked(True)
+        for cb in (self._cb_deposits, self._cb_pnl):
+            cb.toggled.connect(self._refresh_chart)
+            summary.addWidget(cb)
         root.addLayout(summary)
 
         self._fig, (self._ax1, self._ax2) = plt.subplots(
@@ -336,6 +363,46 @@ class GainsTab(QWidget):
         _save_history(self._data)
         self._refresh_chart()
 
+    def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
+        """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
+        self._range_sel  = sel
+        self._range_from = date_from
+        self._range_to   = date_to
+        self._refresh_chart()
+
+    def data_date_bounds(self) -> tuple[str | None, str | None]:
+        """(min, max) ISO date of all events, for defaulting custom pickers."""
+        dates = ([b["date"] for b in self._data.get("balances", [])]
+                 + [t["date"] for t in self._data.get("opt_trades", [])]
+                 + [t["date"] for t in self._data.get("stk_trades", [])]
+                 + [d["date"] for d in self._data.get("deposits", [])])
+        return (min(dates), max(dates)) if dates else (None, None)
+
+    def _filtered_series(self, series: dict) -> dict | None:
+        """Slice the time series to the selected range. None → no points in range."""
+        dates = series["dates"]
+        sel = self._range_sel
+        if sel is None or not dates:        # All Time
+            return series
+
+        if sel == "custom":
+            if not (self._range_from and self._range_to):
+                return series
+            lo = datetime.fromisoformat(self._range_from)
+            hi = datetime.fromisoformat(self._range_to) + timedelta(days=1)
+        else:                               # int days back from last data point
+            hi = dates[-1] + timedelta(days=1)
+            lo = dates[-1] - timedelta(days=sel)
+
+        idx = [i for i, d in enumerate(dates) if lo <= d <= hi]
+        if not idx:
+            return None
+        n = len(dates)
+        return {
+            k: ([v[i] for i in idx] if isinstance(v, list) and len(v) == n else v)
+            for k, v in series.items()
+        }
+
     def _refresh_chart(self):
         for ax in (self._ax1, self._ax2):
             ax.clear()
@@ -344,6 +411,17 @@ class GainsTab(QWidget):
         if not series:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "Import a TOS CSV in the Positions tab",
+                        ha="center", va="center", transform=ax.transAxes,
+                        fontsize=11, color="gray")
+            self._canvas.draw()
+            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+                lbl.setText(lbl.text().split(":")[0] + ": —")
+            return
+
+        series = self._filtered_series(series)
+        if series is None:
+            for ax in (self._ax1, self._ax2):
+                ax.text(0.5, 0.5, "No data in selected range",
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=11, color="gray")
             self._canvas.draw()
@@ -362,19 +440,25 @@ class GainsTab(QWidget):
         real_ror  = (realized  / net_dep * 100) if net_dep else 0.0
         tot_ror   = (total_pnl / net_dep * 100) if net_dep else 0.0
 
+        show_dep = self._cb_deposits.isChecked()
+        show_pnl = self._cb_pnl.isChecked()
         _fill_pnl(self._ax1, dt, dep, real,
-                  f"Realized P&L  —  ${realized:+,.0f}  ({real_ror:+.1f}%)")
+                  f"Realized P&L  —  ${realized:+,.0f}  ({real_ror:+.1f}%)",
+                  show_deposits=show_dep, show_pnl=show_pnl)
         _fill_pnl(self._ax2, dt, dep, tot,
-                  f"Total P&L (Realized + Unrealized)  —  ${total_pnl:+,.0f}  ({tot_ror:+.1f}%)")
+                  f"Total P&L (Realized + Unrealized)  —  ${total_pnl:+,.0f}  ({tot_ror:+.1f}%)",
+                  show_deposits=show_dep, show_pnl=show_pnl)
 
         for ax in (self._ax1, self._ax2):
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
             ax.set_ylabel("Value ($)")
-            ax.legend(loc="upper left", fontsize=8)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc="upper left", fontsize=8)
             ax.grid(True, alpha=0.3)
 
-        self._ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
-        self._ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+        locator = mdates.AutoDateLocator()
+        self._ax2.xaxis.set_major_locator(locator)
+        self._ax2.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         self._fig.autofmt_xdate(rotation=30, ha="right")
         self._fig.tight_layout(pad=1.5)
         self._canvas.draw()
@@ -388,16 +472,31 @@ class GainsTab(QWidget):
         self._lbl_total.setText(f"Total: ${total_pnl:+,.2f} ({tot_ror:+.1f}%)")
 
 
-def _fill_pnl(ax, dt_series, dep_series, pnl_series, title: str):
-    """Draw deposits (blue base) + P&L fill (green gain / red loss) on top."""
-    top = [d + p for d, p in zip(dep_series, pnl_series)]
-    ax.fill_between(dt_series, 0, dep_series,
-                    color="#4a90d9", alpha=0.8, label="Net Deposits")
-    ax.fill_between(dt_series, dep_series, top,
-                    where=[t >= d for t, d in zip(top, dep_series)],
-                    color="#5cb85c", alpha=0.8, label="Gain")
-    ax.fill_between(dt_series, dep_series, top,
-                    where=[t < d for t, d in zip(top, dep_series)],
-                    color="#d9534f", alpha=0.8, label="Loss")
-    ax.plot(dt_series, top, color="white", linewidth=0.8, alpha=0.5)
+def _bar_width(x: list[float]) -> float:
+    """Bar width (in matplotlib date units) = 80% of the smallest gap between points."""
+    gaps = [b - a for a, b in zip(x[:-1], x[1:]) if b > a]
+    return min(gaps) * 0.8 if gaps else 1.0
+
+
+def _fill_pnl(ax, dt_series, dep_series, pnl_series, title: str,
+              show_deposits: bool = True, show_pnl: bool = True):
+    """Draw deposits (blue base) as a fill and/or P&L as per-date bars.
+
+    When deposits are hidden the P&L bars sit on a zero baseline, so the chart
+    shows pure gain/loss (green up / red down) with deposits removed.
+    """
+    base = dep_series if show_deposits else [0.0] * len(dep_series)
+
+    if show_deposits:
+        ax.fill_between(dt_series, 0, dep_series,
+                        color="#4a90d9", alpha=0.8, label="Net Deposits")
+    if show_pnl:
+        x = mdates.date2num(dt_series)
+        width = _bar_width(x)
+        colors = ["#5cb85c" if p >= 0 else "#d9534f" for p in pnl_series]
+        ax.bar(x, pnl_series, bottom=base, width=width, color=colors,
+               alpha=0.85, linewidth=0, align="center")
+        # Proxy entries so the legend shows Gain/Loss for the mixed-colour bars.
+        ax.bar([], [], color="#5cb85c", label="Gain")
+        ax.bar([], [], color="#d9534f", label="Loss")
     ax.set_title(title, fontsize=10, pad=4)
