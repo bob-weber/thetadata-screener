@@ -229,6 +229,44 @@ def fetch_option_eod_chain(symbol: str, exp: date, trade_date: date, right: str 
         return None
 
 
+def fetch_option_expirations(symbol: str) -> list[date]:
+    """Return the option expirations ThetaData actually lists for a symbol."""
+    try:
+        r = requests.get(
+            f"{THETA_BASE}/v3/option/list/expirations",
+            params={"symbol": symbol},
+            timeout=15,
+        )
+        if r.status_code != 200 or not r.text.strip():
+            return []
+        text = r.text.strip()
+        if text.startswith("No data") or "," not in text.split("\n")[0]:
+            return []
+        df = pd.read_csv(io.StringIO(text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        col = "expiration" if "expiration" in df.columns else df.columns[-1]
+        out = []
+        for v in df[col].tolist():
+            try:
+                out.append(date.fromisoformat(str(v).strip()))
+            except ValueError:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def snap_expiration(requested: date, available: list[date]) -> date | None:
+    """Snap a requested expiration to the closest listed one on or before it.
+
+    Options expire only on dates the exchange lists; when the requested date is a
+    weekend or holiday (e.g. Juneteenth 6/19) it won't appear, so we fall back to
+    the nearest earlier listed expiration. Returns None if none qualifies.
+    """
+    on_or_before = [e for e in available if e <= requested]
+    return max(on_or_before) if on_or_before else None
+
+
 def _get_company_symbols(client, on_log=None) -> list[str]:
     """Return NYSE/Nasdaq company tickers, excluding ETFs and funds."""
     sec_symbols: set[str] = set()
@@ -283,23 +321,150 @@ def _get_company_symbols(client, on_log=None) -> list[str]:
     return sorted(theta_symbols)
 
 
-def run_stock_filter(
-    config: dict,
-    on_log=None,
-    on_pass1_progress=None,
-    on_pass2_progress=None,
-    stop_flag=None,
-    price_cache_file: str | Path   = "price_screen_cache.json",
-    history_cache_file: str | Path = "tech_history_cache.json",
-    candidates_cache_file: str | Path = "tech_candidates_cache.json",
-    watchlist_file: str | Path | None = None,
-    skip_candidates_cache: bool = False,
-) -> list[dict]:
+def _connect_client(on_log=None):
     from thetadata import ThetaClient
     from thetadata.errors import AuthenticationError
 
-    price_min        = config.get("price_min",        10.0)
-    price_max        = config.get("price_max",       200.0)
+    if on_log:
+        on_log("Connecting to ThetaData terminal …")
+    try:
+        return ThetaClient(dataframe_type="pandas")
+    except AuthenticationError:
+        raise ScreenerError("Authentication failed — check your ThetaData credentials.")
+
+
+def _price_key(config: dict) -> dict:
+    return {
+        "date":      date.today().isoformat(),
+        "price_min": config.get("price_min", 10.0),
+        "price_max": config.get("price_max", 500.0),
+    }
+
+
+def _full_key(config: dict) -> dict:
+    return {
+        **_price_key(config),
+        "rsi_threshold":    config.get("rsi_threshold",    40.0),
+        "bb_pct_threshold": config.get("bb_pct_threshold", 33.0),
+        "rsi_period":       config.get("rsi_period",       14),
+        "bb_period":        config.get("bb_period",        20),
+    }
+
+
+def run_price_screen(
+    config: dict,
+    on_log=None,
+    on_progress=None,
+    stop_flag=None,
+    watchlist_file: str | Path | None = None,
+    price_cache_file: str | Path = "price_screen_cache.json",
+    use_cache: bool = True,
+) -> list[dict]:
+    """Pass 1 — screen the symbol universe down to those inside the price range.
+
+    Writes ``price_screen_cache.json`` and returns ``[{"symbol", "price"}, …]``.
+    This is the slow, rarely-changing pass; the GUI drives it from its own button.
+    """
+    price_min      = config.get("price_min",      10.0)
+    price_max      = config.get("price_max",     500.0)
+    stock_throttle = config.get("stock_throttle",  0.1)
+
+    trade_date = _current_trade_date()
+    price_key  = _price_key(config)
+    price_path = Path(price_cache_file)
+
+    if use_cache and price_path.exists():
+        try:
+            cached = json.loads(price_path.read_text())
+            if all(cached.get(k) == v for k, v in price_key.items()):
+                qualified = cached["qualified"]
+                if on_log:
+                    on_log(f"Price screen cache hit — {len(qualified)} symbols in ${price_min}–${price_max}")
+                return qualified
+        except Exception:
+            pass
+
+    client = _connect_client(on_log)
+
+    # ── Symbol universe ───────────────────────────────────────────────────────
+    if watchlist_file and Path(watchlist_file).exists():
+        all_symbols = [t.strip() for t in Path(watchlist_file).read_text().splitlines() if t.strip()]
+        if on_log:
+            on_log(f"Using watchlist: {len(all_symbols)} symbols")
+    else:
+        all_symbols = _get_company_symbols(client, on_log)
+
+    if on_log:
+        on_log(f"Pass 1: price screen — {len(all_symbols)} symbols …")
+    price_qualified: list[dict] = []
+    total   = len(all_symbols)
+    skipped = 0
+
+    for i, sym in enumerate(all_symbols):
+        if stop_flag and stop_flag():
+            if on_log:
+                on_log("Stopped by user.")
+            return []
+
+        try:
+            eod = client.stock_history_eod(
+                symbol=sym, start_date=trade_date, end_date=trade_date
+            )
+        except Exception:
+            skipped += 1
+            if on_progress:
+                on_progress(i + 1, total)
+            continue
+
+        if eod is None or eod.empty:
+            skipped += 1
+            if on_progress:
+                on_progress(i + 1, total)
+            continue
+
+        last_price = _current_price(eod)
+        if last_price is None:
+            skipped += 1
+            if on_progress:
+                on_progress(i + 1, total)
+            continue
+
+        if price_min <= last_price <= price_max:
+            price_qualified.append({"symbol": sym, "price": round(last_price, 2)})
+
+        if on_progress:
+            on_progress(i + 1, total)
+
+        time.sleep(stock_throttle)
+
+    if on_log:
+        on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
+
+    from datetime import datetime
+    price_path.write_text(json.dumps({
+        **price_key,
+        "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "qualified":  price_qualified,
+    }))
+    return price_qualified
+
+
+def run_technical_filter(
+    config: dict,
+    price_qualified: list[dict],
+    on_log=None,
+    on_progress=None,
+    stop_flag=None,
+    history_cache_file: str | Path = "tech_history_cache.json",
+    candidates_cache_file: str | Path = "tech_candidates_cache.json",
+    use_cache: bool = True,
+) -> list[dict]:
+    """Pass 2 — fetch 45-day history for the price-qualified list and apply RSI/BB%.
+
+    Writes ``tech_candidates_cache.json`` and returns
+    ``[{"symbol", "price", "rsi", "bb_pct"}, …]``. Takes the price-screened list
+    (from :func:`run_price_screen`) as input so it can be re-run on its own.
+    """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
     bb_std_mult      = config.get("bb_std_mult",       2.0)
@@ -311,116 +476,18 @@ def run_stock_filter(
     trade_date = _current_trade_date()
     hist_start = today - timedelta(days=45)
 
-    price_key = {
-        "date":      today.isoformat(),
-        "price_min": price_min,
-        "price_max": price_max,
-    }
-    full_key = {
-        **price_key,
-        "rsi_threshold":    rsi_threshold,
-        "bb_pct_threshold": bb_pct_threshold,
-        "rsi_period":       rsi_period,
-        "bb_period":        bb_period,
-    }
-
-    # ── Candidates cache (all params match → return immediately) ──────────────
-    cand_path = Path(candidates_cache_file)
-    if not skip_candidates_cache and cand_path.exists():
-        try:
-            cached = json.loads(cand_path.read_text())
-            if all(cached.get(k) == v for k, v in full_key.items()):
-                if on_log:
-                    on_log(f"Loaded {len(cached['candidates'])} candidates from cache.")
-                return cached["candidates"]
-        except Exception:
-            pass
-
-    if on_log:
-        on_log("Connecting to ThetaData terminal …")
-    try:
-        client = ThetaClient(dataframe_type="pandas")
-    except AuthenticationError:
-        raise ScreenerError("Authentication failed — check your ThetaData credentials.")
-
-    # ── Symbol universe ───────────────────────────────────────────────────────
-    if watchlist_file and Path(watchlist_file).exists():
-        all_symbols = [t.strip() for t in Path(watchlist_file).read_text().splitlines() if t.strip()]
-        if on_log:
-            on_log(f"Using watchlist: {len(all_symbols)} symbols")
-    else:
-        all_symbols = _get_company_symbols(client, on_log)
-
-    # ── Pass 1: price screen (last price only) ────────────────────────────────
-    price_path = Path(price_cache_file)
-    price_qualified: list[dict] | None = None
-    if price_path.exists():
-        try:
-            cached = json.loads(price_path.read_text())
-            if all(cached.get(k) == v for k, v in price_key.items()):
-                price_qualified = cached["qualified"]
-                if on_log:
-                    on_log(f"Price screen cache hit — {len(price_qualified)} symbols in ${price_min}–${price_max}")
-        except Exception:
-            pass
-
-    if price_qualified is None:
-        if on_log:
-            on_log(f"Pass 1: price screen — {len(all_symbols)} symbols …")
-        price_qualified = []
-        total   = len(all_symbols)
-        skipped = 0
-
-        for i, sym in enumerate(all_symbols):
-            if stop_flag and stop_flag():
-                if on_log:
-                    on_log("Stopped by user.")
-                return []
-
-            try:
-                eod = client.stock_history_eod(
-                    symbol=sym, start_date=trade_date, end_date=trade_date
-                )
-            except Exception:
-                skipped += 1
-                if on_pass1_progress:
-                    on_pass1_progress(i + 1, total)
-                continue
-
-            if eod is None or eod.empty:
-                skipped += 1
-                if on_pass1_progress:
-                    on_pass1_progress(i + 1, total)
-                continue
-
-            last_price = _current_price(eod)
-            if last_price is None:
-                skipped += 1
-                if on_pass1_progress:
-                    on_pass1_progress(i + 1, total)
-                continue
-
-            if price_min <= last_price <= price_max:
-                price_qualified.append({"symbol": sym, "price": round(last_price, 2)})
-
-            if on_pass1_progress:
-                on_pass1_progress(i + 1, total)
-
-            time.sleep(stock_throttle)
-
-        if on_log:
-            on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
-        price_path.write_text(json.dumps({**price_key, "qualified": price_qualified}))
+    price_key = _price_key(config)
+    full_key  = _full_key(config)
 
     if not price_qualified:
         if on_log:
-            on_log("No symbols passed the price filter.")
+            on_log("No price-screened symbols — run the Price Scan first.")
         return []
 
-    # ── Pass 2: fetch 45-day history for price qualifiers ─────────────────────
+    # ── Pass 2: fetch 45-day history (cache keyed on price params only) ────────
     hist_path = Path(history_cache_file)
     histories: dict[str, list] | None = None
-    if hist_path.exists():
+    if use_cache and hist_path.exists():
         try:
             cached = json.loads(hist_path.read_text())
             if all(cached.get(k) == v for k, v in price_key.items()):
@@ -431,6 +498,7 @@ def run_stock_filter(
             pass
 
     if histories is None:
+        client = _connect_client(on_log)
         if on_log:
             on_log(f"Pass 2: fetching 45-day history for {len(price_qualified)} symbols …")
         histories = {}
@@ -450,34 +518,34 @@ def run_stock_filter(
                 )
             except Exception:
                 skipped += 1
-                if on_pass2_progress:
-                    on_pass2_progress(i + 1, total)
+                if on_progress:
+                    on_progress(i + 1, total)
                 continue
 
             if eod is None or len(eod) < bb_period + 2:
                 skipped += 1
-                if on_pass2_progress:
-                    on_pass2_progress(i + 1, total)
+                if on_progress:
+                    on_progress(i + 1, total)
                 continue
 
             close_col = find_close_col(eod)
             if close_col is None:
                 skipped += 1
-                if on_pass2_progress:
-                    on_pass2_progress(i + 1, total)
+                if on_progress:
+                    on_progress(i + 1, total)
                 continue
 
             closes = eod[close_col].dropna().astype(float)
             if len(closes) < bb_period + 2:
                 skipped += 1
-                if on_pass2_progress:
-                    on_pass2_progress(i + 1, total)
+                if on_progress:
+                    on_progress(i + 1, total)
                 continue
 
             histories[sym] = closes.tolist()
 
-            if on_pass2_progress:
-                on_pass2_progress(i + 1, total)
+            if on_progress:
+                on_progress(i + 1, total)
 
             time.sleep(stock_throttle)
 
@@ -510,12 +578,61 @@ def run_stock_filter(
         on_log(f"Technical filter done — {len(tech_candidates)} candidates.")
 
     from datetime import datetime
-    cand_path.write_text(json.dumps({
+    Path(candidates_cache_file).write_text(json.dumps({
         **full_key,
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "candidates": tech_candidates,
     }))
     return tech_candidates
+
+
+def run_stock_filter(
+    config: dict,
+    on_log=None,
+    on_pass1_progress=None,
+    on_pass2_progress=None,
+    stop_flag=None,
+    price_cache_file: str | Path   = "price_screen_cache.json",
+    history_cache_file: str | Path = "tech_history_cache.json",
+    candidates_cache_file: str | Path = "tech_candidates_cache.json",
+    watchlist_file: str | Path | None = None,
+    skip_candidates_cache: bool = False,
+) -> list[dict]:
+    """Convenience wrapper: price screen (Pass 1) then technical filter (Pass 2)."""
+    full_key  = _full_key(config)
+    cand_path = Path(candidates_cache_file)
+    if not skip_candidates_cache and cand_path.exists():
+        try:
+            cached = json.loads(cand_path.read_text())
+            if all(cached.get(k) == v for k, v in full_key.items()):
+                if on_log:
+                    on_log(f"Loaded {len(cached['candidates'])} candidates from cache.")
+                return cached["candidates"]
+        except Exception:
+            pass
+
+    price_qualified = run_price_screen(
+        config,
+        on_log=on_log,
+        on_progress=on_pass1_progress,
+        stop_flag=stop_flag,
+        watchlist_file=watchlist_file,
+        price_cache_file=price_cache_file,
+    )
+    if not price_qualified:
+        if on_log:
+            on_log("No symbols passed the price filter.")
+        return []
+
+    return run_technical_filter(
+        config,
+        price_qualified,
+        on_log=on_log,
+        on_progress=on_pass2_progress,
+        stop_flag=stop_flag,
+        history_cache_file=history_cache_file,
+        candidates_cache_file=candidates_cache_file,
+    )
 
 
 def run_options_filter(
@@ -535,13 +652,12 @@ def run_options_filter(
     today       = date.today()
     trade_date  = _prev_trading_day()
 
-    exp_date_str = config.get("expiration_date")
-    if exp_date_str:
-        expirations = [date.fromisoformat(exp_date_str)]
-    else:
-        dte_min     = config.get("dte_min",  4)
-        dte_max     = config.get("dte_max", 21)
-        expirations = [today + timedelta(days=d) for d in range(dte_min, dte_max + 1)]
+    exp_date_str  = config.get("expiration_date")
+    requested_exp = date.fromisoformat(exp_date_str) if exp_date_str else None
+    if requested_exp is None:
+        dte_min         = config.get("dte_min",  4)
+        dte_max         = config.get("dte_max", 21)
+        dte_expirations = [today + timedelta(days=d) for d in range(dte_min, dte_max + 1)]
     results = []
     total   = len(candidates)
 
@@ -558,6 +674,21 @@ def run_options_filter(
         sym         = row["symbol"]
         stock_price = row["price"]
         sym_hits    = 0
+
+        if requested_exp is not None:
+            exp = snap_expiration(requested_exp, fetch_option_expirations(sym))
+            if exp is None:
+                if on_log:
+                    on_log(f"  {sym}: no listed expiration on or before {requested_exp}")
+                if on_progress:
+                    on_progress(i + 1, total)
+                time.sleep(options_throttle)
+                continue
+            if exp != requested_exp and on_log:
+                on_log(f"  {sym}: {requested_exp} not listed — using {exp}")
+            expirations = [exp]
+        else:
+            expirations = dte_expirations
 
         for exp in expirations:
             chain = fetch_option_eod_chain(sym, exp, trade_date, right=right)

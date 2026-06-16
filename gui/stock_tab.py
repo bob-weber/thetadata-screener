@@ -8,13 +8,16 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from .workers import StockWorker
+from .workers import PriceScreenWorker, TechnicalWorker
 
+PRICE_CACHE      = "price_screen_cache.json"
 CANDIDATES_CACHE = "tech_candidates_cache.json"
+
+_PRICE_COLS    = ["symbol", "price"]
+_PRICE_HEADERS = ["Symbol", "Price"]
 
 _COLS    = ["symbol", "price", "rsi", "bb_pct"]
 _HEADERS = ["Symbol", "Price", "RSI", "BB%"]
-_NUMERIC = {"price", "rsi", "bb_pct"}
 
 
 class _NumericItem(QTableWidgetItem):
@@ -35,31 +38,60 @@ def _make_item(val) -> QTableWidgetItem:
     return item
 
 
+def _new_table(headers: list[str]) -> QTableWidget:
+    table = QTableWidget(0, len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.setSortingEnabled(True)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    header.setStretchLastSection(True)
+    table.verticalHeader().setVisible(False)
+    return table
+
+
+def _fill_table(table: QTableWidget, rows: list[dict], cols: list[str]):
+    table.setSortingEnabled(False)
+    table.setRowCount(len(rows))
+    for r, row in enumerate(rows):
+        for c, key in enumerate(cols):
+            table.setItem(r, c, _make_item(row.get(key, "")))
+    table.setSortingEnabled(True)
+    table.resizeColumnsToContents()
+
+
 class StockScannerTab(QWidget):
     scan_finished = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self._worker       = None
-        self._results_box  = None
-        self._table        = None
+        self._worker = None
         self._setup_ui()
         self._load_cached_results()
 
+    # ── startup cache loading ──────────────────────────────────────────────────
+
     def _load_cached_results(self):
-        path = Path(CANDIDATES_CACHE)
+        self._load_cache(PRICE_CACHE, "qualified", self._price_table,
+                         self._price_box, _PRICE_COLS, "symbols")
+        self._load_cache(CANDIDATES_CACHE, "candidates", self._cand_table,
+                         self._cand_box, _COLS, "candidates")
+
+    def _load_cache(self, path_str, key, table, box, cols, noun):
+        path = Path(path_str)
         if not path.exists():
             return
         try:
             cached = json.loads(path.read_text())
         except Exception:
             return
-        candidates = cached.get("candidates", [])
-        if not candidates:
-            return
-        ts = cached.get("scanned_at") or cached.get("date", "unknown")
-        self._populate_table(candidates)
-        self._results_box.setTitle(f"Results — {len(candidates)} candidates  |  last scan: {ts}")
+        rows = cached.get(key, [])
+        ts   = cached.get("scanned_at") or cached.get("date", "unknown")
+        _fill_table(table, rows, cols)
+        box.setTitle(f"{box.property('_base')} — {len(rows)} {noun}  |  last scan: {ts}")
+
+    # ── UI construction ─────────────────────────────────────────────────────────
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
@@ -74,7 +106,7 @@ class StockScannerTab(QWidget):
         ph = QHBoxLayout(price_row)
         ph.setContentsMargins(0, 0, 0, 0)
         self._price_min = QLineEdit("10.0")
-        self._price_max = QLineEdit("200.0")
+        self._price_max = QLineEdit("500.0")
         ph.addWidget(self._price_min)
         ph.addWidget(QLabel("–"))
         ph.addWidget(self._price_max)
@@ -109,55 +141,65 @@ class StockScannerTab(QWidget):
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._run_btn  = QPushButton("Run Stock Scanner")
-        self._stop_btn = QPushButton("Stop")
-        self._run_btn.setFixedHeight(32)
-        self._stop_btn.setFixedHeight(32)
+        self._price_btn = QPushButton("Run Price Scan")
+        self._tech_btn  = QPushButton("Run Technical Scan")
+        self._stop_btn  = QPushButton("Stop")
+        for b in (self._price_btn, self._tech_btn, self._stop_btn):
+            b.setFixedHeight(32)
         self._stop_btn.setEnabled(False)
-        self._run_btn.clicked.connect(self._run)
+        self._price_btn.clicked.connect(self._run_price)
+        self._tech_btn.clicked.connect(self._run_technical)
         self._stop_btn.clicked.connect(self._stop)
         btn_row.addStretch()
-        btn_row.addWidget(self._run_btn)
+        btn_row.addWidget(self._price_btn)
+        btn_row.addWidget(self._tech_btn)
         btn_row.addWidget(self._stop_btn)
         root.addLayout(btn_row)
 
         # ── Progress ──────────────────────────────────────────────────────────
         prog_box = QGroupBox("Progress")
         pl = QFormLayout(prog_box)
-        self._pass1_bar   = QProgressBar()
-        self._pass1_label = QLabel("—")
-        self._pass2_bar   = QProgressBar()
-        self._pass2_label = QLabel("—")
-        self._pass1_bar.setRange(0, 100)
-        self._pass2_bar.setRange(0, 100)
-        pl.addRow("Pass 1 — price screen:", self._pass1_bar)
-        pl.addRow("",                        self._pass1_label)
-        pl.addRow("Pass 2 — history fetch:", self._pass2_bar)
-        pl.addRow("",                        self._pass2_label)
+        self._price_bar   = QProgressBar()
+        self._price_plabel = QLabel("—")
+        self._tech_bar    = QProgressBar()
+        self._tech_plabel = QLabel("—")
+        self._price_bar.setRange(0, 100)
+        self._tech_bar.setRange(0, 100)
+        pl.addRow("Price scan:",     self._price_bar)
+        pl.addRow("",                self._price_plabel)
+        pl.addRow("Technical scan:", self._tech_bar)
+        pl.addRow("",                self._tech_plabel)
         root.addWidget(prog_box)
 
-        # ── Splitter: log + results ───────────────────────────────────────────
+        # ── Splitter: log + two result tables ───────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         log_box = QGroupBox("Log")
         ll = QVBoxLayout(log_box)
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setFont(self._log.font())
         ll.addWidget(self._log)
         splitter.addWidget(log_box)
 
-        self._results_box = QGroupBox("Results — 0 candidates")
-        rl = QVBoxLayout(self._results_box)
-        self._table = QTableWidget(0, len(_HEADERS))
-        self._table.setHorizontalHeaderLabels(_HEADERS)
-        self._table.setSortingEnabled(True)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._table.verticalHeader().setVisible(False)
-        rl.addWidget(self._table)
-        splitter.addWidget(self._results_box)
+        results_split = QSplitter(Qt.Orientation.Horizontal)
+
+        self._price_box = QGroupBox("Price-Screened — 0 symbols")
+        self._price_box.setProperty("_base", "Price-Screened")
+        prl = QVBoxLayout(self._price_box)
+        self._price_table = _new_table(_PRICE_HEADERS)
+        prl.addWidget(self._price_table)
+        results_split.addWidget(self._price_box)
+
+        self._cand_box = QGroupBox("Technical Candidates — 0 candidates")
+        self._cand_box.setProperty("_base", "Technical Candidates")
+        cl = QVBoxLayout(self._cand_box)
+        self._cand_table = _new_table(_HEADERS)
+        cl.addWidget(self._cand_table)
+        results_split.addWidget(self._cand_box)
+
+        results_split.setStretchFactor(0, 1)
+        results_split.setStretchFactor(1, 2)
+        splitter.addWidget(results_split)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -183,29 +225,48 @@ class StockScannerTab(QWidget):
             "stock_throttle":   float(self._throttle.text()),
         }
 
-    def _run(self):
+    def _begin_scan(self) -> dict | None:
         try:
             config = self._get_config()
         except ValueError as e:
             self._log.append(f"Invalid parameter: {e}")
-            return
-
-        watchlist = self._watchlist_edit.text().strip() or None
-        self._run_btn.setEnabled(False)
+            return None
+        self._price_btn.setEnabled(False)
+        self._tech_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._log.clear()
-        self._table.setRowCount(0)
-        self._results_box.setTitle("Results — 0 candidates")
-        self._pass1_bar.setValue(0)
-        self._pass2_bar.setValue(0)
-        self._pass1_label.setText("—")
-        self._pass2_label.setText("—")
+        return config
 
-        self._worker = StockWorker(config, watchlist)
+    def _run_price(self):
+        config = self._begin_scan()
+        if config is None:
+            return
+        self._price_table.setRowCount(0)
+        self._price_box.setTitle("Price-Screened — 0 symbols")
+        self._price_bar.setValue(0)
+        self._price_plabel.setText("—")
+
+        watchlist = self._watchlist_edit.text().strip() or None
+        self._worker = PriceScreenWorker(config, watchlist)
         self._worker.log_msg.connect(self._log.append)
-        self._worker.pass1_progress.connect(self._on_pass1_progress)
-        self._worker.pass2_progress.connect(self._on_pass2_progress)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.progress.connect(self._on_price_progress)
+        self._worker.finished.connect(self._on_price_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _run_technical(self):
+        config = self._begin_scan()
+        if config is None:
+            return
+        self._cand_table.setRowCount(0)
+        self._cand_box.setTitle("Technical Candidates — 0 candidates")
+        self._tech_bar.setValue(0)
+        self._tech_plabel.setText("—")
+
+        self._worker = TechnicalWorker(config)
+        self._worker.log_msg.connect(self._log.append)
+        self._worker.progress.connect(self._on_tech_progress)
+        self._worker.finished.connect(self._on_tech_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -214,45 +275,45 @@ class StockScannerTab(QWidget):
             self._worker.stop()
         self._stop_btn.setEnabled(False)
 
-    def _on_pass1_progress(self, current: int, total: int):
-        self._pass1_label.setText(f"{current:,} / {total:,}")
-        if total > 0:
-            self._pass1_bar.setValue(int(current * 100 / total))
-
-    def _on_pass2_progress(self, current: int, total: int):
-        self._pass2_label.setText(f"{current:,} / {total:,}")
-        if total > 0:
-            self._pass2_bar.setValue(int(current * 100 / total))
-
-    def _on_finished(self, results: list):
-        self._run_btn.setEnabled(True)
+    def _idle(self):
+        self._price_btn.setEnabled(True)
+        self._tech_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._pass1_bar.setValue(100)
-        self._pass2_bar.setValue(100)
-        self._log.append(f"Done — {len(results)} candidate(s) found.")
-        ts = self._read_scan_timestamp()
-        self._populate_table(results, title=f"Results — {len(results)} candidate(s)  |  last scan: {ts}")
+
+    def _on_price_progress(self, current: int, total: int):
+        self._price_plabel.setText(f"{current:,} / {total:,}")
+        if total > 0:
+            self._price_bar.setValue(int(current * 100 / total))
+
+    def _on_tech_progress(self, current: int, total: int):
+        self._tech_plabel.setText(f"{current:,} / {total:,}")
+        if total > 0:
+            self._tech_bar.setValue(int(current * 100 / total))
+
+    def _on_price_finished(self, results: list):
+        self._idle()
+        self._price_bar.setValue(100)
+        self._log.append(f"Price scan done — {len(results)} symbol(s) in range.")
+        ts = self._read_scan_timestamp(PRICE_CACHE)
+        _fill_table(self._price_table, results, _PRICE_COLS)
+        self._price_box.setTitle(f"Price-Screened — {len(results)} symbols  |  last scan: {ts}")
+
+    def _on_tech_finished(self, results: list):
+        self._idle()
+        self._tech_bar.setValue(100)
+        self._log.append(f"Technical scan done — {len(results)} candidate(s) found.")
+        ts = self._read_scan_timestamp(CANDIDATES_CACHE)
+        _fill_table(self._cand_table, results, _COLS)
+        self._cand_box.setTitle(f"Technical Candidates — {len(results)} candidates  |  last scan: {ts}")
         self.scan_finished.emit()
 
-    def _read_scan_timestamp(self) -> str:
+    def _read_scan_timestamp(self, path_str: str) -> str:
         try:
-            cached = json.loads(Path(CANDIDATES_CACHE).read_text())
+            cached = json.loads(Path(path_str).read_text())
             return cached.get("scanned_at") or cached.get("date", "unknown")
         except Exception:
             return "unknown"
 
     def _on_error(self, msg: str):
-        self._run_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
+        self._idle()
         self._log.append(f"ERROR: {msg}")
-
-    def _populate_table(self, results: list, title: str | None = None):
-        self._results_box.setTitle(title or f"Results — {len(results)} candidate(s)")
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(results))
-        for r, row in enumerate(results):
-            for c, key in enumerate(_COLS):
-                self._table.setItem(r, c, _make_item(row.get(key, "")))
-        self._table.setSortingEnabled(True)
-        self._table.resizeColumnsToContents()
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)

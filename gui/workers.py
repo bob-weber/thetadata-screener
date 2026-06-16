@@ -8,12 +8,15 @@ OPTIONS_RESULTS_CACHE = "options_results_cache.json"
 _OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side", "yield_min", "yield_max"]
 
 
-class StockWorker(QThread):
-    log_msg        = pyqtSignal(str)
-    pass1_progress = pyqtSignal(int, int)
-    pass2_progress = pyqtSignal(int, int)
-    finished       = pyqtSignal(list)
-    error          = pyqtSignal(str)
+PRICE_SCREEN_CACHE = "price_screen_cache.json"
+
+
+class PriceScreenWorker(QThread):
+    """Pass 1 — price screen. Driven by the Stock Scanner's 'Run Price Scan' button."""
+    log_msg  = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(list)
+    error    = pyqtSignal(str)
 
     def __init__(self, config: dict, watchlist_file: str | None = None):
         super().__init__()
@@ -25,16 +28,62 @@ class StockWorker(QThread):
         self._stop = True
 
     def run(self):
-        from core.screener import run_stock_filter, ScreenerError
+        from core.screener import run_price_screen, ScreenerError
         try:
-            results = run_stock_filter(
+            results = run_price_screen(
                 self._config,
                 on_log=self.log_msg.emit,
-                on_pass1_progress=lambda c, t: self.pass1_progress.emit(c, t),
-                on_pass2_progress=lambda c, t: self.pass2_progress.emit(c, t),
+                on_progress=lambda c, t: self.progress.emit(c, t),
                 stop_flag=lambda: self._stop,
                 watchlist_file=self._watchlist,
-                skip_candidates_cache=True,
+                use_cache=False,
+            )
+            self.finished.emit(results)
+        except ScreenerError as e:
+            self.error.emit(str(e))
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {e}")
+
+
+class TechnicalWorker(QThread):
+    """Pass 2 — RSI/BB% filter over the saved price-screen list."""
+    log_msg  = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(list)
+    error    = pyqtSignal(str)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self._config = config
+        self._stop   = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from core.screener import run_technical_filter, ScreenerError
+
+        price_path = Path(PRICE_SCREEN_CACHE)
+        if not price_path.exists():
+            self.error.emit("No price-screen results — run the Price Scan first.")
+            return
+        try:
+            price_qualified = json.loads(price_path.read_text()).get("qualified", [])
+        except Exception as e:
+            self.error.emit(f"Could not read price-screen cache: {e}")
+            return
+        if not price_qualified:
+            self.error.emit("Price screen returned no symbols — run the Price Scan first.")
+            return
+
+        try:
+            results = run_technical_filter(
+                self._config,
+                price_qualified,
+                on_log=self.log_msg.emit,
+                on_progress=lambda c, t: self.progress.emit(c, t),
+                stop_flag=lambda: self._stop,
+                use_cache=False,
             )
             self.finished.emit(results)
         except ScreenerError as e:
@@ -50,10 +99,12 @@ class OptionsWorker(QThread):
     finished          = pyqtSignal(list)
     error             = pyqtSignal(str)
 
-    def __init__(self, config: dict, positions: list[str] | None = None):
+    def __init__(self, config: dict, positions: list[str] | None = None,
+                 reject: set[str] | None = None):
         super().__init__()
         self._config    = config
         self._positions = positions  # None → use stock scan cache; list → fetch prices live
+        self._reject    = {s.upper() for s in reject} if reject else set()
         self._stop      = False
 
     def stop(self):
@@ -90,13 +141,36 @@ class OptionsWorker(QThread):
         if not candidates:
             self.error.emit("Stock scan returned no candidates — run the Stock Scanner first.")
             return None
+        candidates = self._apply_reject(candidates, "candidate")
+        if not candidates:
+            self.error.emit("All stock-scan candidates are on the reject list.")
+            return None
         scan_date = cached.get("date", "unknown date")
         self.log_msg.emit(f"Loaded {len(candidates)} candidates from stock scan ({scan_date}).")
         self.candidates_loaded.emit(len(candidates))
         return candidates
 
+    def _apply_reject(self, candidates: list[dict], noun: str) -> list[dict]:
+        """Drop candidates whose symbol is on the reject list; log how many."""
+        if not self._reject:
+            return candidates
+        kept    = [c for c in candidates if c["symbol"].upper() not in self._reject]
+        removed = len(candidates) - len(kept)
+        if removed:
+            self.log_msg.emit(f"Reject list: excluded {removed} {noun}(s).")
+        return kept
+
     def _fetch_position_candidates(self) -> list[dict] | None:
         from core.screener import fetch_stock_prices, ScreenerError
+        if self._reject:
+            kept    = [p for p in self._positions if p.upper() not in self._reject]
+            removed = len(self._positions) - len(kept)
+            if removed:
+                self.log_msg.emit(f"Reject list: excluded {removed} position(s).")
+            self._positions = kept
+            if not self._positions:
+                self.error.emit("All positions are on the reject list.")
+                return None
         self.log_msg.emit(f"Fetching current prices for {len(self._positions)} position(s)…")
         try:
             candidates = fetch_stock_prices(
