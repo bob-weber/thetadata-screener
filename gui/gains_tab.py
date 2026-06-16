@@ -217,11 +217,14 @@ def _price_on(hist: dict, date_str: str) -> float | None:
     return hist[max(candidates)] if candidates else None
 
 
-def reconstruct(data: dict) -> dict:
+def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     """
     Walk trades chronologically with average-cost basis.
     Returns time series aligned to balance dates:
       dates, deposits, realized, total, and final summary values.
+
+    Pass ``with_unrealized=False`` to skip the (networked) yfinance price
+    fetch when only realized P&L is needed; ``total`` then equals ``realized``.
     """
     balances = sorted(data["balances"], key=lambda b: b["date"])
 
@@ -243,9 +246,12 @@ def reconstruct(data: dict) -> dict:
     start_d = date.fromisoformat(timeline[0])
     end_d   = date.fromisoformat(timeline[-1])
 
-    # All symbols ever traded → fetch price history once
-    symbols = sorted({t["symbol"] for t in data["stk_trades"]})
-    price_hist = _fetch_price_history(symbols, start_d, end_d)
+    # All symbols ever traded → fetch price history once (skipped if realized-only)
+    if with_unrealized:
+        symbols = sorted({t["symbol"] for t in data["stk_trades"]})
+        price_hist = _fetch_price_history(symbols, start_d, end_d)
+    else:
+        price_hist = {}
 
     holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
     cum_opt = 0.0
@@ -307,6 +313,148 @@ def reconstruct(data: dict) -> dict:
         "realized": realized_series,
         "total":    total_series,
     }
+
+
+# Option leg description parsers (capture: action, qty, to-open expiration,
+# strike, type). Calendar rolls list the to-open expiration first, then /to-close.
+_OPT_CAL_RE = re.compile(
+    r'\b(SOLD|BOT)\s+([+-]?\d+)\s+CALENDAR\s+\S+\s+100.*?'
+    r'(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
+    r'\s+([\d.]+)\s+(PUT|CALL)', re.IGNORECASE)
+_OPT_SINGLE_RE = re.compile(
+    r'\b(SOLD|BOT)\s+([+-]?\d+)\s+\S+\s+100.*?'
+    r'(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})\s+([\d.]+)\s+(PUT|CALL)', re.IGNORECASE)
+
+
+def _parse_exp_date(s: str) -> date | None:
+    for fmt in ("%d %b %y", "%d %b %Y"):
+        try:
+            return datetime.strptime(s.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_opt_leg(desc: str) -> dict | None:
+    m = _OPT_CAL_RE.search(desc) or _OPT_SINGLE_RE.search(desc)
+    if not m:
+        return None
+    exp = _parse_exp_date(m.group(3))
+    if exp is None:
+        return None
+    return {
+        "action": m.group(1).upper(),
+        "qty":    int(m.group(2)),
+        "exp":    exp,
+        "strike": float(m.group(4)),
+        "type":   m.group(5).upper(),
+    }
+
+
+def _bdays(start: date, end: date) -> list[date]:
+    """Business days (Mon-Fri) in [start, end] inclusive; holidays ignored."""
+    if end < start:
+        end = start
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out or [start]
+
+
+def _stock_realized_by_date(data: dict) -> dict[date, float]:
+    """Realized P&L from stock sales (avg-cost basis), booked on the sale day."""
+    trades = sorted(data.get("stk_trades", []), key=lambda t: t["date"])
+    holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
+    out: dict[date, float] = {}
+    for t in trades:
+        sym = t["symbol"]
+        sh, tc = holdings.get(sym, [0.0, 0.0])
+        if t["action"] == "BOT":
+            sh += t["shares"]
+            tc += abs(t["amount"])
+            holdings[sym] = [sh, tc]
+        else:  # SOLD — realize proceeds against average cost
+            if sh > 0:
+                avg = tc / sh
+                q   = min(t["shares"], sh)
+                realized = t["amount"] - avg * q
+                sh -= q
+                tc -= avg * q
+                holdings[sym] = [sh, tc]
+            else:
+                realized = t["amount"]   # short / no basis
+            try:
+                d = date.fromisoformat(t["date"])
+            except Exception:
+                continue
+            out[d] = out.get(d, 0.0) + realized
+    return out
+
+
+def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
+                          range_to: str | None) -> dict | None:
+    """Weekly return on capital actually deployed in trades.
+
+    Realized per day = option premium accrued evenly across the business days a
+    leg is open (trade date → to-open expiration) PLUS stock-sale gain/loss
+    (avg-cost) booked on the sale day. Capital at risk = short-put collateral
+    (strike×100×qty) on each open day; a week's allocated is the average over
+    days a position is open. Weekly RoR = weekly realized / weekly allocated.
+    """
+    daily_prem:   dict[date, float] = {}
+    daily_collat: dict[date, float] = {}
+    for t in data.get("opt_trades", []):
+        leg = _parse_opt_leg(t.get("desc", ""))
+        if not leg:
+            continue
+        try:
+            trade_d = date.fromisoformat(t["date"])
+        except Exception:
+            continue
+        bdays   = _bdays(trade_d, leg["exp"])
+        per_day = t["amount"] / len(bdays)
+        collat  = (leg["strike"] * 100 * abs(leg["qty"])
+                   if leg["type"] == "PUT" and leg["action"] == "SOLD" else 0.0)
+        for d in bdays:
+            daily_prem[d] = daily_prem.get(d, 0.0) + per_day
+            if collat:
+                daily_collat[d] = daily_collat.get(d, 0.0) + collat
+
+    # Stock realized gain/loss, all on the day of sale.
+    for d, r in _stock_realized_by_date(data).items():
+        daily_prem[d] = daily_prem.get(d, 0.0) + r
+
+    if not daily_prem:
+        return None
+
+    days = sorted(set(daily_prem) | set(daily_collat))
+    first, last = days[0], days[-1]
+
+    if sel == "custom" and range_from and range_to:
+        win_start = date.fromisoformat(range_from)
+        win_end   = date.fromisoformat(range_to)
+    elif isinstance(sel, int):
+        win_end   = last
+        win_start = last - timedelta(days=sel)
+    else:
+        win_start, win_end = first, last
+
+    wk = win_start - timedelta(days=win_start.weekday())
+    last_wk = win_end - timedelta(days=win_end.weekday())
+    weeks, ror, realized, allocated = [], [], [], []
+    while wk <= last_wk:
+        wdays  = [wk + timedelta(days=i) for i in range(5)]   # Mon-Fri
+        r      = sum(daily_prem.get(d, 0.0) for d in wdays)
+        active = [daily_collat[d] for d in wdays if daily_collat.get(d, 0.0) > 0]
+        alloc  = sum(active) / len(active) if active else 0.0
+        weeks.append(datetime(wk.year, wk.month, wk.day))
+        realized.append(r)
+        allocated.append(alloc)
+        ror.append((r / alloc * 100) if alloc else 0.0)
+        wk += timedelta(days=7)
+    return {"weeks": weeks, "ror": ror, "realized": realized, "allocated": allocated}
 
 
 class GainsTab(QWidget):
@@ -407,8 +555,8 @@ class GainsTab(QWidget):
         for ax in (self._ax1, self._ax2):
             ax.clear()
 
-        series = reconstruct(self._data)
-        if not series:
+        full = reconstruct(self._data)
+        if not full:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "Import a TOS CSV in the Positions tab",
                         ha="center", va="center", transform=ax.transAxes,
@@ -418,7 +566,7 @@ class GainsTab(QWidget):
                 lbl.setText(lbl.text().split(":")[0] + ": —")
             return
 
-        series = self._filtered_series(series)
+        series = self._filtered_series(full)
         if series is None:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "No data in selected range",
@@ -500,3 +648,127 @@ def _fill_pnl(ax, dt_series, dep_series, pnl_series, title: str,
         ax.bar([], [], color="#5cb85c", label="Gain")
         ax.bar([], [], color="#d9534f", label="Loss")
     ax.set_title(title, fontsize=10, pad=4)
+
+
+class WeeklyRorTab(QWidget):
+    """Per-week realized P&L as bars, in dollars (left axis) and RoR % (right)."""
+
+    def __init__(self):
+        super().__init__()
+        self._data = _load_history()
+        self._range_sel  = None
+        self._range_from = None
+        self._range_to   = None
+        self._setup_ui()
+        self._refresh()
+
+    def _setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+        self._summary = QLabel("Weekly RoR")
+        self._summary.setStyleSheet("font-weight: bold; font-size: 13px;")
+        root.addWidget(self._summary)
+
+        self._fig, self._ax = plt.subplots(figsize=(10, 6))
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        root.addWidget(self._canvas, 1)
+
+    # ── external hooks ──────────────────────────────────────────────────────
+    def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
+        self._range_sel  = sel
+        self._range_from = date_from
+        self._range_to   = date_to
+        self._refresh()
+
+    def reload(self, *_):
+        """Re-read saved history (after a CSV import or Clear All) and redraw."""
+        self._data = _load_history()
+        self._refresh()
+
+    # ── drawing ─────────────────────────────────────────────────────────────
+    def _empty(self, msg: str):
+        self._ax.text(0.5, 0.5, msg, ha="center", va="center",
+                      transform=self._ax.transAxes, fontsize=11, color="gray")
+        self._summary.setText(f"Weekly RoR — {msg.lower()}")
+        self._canvas.draw()
+
+    def _refresh(self):
+        self._ax.clear()
+
+        if not self._data.get("opt_trades"):
+            self._empty("Import a TOS CSV in the Positions tab")
+            return
+
+        wk = _weekly_allocated_ror(
+            self._data, self._range_sel, self._range_from, self._range_to)
+        if not wk or not wk["weeks"]:
+            self._empty("No data in selected range")
+            return
+
+        weeks, ror, realized, allocated = (
+            wk["weeks"], wk["ror"], wk["realized"], wk["allocated"])
+
+        # Past weeks are realized (green/red); the current week is the boundary
+        # (amber); weeks after it are forward-looking projections (yellow), since
+        # their premium is still accruing on positions currently held.
+        today = date.today()
+        cur_monday = today - timedelta(days=today.weekday())
+        cur_dt = datetime(cur_monday.year, cur_monday.month, cur_monday.day)
+        CUR    = "#f0ad4e"   # current week (amber)
+        FUTURE = "#f5e16e"   # projected weeks (yellow)
+
+        def _bar_color(w, v):
+            if w == cur_dt:
+                return CUR
+            if w > cur_dt:
+                return FUTURE
+            return "#5cb85c" if v >= 0 else "#d9534f"
+
+        x = mdates.date2num(weeks)
+        colors = [_bar_color(w, v) for w, v in zip(weeks, ror)]
+        bars = self._ax.bar(x, ror, width=6.0, align="edge", color=colors,
+                            alpha=0.85, linewidth=0)
+        self._ax.bar([], [], color="#5cb85c", label="Gain")
+        self._ax.bar([], [], color="#d9534f", label="Loss")
+        if any(w == cur_dt for w in weeks):
+            self._ax.bar([], [], color=CUR, label="Current week")
+        if any(w > cur_dt for w in weeks):
+            self._ax.bar([], [], color=FUTURE, label="Projected")
+        self._ax.axhline(0, color="white", linewidth=0.6, alpha=0.4)
+        self._ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.1f}%"))
+        self._ax.set_ylabel("Weekly RoR (% of capital allocated)")
+        self._ax.legend(loc="upper left", fontsize=8)
+        self._ax.grid(True, axis="y", alpha=0.3)
+        loc = mdates.AutoDateLocator()
+        self._ax.xaxis.set_major_locator(loc)
+        self._ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+        # Label each bar with the week's realized gain/loss ($) and, below it,
+        # the capital allocated. Match the axis (month) tick label style so it's
+        # clearly legible on the plot background.
+        lbl_color = plt.rcParams.get("xtick.color", "black")
+        lbl_size  = plt.rcParams.get("xtick.labelsize", 10)
+        for bar, alloc, real, r in zip(bars, allocated, realized, ror):
+            gl = f"{'+' if real >= 0 else '-'}${abs(real):,.0f}"
+            al = (f"${alloc/1000:.0f}k" if alloc >= 1000 else f"${alloc:.0f}") if alloc > 0 else "—"
+            label = f"{gl}\non {al}"
+            y = bar.get_height()
+            self._ax.annotate(
+                label, (bar.get_x() + bar.get_width() / 2, y),
+                xytext=(0, 4 if r >= 0 else -4), textcoords="offset points",
+                ha="center", va="bottom" if r >= 0 else "top",
+                fontsize=lbl_size, color=lbl_color, linespacing=1.1)
+
+        tot_real  = sum(realized)
+        active    = [a for a in allocated if a > 0]
+        avg_alloc = sum(active) / len(active) if active else 0.0
+        avg_ror   = sum(r for r in ror if r) / len(active) if active else 0.0
+        self._ax.set_title(
+            f"Weekly RoR on Allocated Capital  —  {len(weeks)} week(s)", fontsize=11)
+        self._summary.setText(
+            f"Weekly RoR — {len(weeks)} weeks · ${tot_real:+,.0f} realized · "
+            f"avg {avg_ror:+.2f}%/wk on ~${avg_alloc:,.0f} allocated")
+
+        self._fig.autofmt_xdate(rotation=30, ha="right")
+        self._fig.tight_layout(pad=1.5)
+        self._canvas.draw()
