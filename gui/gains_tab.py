@@ -651,7 +651,7 @@ def _fill_pnl(ax, dt_series, dep_series, pnl_series, title: str,
 
 
 class WeeklyRorTab(QWidget):
-    """Per-week realized P&L as bars, in dollars (left axis) and RoR % (right)."""
+    """Per-week realized gain/loss ($, top) and return on allocated capital (%, bottom)."""
 
     def __init__(self):
         super().__init__()
@@ -669,7 +669,9 @@ class WeeklyRorTab(QWidget):
         self._summary.setStyleSheet("font-weight: bold; font-size: 13px;")
         root.addWidget(self._summary)
 
-        self._fig, self._ax = plt.subplots(figsize=(10, 6))
+        self._fig, (self._ax_d, self._ax_r) = plt.subplots(
+            2, 1, figsize=(10, 7), sharex=True)
+        self._fig.subplots_adjust(hspace=0.12)
         self._canvas = FigureCanvasQTAgg(self._fig)
         root.addWidget(self._canvas, 1)
 
@@ -687,13 +689,15 @@ class WeeklyRorTab(QWidget):
 
     # ── drawing ─────────────────────────────────────────────────────────────
     def _empty(self, msg: str):
-        self._ax.text(0.5, 0.5, msg, ha="center", va="center",
-                      transform=self._ax.transAxes, fontsize=11, color="gray")
+        for ax in (self._ax_d, self._ax_r):
+            ax.text(0.5, 0.5, msg, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=11, color="gray")
         self._summary.setText(f"Weekly RoR — {msg.lower()}")
         self._canvas.draw()
 
     def _refresh(self):
-        self._ax.clear()
+        self._ax_d.clear()
+        self._ax_r.clear()
 
         if not self._data.get("opt_trades"):
             self._empty("Import a TOS CSV in the Positions tab")
@@ -708,63 +712,71 @@ class WeeklyRorTab(QWidget):
         weeks, ror, realized, allocated = (
             wk["weeks"], wk["ror"], wk["realized"], wk["allocated"])
 
-        # Past weeks are realized (green/red); the current week is the boundary
-        # (amber); weeks after it are forward-looking projections (yellow), since
-        # their premium is still accruing on positions currently held.
+        # Past weeks are realized (green/red by sign); the current week is the
+        # boundary (amber); weeks after it are forward-looking projections
+        # (yellow), since their premium is still accruing on positions held now.
         today = date.today()
         cur_monday = today - timedelta(days=today.weekday())
         cur_dt = datetime(cur_monday.year, cur_monday.month, cur_monday.day)
         CUR    = "#f0ad4e"   # current week (amber)
         FUTURE = "#f5e16e"   # projected weeks (yellow)
 
-        def _bar_color(w, v):
+        def _cat_color(w, val):
             if w == cur_dt:
                 return CUR
             if w > cur_dt:
                 return FUTURE
-            return "#5cb85c" if v >= 0 else "#d9534f"
+            return "#5cb85c" if val >= 0 else "#d9534f"
 
         x = mdates.date2num(weeks)
-        colors = [_bar_color(w, v) for w, v in zip(weeks, ror)]
-        bars = self._ax.bar(x, ror, width=6.0, align="edge", color=colors,
-                            alpha=0.85, linewidth=0)
-        self._ax.bar([], [], color="#5cb85c", label="Gain")
-        self._ax.bar([], [], color="#d9534f", label="Loss")
-        if any(w == cur_dt for w in weeks):
-            self._ax.bar([], [], color=CUR, label="Current week")
-        if any(w > cur_dt for w in weeks):
-            self._ax.bar([], [], color=FUTURE, label="Projected")
-        self._ax.axhline(0, color="white", linewidth=0.6, alpha=0.4)
-        self._ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.1f}%"))
-        self._ax.set_ylabel("Weekly RoR (% of capital allocated)")
-        self._ax.legend(loc="upper left", fontsize=8)
-        self._ax.grid(True, axis="y", alpha=0.3)
-        loc = mdates.AutoDateLocator()
-        self._ax.xaxis.set_major_locator(loc)
-        self._ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+        colors = [_cat_color(w, v) for w, v in zip(weeks, realized)]
 
-        # Label each bar with the week's realized gain/loss ($) and, below it,
-        # the capital allocated. Match the axis (month) tick label style so it's
-        # clearly legible on the plot background.
+        # ── Top: realized gain/loss in dollars ──────────────────────────────
+        self._ax_d.bar(x, realized, width=6.0, align="edge", color=colors,
+                       alpha=0.85, linewidth=0)
+        self._ax_d.bar([], [], color="#5cb85c", label="Gain")
+        self._ax_d.bar([], [], color="#d9534f", label="Loss")
+        if any(w == cur_dt for w in weeks):
+            self._ax_d.bar([], [], color=CUR, label="Current week")
+        if any(w > cur_dt for w in weeks):
+            self._ax_d.bar([], [], color=FUTURE, label="Projected")
+        self._ax_d.axhline(0, color="0.5", linewidth=0.6)
+        self._ax_d.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+        self._ax_d.set_ylabel("Realized ($)")
+        self._ax_d.legend(loc="upper left", fontsize=8)
+        self._ax_d.grid(True, axis="y", alpha=0.3)
+        self._ax_d.set_title("Weekly Realized $  (top)  and  RoR on Allocated Capital  (bottom)",
+                             fontsize=11)
+        self._ax_d.tick_params(labelbottom=False)
+
+        # ── Bottom: return on allocated capital (%) ─────────────────────────
+        bars_r = self._ax_r.bar(x, ror, width=6.0, align="edge", color=colors,
+                                alpha=0.85, linewidth=0)
+        self._ax_r.axhline(0, color="0.5", linewidth=0.6)
+        self._ax_r.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.1f}%"))
+        self._ax_r.set_ylabel("RoR (% of allocated)")
+        self._ax_r.grid(True, axis="y", alpha=0.3)
+        loc = mdates.AutoDateLocator()
+        self._ax_r.xaxis.set_major_locator(loc)
+        self._ax_r.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+        # Label each RoR bar with the capital allocated that week.
         lbl_color = plt.rcParams.get("xtick.color", "black")
         lbl_size  = plt.rcParams.get("xtick.labelsize", 10)
-        for bar, alloc, real, r in zip(bars, allocated, realized, ror):
-            gl = f"{'+' if real >= 0 else '-'}${abs(real):,.0f}"
-            al = (f"${alloc/1000:.0f}k" if alloc >= 1000 else f"${alloc:.0f}") if alloc > 0 else "—"
-            label = f"{gl}\non {al}"
-            y = bar.get_height()
-            self._ax.annotate(
-                label, (bar.get_x() + bar.get_width() / 2, y),
+        for bar, alloc, r in zip(bars_r, allocated, ror):
+            if alloc <= 0:
+                continue
+            label = f"${alloc/1000:.0f}k" if alloc >= 1000 else f"${alloc:.0f}"
+            self._ax_r.annotate(
+                label, (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                 xytext=(0, 4 if r >= 0 else -4), textcoords="offset points",
                 ha="center", va="bottom" if r >= 0 else "top",
-                fontsize=lbl_size, color=lbl_color, linespacing=1.1)
+                fontsize=lbl_size, color=lbl_color)
 
         tot_real  = sum(realized)
         active    = [a for a in allocated if a > 0]
         avg_alloc = sum(active) / len(active) if active else 0.0
         avg_ror   = sum(r for r in ror if r) / len(active) if active else 0.0
-        self._ax.set_title(
-            f"Weekly RoR on Allocated Capital  —  {len(weeks)} week(s)", fontsize=11)
         self._summary.setText(
             f"Weekly RoR — {len(weeks)} weeks · ${tot_real:+,.0f} realized · "
             f"avg {avg_ror:+.2f}%/wk on ~${avg_alloc:,.0f} allocated")

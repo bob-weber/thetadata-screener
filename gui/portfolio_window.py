@@ -59,8 +59,10 @@ booked in full on the <b>day of sale</b> (not accrued).</li>
 <p><b>Allocated capital (denominator), per week:</b> the collateral of open
 <b>short puts</b> (strike × 100 × contracts) averaged over the days a position is
 open. Long stock positions and covered-call collateral are <i>not</i> counted.</p>
-<p><b>Weekly RoR</b> = weekly realized ÷ weekly allocated. Each bar is labelled
-with that week's realized gain/loss ($) over the capital allocated.</p>
+<p><b>Weekly RoR</b> = weekly realized ÷ weekly allocated. The tab shows two
+stacked charts sharing the week axis: the <b>top</b> plots realized gain/loss in
+dollars, the <b>bottom</b> plots RoR % on allocated capital (each RoR bar is
+labelled with that week's allocated capital).</p>
 <p><b>Bar colours:</b> past weeks are realized (green = gain, red = loss); the
 <span style="color:#f0ad4e"><b>current week</b></span> is amber (the boundary);
 weeks after it are <span style="color:#caa800"><b>projected</b></span> (yellow) —
