@@ -102,6 +102,14 @@ class OptionsScannerTab(QWidget):
         else:
             self._candidates_label.setText("Run the Stock Scanner first.")
 
+    def _cache_trade_date(self) -> str:
+        """EOD trading day the cached chains are from (falls back to run date)."""
+        try:
+            c = json.loads(OPTIONS_CACHE.read_text())
+            return c.get("trade_date") or c.get("date", "unknown")
+        except Exception:
+            return "unknown"
+
     def _load_cached_results(self):
         if not OPTIONS_CACHE.exists():
             return
@@ -112,9 +120,9 @@ class OptionsScannerTab(QWidget):
         results = cached.get("results", [])
         if not results:
             return
-        scan_date = cached.get("date", "unknown date")
+        trade_date = cached.get("trade_date") or cached.get("date", "unknown")
         self._populate_table(results)
-        self._results_box.setTitle(f"Results — {len(results)} contract(s) (from {scan_date})")
+        self._results_box.setTitle(f"Results — {len(results)} contract(s) (EOD {trade_date})")
 
     # ── positions file helpers ────────────────────────────────────────────────
 
@@ -376,7 +384,8 @@ class OptionsScannerTab(QWidget):
         self._opts_bar.setValue(100)
         self._log.append(f"Done — {len(results)} contract(s) found.")
         self._populate_table(results)
-        self._results_box.setTitle(f"Results — {len(results)} contract(s)")
+        self._results_box.setTitle(
+            f"Results — {len(results)} contract(s) (EOD {self._cache_trade_date()})")
         self.scan_finished.emit()
 
     def _on_error(self, msg: str):

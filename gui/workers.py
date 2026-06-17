@@ -111,9 +111,11 @@ class OptionsWorker(QThread):
         self._stop = True
 
     def _cache_key(self) -> dict:
+        from core.screener import _current_trade_date
         c = self._config
         key = {
             "date":            date.today().isoformat(),
+            "trade_date":      _current_trade_date().isoformat(),
             "expiration_date": c.get("expiration_date"),
             "right":           c.get("right", "P"),
             "side":            c.get("side", "sell"),

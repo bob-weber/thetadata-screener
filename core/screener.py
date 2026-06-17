@@ -650,7 +650,7 @@ def run_options_filter(
     price_col        = "bid" if side == "sell" else "ask"
 
     today       = date.today()
-    trade_date  = _prev_trading_day()
+    trade_date  = _current_trade_date()   # today's EOD once past 4pm ET, else prior day
 
     exp_date_str  = config.get("expiration_date")
     requested_exp = date.fromisoformat(exp_date_str) if exp_date_str else None
@@ -663,7 +663,8 @@ def run_options_filter(
 
     if on_log:
         label = f"{'Put' if right == 'P' else 'Call'} {'sells' if side == 'sell' else 'buys'}"
-        on_log(f"Scanning {label} chains for {total} candidates …")
+        on_log(f"Scanning {label} chains as of EOD {trade_date.isoformat()} "
+               f"for {total} candidates …")
 
     for i, row in enumerate(candidates):
         if stop_flag and stop_flag():
