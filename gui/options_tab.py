@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter, QDateEdit,
-    QRadioButton, QButtonGroup, QApplication,
+    QRadioButton, QButtonGroup, QApplication, QCheckBox,
 )
 
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal
@@ -247,6 +247,10 @@ class OptionsScannerTab(QWidget):
         self._exp_date.setDisplayFormat("yyyy-MM-dd")
         pf.addRow("Expiration date:", self._exp_date)
 
+        self._weeklies_only = QCheckBox("Only scan symbols with weekly options")
+        self._weeklies_only.setChecked(True)
+        pf.addRow("", self._weeklies_only)
+
         yield_row = QWidget()
         yh = QHBoxLayout(yield_row)
         yh.setContentsMargins(0, 0, 0, 0)
@@ -324,6 +328,7 @@ class OptionsScannerTab(QWidget):
             "yield_min":        float(self._yield_min.text()) / 100.0,
             "yield_max":        float(self._yield_max.text()) / 100.0,
             "options_throttle": float(self._opts_throttle.text()),
+            "weeklies_only":    self._weeklies_only.isChecked(),
         }
 
     def _run(self):

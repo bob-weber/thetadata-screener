@@ -267,6 +267,19 @@ def snap_expiration(requested: date, available: list[date]) -> date | None:
     return max(on_or_before) if on_or_before else None
 
 
+def _has_weeklies(expirations: list[date], ref: date, horizon_days: int = 70) -> bool:
+    """True if the symbol offers weekly options.
+
+    Monthly-only names list expirations roughly a month apart (3rd Fridays);
+    weeklies add an expiration nearly every Friday. We flag weeklies when two
+    listed expirations within the horizon fall 10 or fewer days apart.
+    """
+    near = sorted(e for e in expirations if ref <= e <= ref + timedelta(days=horizon_days))
+    if len(near) < 2:
+        return False
+    return any((b - a).days <= 10 for a, b in zip(near, near[1:]))
+
+
 def _get_company_symbols(client, on_log=None) -> list[str]:
     """Return NYSE/Nasdaq company tickers, excluding ETFs and funds."""
     sec_symbols: set[str] = set()
@@ -647,6 +660,7 @@ def run_options_filter(
     options_throttle = config.get("options_throttle", 0.5)
     right            = config.get("right",            "P")    # "P" or "C"
     side             = config.get("side",             "sell") # "sell" or "buy"
+    weeklies_only    = config.get("weeklies_only",    False)
     price_col        = "bid" if side == "sell" else "ask"
 
     today       = date.today()
@@ -676,8 +690,18 @@ def run_options_filter(
         stock_price = row["price"]
         sym_hits    = 0
 
+        if requested_exp is not None or weeklies_only:
+            listed = fetch_option_expirations(sym)
+            if weeklies_only and not _has_weeklies(listed, today):
+                if on_log:
+                    on_log(f"  {sym}: no weekly options — skipped")
+                if on_progress:
+                    on_progress(i + 1, total)
+                time.sleep(options_throttle)
+                continue
+
         if requested_exp is not None:
-            exp = snap_expiration(requested_exp, fetch_option_expirations(sym))
+            exp = snap_expiration(requested_exp, listed)
             if exp is None:
                 if on_log:
                     on_log(f"  {sym}: no listed expiration on or before {requested_exp}")
