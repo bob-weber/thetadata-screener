@@ -36,7 +36,7 @@ _OPT_COLUMNS = [
     ("weeks_held", "Weeks Held",        "calc"),
     ("fees",       "Fees",              "edit"),
     ("weekly_ror", "Avg Weekly RoR",    "calc"),
-    ("cost_basis", "Cost Basis / P&L",  "calc"),
+    ("cost_basis", "Cost Basis/Recovery/P&L",  "calc"),
 ]
 _OPT_FIELDS = [c[0] for c in _OPT_COLUMNS]
 _O_HDRS     = [c[1] for c in _OPT_COLUMNS]
