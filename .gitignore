@@ -1,5 +1,7 @@
 # Credentials — never commit
 creds.txt
+schwab_creds.txt
+schwab_token.json
 
 # ThetaData terminal binary and downloaded server jars
 ThetaTerminalv3.jar

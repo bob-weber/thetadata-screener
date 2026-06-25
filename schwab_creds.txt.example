@@ -1,0 +1,7 @@
+# Schwab Market Data API credentials (read-only).
+# Copy this file to `schwab_creds.txt` (gitignored) and fill in your values
+# from the app on developer.schwab.com. Do NOT commit the real file.
+
+app_key=YOUR_APP_KEY
+app_secret=YOUR_APP_SECRET
+callback_url=https://127.0.0.1
