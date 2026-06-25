@@ -15,10 +15,11 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
 )
 
-POSITIONS_FILE   = Path("my_option_positions.json")
-STOCKS_FILE      = Path("my_stock_positions.json")
-SUPERSEDED_FILE  = Path("my_option_superseded.json")   # legacy (pre-lifecycle), cleaned up
-EVENTS_FILE      = Path("my_option_events.json")        # accumulated cash events for wheel reconstruction
+from .account_store import DEFAULT_ACCT, events_path
+
+POSITIONS_FILE   = Path("my_option_positions.json")     # legacy cache, rebuilt from events
+STOCKS_FILE      = Path("my_stock_positions.json")       # legacy cache, rebuilt from events
+SUPERSEDED_FILE  = Path("my_option_superseded.json")     # legacy (pre-lifecycle), cleaned up
 
 # ── Options column layout ──────────────────────────────────────────────────────
 # (field, header, kind)   kind: "edit" = stored & editable, "calc" = computed,
@@ -69,38 +70,43 @@ class _StatusItem(QTableWidgetItem):
 
 
 class PortfolioTab(QWidget):
-    csv_imported    = pyqtSignal(str)   # file path after a successful import
-    account_changed = pyqtSignal(str)   # account label text
-    status_changed  = pyqtSignal(str)   # status bar text
+    csv_imported    = pyqtSignal(str, str)   # (file path, account) after a successful import
+    account_changed = pyqtSignal(str)        # account label text
+    status_changed  = pyqtSignal(str)        # status bar text
 
     def __init__(self):
         super().__init__()
-        self._events, self._outcomes, self._account = self._load_events()
+        self._events, self._outcomes, self._account = [], {}, ""
         self._range_sel  = None   # None → all time; int → days back; "custom"
         self._range_from = None   # ISO date string when custom
         self._range_to   = None
         self._setup_ui()
-        self._load_saved()
-        self._rebuild_options_table()
-        self.account_changed.emit(self._account)
 
-    def _load_events(self) -> tuple[list[dict], dict, str]:
-        if EVENTS_FILE.exists():
+    def _read_events(self, acct: str) -> tuple[list[dict], dict]:
+        """Load one account's stored events/outcomes (empty if it has none yet)."""
+        path = events_path(acct)
+        if path.exists():
             try:
-                data = json.loads(EVENTS_FILE.read_text())
-                events   = data.get("events", [])
+                data = json.loads(path.read_text())
                 outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
-                return events, outcomes, data.get("account", "")
+                return data.get("events", []), outcomes
             except Exception:
                 pass
-        return [], {}, ""
+        return [], {}
 
     def _save_events(self):
-        EVENTS_FILE.write_text(json.dumps({
+        events_path(self._account).write_text(json.dumps({
             "account":  self._account,
             "events":   self._events,
             "outcomes": {_outcome_key(k): v for k, v in self._outcomes.items()},
         }, indent=2))
+
+    def load_account(self, acct: str):
+        """Switch the active account: load its events and rebuild the table."""
+        self._account = acct
+        self._events, self._outcomes = self._read_events(acct) if acct else ([], {})
+        self._rebuild_options_table()
+        self.account_changed.emit(self._account)
 
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
         """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
@@ -190,9 +196,6 @@ class PortfolioTab(QWidget):
 
     # ── persistence ───────────────────────────────────────────────────────────
 
-    def _load_saved(self):
-        pass  # Option lifecycles are rebuilt from accumulated events in __init__.
-
     # ── CSV import ────────────────────────────────────────────────────────────
 
     def import_csv(self):
@@ -205,7 +208,7 @@ class PortfolioTab(QWidget):
 
         rows = list(csv.reader(io.StringIO(
             Path(path).read_text(encoding="utf-8-sig", errors="replace"))))
-        account      = _parse_account(rows)
+        account      = (_parse_account(rows) or "").strip()
         new_events   = _collect_cash_events(rows)
         new_outcomes = _build_rad_outcomes(rows)
         _, opt_warns, stks, stk_warns = _parse_tos_csv(Path(path))
@@ -218,12 +221,14 @@ class PortfolioTab(QWidget):
             QMessageBox.warning(self, "Import", msg)
             return
 
-        # A different account replaces the view — we track one account at a time.
-        switched = bool(account and self._account and account != self._account)
-        if switched:
-            self._reset_data()
-        if account:
-            self._account = account
+        # Route to the statement's own account bucket. Importing a different
+        # account's statement loads (or creates) that account and merges into it,
+        # never discarding the account we were previously viewing.
+        target = account or self._account or DEFAULT_ACCT
+        switched = bool(self._account and target != self._account)
+        if target != self._account:
+            self._account = target
+            self._events, self._outcomes = self._read_events(target)
 
         def _cell(table, row, col):
             it = table.item(row, col)
@@ -255,26 +260,28 @@ class PortfolioTab(QWidget):
         opt_rows = self._opt_table.rowCount()
         note = f"Imported {added_evs} new event(s) → {opt_rows} cycle(s)."
         if switched:
-            note = f"Switched to account {account}. " + note
+            note = f"Switched to account {self._account}. " + note
         self.status_changed.emit(note)
         self.account_changed.emit(self._account)
-        self.csv_imported.emit(path)
+        self.csv_imported.emit(path, self._account)
 
     def _reset_data(self):
-        """Wipe all in-memory and on-disk position data (no confirmation)."""
+        """Wipe the active account's stored events (no confirmation)."""
         self._opt_table.blockSignals(True)
         self._opt_table.setRowCount(0)
         self._opt_table.blockSignals(False)
+        if self._account:
+            events_path(self._account).unlink(missing_ok=True)
         POSITIONS_FILE.unlink(missing_ok=True)
         STOCKS_FILE.unlink(missing_ok=True)
         SUPERSEDED_FILE.unlink(missing_ok=True)
-        EVENTS_FILE.unlink(missing_ok=True)
-        self._events, self._outcomes, self._account = [], {}, ""
+        self._events, self._outcomes = [], {}
 
     def clear_all(self):
+        """Erase the active account's stored history."""
+        acct = self._account
         self._reset_data()
-        self.account_changed.emit("")
-        self.status_changed.emit("All positions cleared.")
+        self.status_changed.emit(f"Cleared account {acct}." if acct else "Cleared.")
 
 
 # ── TOS CSV parsing ───────────────────────────────────────────────────────────

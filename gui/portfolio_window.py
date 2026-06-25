@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDate
 
+from . import account_store
 from .positions_tab import PortfolioTab
 from .gains_tab     import GainsTab, WeeklyRorTab, _RANGE_OPTIONS
 
@@ -15,8 +16,16 @@ _HELP_HTML = """
 <p><b>Data source.</b> Everything is derived from imported <i>TOS Account
 Statement</i> CSVs (Import TOS CSV…). The parsed events — deposits/withdrawals,
 option legs, stock trades, and daily balances — are merged (de-duplicated) and
-saved to <code>gains_history.json</code>. Re-importing the same statement is
+saved per account to <code>my_option_events_&lt;acct&gt;.json</code> and
+<code>gains_history_&lt;acct&gt;.json</code>. Re-importing the same statement is
 safe; only new rows are added.</p>
+
+<p><b>Multiple accounts.</b> Each statement is routed to its own account's files
+by the account number in the statement header, so several accounts accumulate
+history side by side. Pick the account to view with the <b>Account</b> selector
+in the top bar; importing a statement switches to (or creates) that account.
+<b>Clear Account</b> erases only the selected account's history. History grows
+across years as you import — you don't need to keep the CSVs.</p>
 
 <h3>Global Range (top bar)</h3>
 <p>One control drives every tab: <b>1 Week, 3 Weeks, 3 Months, 1 Year, All Time,
@@ -89,15 +98,20 @@ class PortfolioWindow(QMainWindow):
         self.setWindowTitle("Portfolio Tracker")
         self.resize(1100, 780)
 
+        account_store.migrate_legacy()
+
         self._positions_tab = PortfolioTab()
         self._gains_tab     = GainsTab()
         self._weekly_tab    = WeeklyRorTab()
 
         # ── Shared top bar ────────────────────────────────────────────────────
         import_btn   = QPushButton("Import TOS CSV…")
-        clear_btn    = QPushButton("Clear All")
-        account_lbl  = QLabel("Account: —")
+        clear_btn    = QPushButton("Clear Account")
+        account_lbl  = QLabel("Account:")
         account_lbl.setStyleSheet("font-weight: bold;")
+        self._account_combo = QComboBox()
+        self._account_combo.setMinimumWidth(140)
+        self._account_combo.currentIndexChanged.connect(self._on_account_selected)
         status_lbl   = QLabel("")
 
         # Global time/range control — drives both the Positions table and chart.
@@ -126,14 +140,10 @@ class PortfolioWindow(QMainWindow):
         self._date_to.dateChanged.connect(self._emit_range)
 
         import_btn.clicked.connect(self._positions_tab.import_csv)
-        clear_btn.clicked.connect(self._clear_all)
+        clear_btn.clicked.connect(self._clear_account)
 
-        self._positions_tab.account_changed.connect(
-            lambda acct: account_lbl.setText(f"Account: {acct}" if acct else "Account: —"))
         self._positions_tab.status_changed.connect(status_lbl.setText)
-        self._positions_tab.csv_imported.connect(self._gains_tab.process_csv)
-        self._positions_tab.csv_imported.connect(self._weekly_tab.reload)
-        self._positions_tab.csv_imported.connect(lambda _p: self._on_data_changed())
+        self._positions_tab.csv_imported.connect(self._on_imported)
 
         bar = QHBoxLayout()
         bar.addWidget(import_btn)
@@ -144,6 +154,7 @@ class PortfolioWindow(QMainWindow):
         bar.addWidget(self._custom_box)
         bar.addSpacing(16)
         bar.addWidget(account_lbl)
+        bar.addWidget(self._account_combo)
         bar.addStretch()
         bar.addWidget(status_lbl)
 
@@ -167,7 +178,8 @@ class PortfolioWindow(QMainWindow):
         act = help_menu.addAction("Calculations && Methodology")
         act.triggered.connect(self._show_help)
 
-        self._emit_range()   # apply the default ("All Time") to both tabs
+        self._refresh_accounts()   # populate combo + load the initial account
+        self._emit_range()         # apply the default ("All Time") to every tab
 
     def _show_help(self):
         dlg = QDialog(self)
@@ -208,15 +220,60 @@ class PortfolioWindow(QMainWindow):
             self._init_custom_dates()
         self._emit_range()
 
-    def _clear_all(self):
+    # ── Account selection ─────────────────────────────────────────────────────
+    def _activate_account(self, acct: str):
+        """Point every tab at one account's stored history (empty string → none)."""
+        self._positions_tab.load_account(acct)
+        self._gains_tab.load_account(acct)
+        self._weekly_tab.load_account(acct)
+
+    def _refresh_accounts(self, active: str | None = None):
+        """Repopulate the account combo and activate ``active`` (auto-pick if gone).
+
+        active=None keeps the current selection; otherwise the named account is
+        selected, falling back to the first known account (or none)."""
+        accounts = account_store.list_accounts()
+        if active is None:
+            active = self._account_combo.currentData() or ""
+        if active not in accounts:
+            active = accounts[0] if accounts else ""
+
+        self._account_combo.blockSignals(True)
+        self._account_combo.clear()
+        for a in accounts:
+            self._account_combo.addItem(a, a)
+        idx = self._account_combo.findData(active)
+        if idx >= 0:
+            self._account_combo.setCurrentIndex(idx)
+        self._account_combo.blockSignals(False)
+        self._account_combo.setEnabled(bool(accounts))
+
+        self._activate_account(active)
+
+    def _on_account_selected(self):
+        self._activate_account(self._account_combo.currentData() or "")
+        self._on_data_changed()
+
+    def _on_imported(self, path: str, account: str):
+        """A statement was imported into ``account`` from the Positions tab."""
+        self._gains_tab.process_csv(path, account)
+        self._refresh_accounts(active=account)
+        self._on_data_changed()
+
+    def _clear_account(self):
+        acct = self._account_combo.currentData()
+        if not acct:
+            return
         reply = QMessageBox.question(
-            self, "Clear All",
-            "Clear all positions and P&L history?",
+            self, "Clear Account",
+            f"Erase all stored history for account {acct}?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        self._positions_tab.clear_all()
-        self._gains_tab.clear_history()
-        self._weekly_tab.reload()
+        self._activate_account(acct)        # ensure tabs point at this account
+        self._positions_tab.clear_all()     # delete its events file
+        self._gains_tab.clear_history()     # delete its gains file
+        self._refresh_accounts(active="")   # drop it, switch to a remaining account
+        self._on_data_changed()

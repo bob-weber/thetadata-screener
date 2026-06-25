@@ -27,7 +27,7 @@ _RANGE_OPTIONS = [
     ("Custom…",  "custom"),
 ]
 
-GAINS_FILE = Path("gains_history.json")
+from .account_store import gains_path
 
 _DEPOSIT_TYPES    = {"CRC"}
 _WITHDRAWAL_TYPES = {"CDB"}
@@ -143,20 +143,24 @@ def parse_statement(path: Path) -> dict:
             "opt_trades": opt_trades, "stk_trades": stk_trades}
 
 
-def _load_history() -> dict:
-    if GAINS_FILE.exists():
+def _blank_history() -> dict:
+    return {"deposits": [], "balances": [], "opt_trades": [], "stk_trades": []}
+
+
+def _load_history(path: Path) -> dict:
+    if path.exists():
         try:
-            data = json.loads(GAINS_FILE.read_text())
+            data = json.loads(path.read_text())
             for k in ("deposits", "balances", "opt_trades", "stk_trades"):
                 data.setdefault(k, [])
             return data
         except Exception:
             pass
-    return {"deposits": [], "balances": [], "opt_trades": [], "stk_trades": []}
+    return _blank_history()
 
 
-def _save_history(data: dict) -> None:
-    GAINS_FILE.write_text(json.dumps(data, indent=2))
+def _save_history(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2))
 
 
 def _merge(existing: list[dict], new: list[dict], key_fn) -> int:
@@ -460,7 +464,8 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
 class GainsTab(QWidget):
     def __init__(self):
         super().__init__()
-        self._data = _load_history()
+        self._account = ""
+        self._data = _blank_history()
         self._range_sel  = None   # None → all time; int → days back; "custom"
         self._range_from = None   # ISO date string when custom
         self._range_to   = None
@@ -495,20 +500,29 @@ class GainsTab(QWidget):
         self._canvas = FigureCanvasQTAgg(self._fig)
         root.addWidget(self._canvas, 1)
 
-    def process_csv(self, path: str):
-        """Called by PortfolioTab after a successful CSV import."""
+    def load_account(self, acct: str):
+        """Switch to an account's gains history and redraw."""
+        self._account = acct
+        self._data = _load_history(gains_path(acct)) if acct else _blank_history()
+        self._refresh_chart()
+
+    def process_csv(self, path: str, account: str):
+        """Merge an imported statement into the given account's gains history."""
         try:
             parsed = parse_statement(Path(path))
         except ValueError:
             return
+        self._account = account
+        self._data = _load_history(gains_path(account))
         merge_statement(self._data, parsed)
-        _save_history(self._data)
+        _save_history(gains_path(account), self._data)
         self._refresh_chart()
 
     def clear_history(self):
-        """Called by PortfolioWindow when the user clears all data."""
-        self._data = {"deposits": [], "balances": [], "opt_trades": [], "stk_trades": []}
-        _save_history(self._data)
+        """Erase the active account's gains history."""
+        if self._account:
+            gains_path(self._account).unlink(missing_ok=True)
+        self._data = _blank_history()
         self._refresh_chart()
 
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
@@ -655,7 +669,8 @@ class WeeklyRorTab(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._data = _load_history()
+        self._account = ""
+        self._data = _blank_history()
         self._range_sel  = None
         self._range_from = None
         self._range_to   = None
@@ -682,9 +697,15 @@ class WeeklyRorTab(QWidget):
         self._range_to   = date_to
         self._refresh()
 
+    def load_account(self, acct: str):
+        """Switch to an account's gains history and redraw."""
+        self._account = acct
+        self._data = _load_history(gains_path(acct)) if acct else _blank_history()
+        self._refresh()
+
     def reload(self, *_):
-        """Re-read saved history (after a CSV import or Clear All) and redraw."""
-        self._data = _load_history()
+        """Re-read the active account's history (after import or clear) and redraw."""
+        self._data = _load_history(gains_path(self._account)) if self._account else _blank_history()
         self._refresh()
 
     # ── drawing ─────────────────────────────────────────────────────────────
