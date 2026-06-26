@@ -2,13 +2,11 @@ import re
 import time
 import json
 import requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
-
-THETA_BASE = "http://127.0.0.1:25503"
 
 
 def _us_market_holidays(year: int) -> set[date]:
@@ -75,7 +73,6 @@ def _prev_trading_day() -> date:
 
 def _current_trade_date() -> date:
     """Return today if the market has closed (4:00 PM ET), otherwise the previous trading day."""
-    from datetime import datetime
     from zoneinfo import ZoneInfo
     ET    = ZoneInfo("America/New_York")
     today = date.today()
@@ -132,31 +129,6 @@ def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> f
     if (u - l) == 0:
         return 50.0
     return float((price - l) / (u - l) * 100)
-
-
-def find_close_col(df: pd.DataFrame) -> str | None:
-    for name in ("close", "CLOSE", "Close", "DataType.CLOSE"):
-        if name in df.columns:
-            return name
-    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
-    return numeric[-1] if numeric else None
-
-
-def _current_price(eod: pd.DataFrame) -> float | None:
-    """Return bid/ask midpoint when both are positive, otherwise the close price."""
-    try:
-        bid = float(eod["bid"].iloc[-1])
-        ask = float(eod["ask"].iloc[-1])
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2
-    except (KeyError, IndexError, ValueError):
-        pass
-    close_col = find_close_col(eod)
-    if close_col:
-        closes = eod[close_col].dropna().astype(float)
-        if not closes.empty:
-            return float(closes.iloc[-1])
-    return None
 
 
 def fetch_stock_prices(
@@ -291,25 +263,49 @@ def _fetch_edgar_symbols(on_log=None) -> list[str]:
     return symbols
 
 
-def _filter_priceable(client, symbols: list[str], on_log=None, on_progress=None,
-                      chunk: int = 250) -> list[str]:
-    """Keep only symbols Schwab recognizes, via batched quotes (a few calls)."""
+def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progress=None,
+                       chunk: int = 250) -> dict:
+    """Map each EDGAR ticker Schwab can price to its Schwab symbol.
+
+    Direct hits map to themselves. Dual-class names lost to the EDGAR '-'/'.'
+    vs Schwab '/' separator (BRK-B → BRK/B) are recovered with a normalized
+    retry, and stored under their Schwab form. Returns {edgar: schwab}.
+    """
     from core import schwab_client
-    good: list[str] = []
-    total = len(symbols)
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    total = len(edgar_symbols)
     for i in range(0, total, chunk):
-        batch = symbols[i:i + chunk]
+        batch = edgar_symbols[i:i + chunk]
         try:
             data = schwab_client.quotes(client, batch)
-            # Recognized symbols are top-level keys; unknowns land in errors.invalidSymbols.
-            good.extend(s for s in batch if s in data)
+            # Recognized symbols are top-level keys; unknowns are in errors.invalidSymbols.
+            for s in batch:
+                (resolved.__setitem__(s, s) if s in data else missing.append(s))
         except Exception:
-            good.extend(batch)   # on a request error, keep the batch rather than drop it
+            for s in batch:      # on a request error, keep the batch rather than drop it
+                resolved[s] = s
         if on_progress:
             on_progress(min(i + chunk, total), total)
+
+    # Recover dual-class commons via separator normalization (BRK-B → BRK/B).
+    candidates = [s for s in missing if _classify_dropped(s) == "class_share"]
+    for i in range(0, len(candidates), chunk):
+        batch = candidates[i:i + chunk]
+        alt = {s: re.sub(r"[-.]", "/", s) for s in batch}
+        try:
+            data = schwab_client.quotes(client, list(alt.values()))
+        except Exception:
+            continue
+        for edgar_sym, schwab_sym in alt.items():
+            if schwab_sym in data:
+                resolved[edgar_sym] = schwab_sym
+
     if on_log:
-        on_log(f"Priceable in Schwab: {len(good)}/{total}")
-    return good
+        recovered = sum(1 for e, s in resolved.items() if e != s)
+        extra = f" ({recovered} dual-class recovered)" if recovered else ""
+        on_log(f"Priceable in Schwab: {len(resolved)}/{total}{extra}")
+    return resolved
 
 
 def _classify_dropped(sym: str) -> str:
@@ -381,9 +377,10 @@ def build_universe(on_log=None, on_progress=None,
             if on_log:
                 on_log(f"Schwab unavailable ({e}) — saving unvalidated EDGAR list")
         if client is not None:
-            symbols = _filter_priceable(client, edgar, on_log, on_progress)
-            source  = "SEC EDGAR + Schwab priceable"
-            _record_dropped(sorted(set(edgar) - set(symbols)), on_log)
+            resolved = _resolve_priceable(client, edgar, on_log, on_progress)
+            symbols  = sorted(resolved.values())   # Schwab symbols (recovered forms included)
+            source   = "SEC EDGAR + Schwab priceable"
+            _record_dropped(sorted(set(edgar) - set(resolved)), on_log)
 
     data = {
         "updated": date.today().isoformat(),
@@ -407,18 +404,6 @@ def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None
         return symbols or None
     except Exception:
         return None
-
-
-def _connect_client(on_log=None):
-    from thetadata import ThetaClient
-    from thetadata.errors import AuthenticationError
-
-    if on_log:
-        on_log("Connecting to ThetaData terminal …")
-    try:
-        return ThetaClient(dataframe_type="pandas")
-    except AuthenticationError:
-        raise ScreenerError("Authentication failed — check your ThetaData credentials.")
 
 
 def _price_key(config: dict) -> dict:
@@ -457,7 +442,6 @@ def run_price_screen(
     price_max      = config.get("price_max",     500.0)
     stock_throttle = config.get("stock_throttle",  0.1)
 
-    trade_date = _current_trade_date()
     price_key  = _price_key(config)
     price_path = Path(price_cache_file)
 
@@ -472,7 +456,14 @@ def run_price_screen(
         except Exception:
             pass
 
-    client = _connect_client(on_log)
+    from core import schwab_client
+    try:
+        client = schwab_client.get_client(interactive=False)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise ScreenerError(
+            "Schwab authentication required for the price screen. Run "
+            "'gui-env/bin/python -m core.schwab_client login' once, then retry."
+        ) from e
 
     # ── Symbol universe ───────────────────────────────────────────────────────
     # Precedence: manual watchlist → saved universe.json → bootstrap from EDGAR.
@@ -490,52 +481,38 @@ def run_price_screen(
             on_log(f"Using saved universe: {len(all_symbols)} tickers")
 
     if on_log:
-        on_log(f"Pass 1: price screen — {len(all_symbols)} symbols …")
+        on_log(f"Pass 1: price screen — {len(all_symbols)} symbols (batched quotes) …")
     price_qualified: list[dict] = []
     total   = len(all_symbols)
     skipped = 0
+    chunk   = 250
 
-    for i, sym in enumerate(all_symbols):
+    for i in range(0, total, chunk):
         if stop_flag and stop_flag():
             if on_log:
                 on_log("Stopped by user.")
             return []
 
+        batch = all_symbols[i:i + chunk]
         try:
-            eod = client.stock_history_eod(
-                symbol=sym, start_date=trade_date, end_date=trade_date
-            )
+            data = schwab_client.quotes(client, batch)
         except Exception:
-            skipped += 1
-            if on_progress:
-                on_progress(i + 1, total)
-            continue
+            data = {}
 
-        if eod is None or eod.empty:
-            skipped += 1
-            if on_progress:
-                on_progress(i + 1, total)
-            continue
-
-        last_price = _current_price(eod)
-        if last_price is None:
-            skipped += 1
-            if on_progress:
-                on_progress(i + 1, total)
-            continue
-
-        if price_min <= last_price <= price_max:
-            price_qualified.append({"symbol": sym, "price": round(last_price, 2)})
+        for sym in batch:
+            price = data.get(sym, {}).get("quote", {}).get("lastPrice")
+            if price is None:
+                skipped += 1
+            elif price_min <= price <= price_max:
+                price_qualified.append({"symbol": sym, "price": round(float(price), 2)})
 
         if on_progress:
-            on_progress(i + 1, total)
-
+            on_progress(min(i + chunk, total), total)
         time.sleep(stock_throttle)
 
     if on_log:
         on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
 
-    from datetime import datetime
     price_path.write_text(json.dumps({
         **price_key,
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -568,7 +545,6 @@ def run_technical_filter(
     stock_throttle   = config.get("stock_throttle",    0.1)
 
     today      = date.today()
-    trade_date = _current_trade_date()
     hist_start = today - timedelta(days=45)
 
     price_key = _price_key(config)
@@ -593,12 +569,21 @@ def run_technical_filter(
             pass
 
     if histories is None:
-        client = _connect_client(on_log)
+        from core import schwab_client
+        try:
+            client = schwab_client.get_client(interactive=False)
+        except (FileNotFoundError, RuntimeError) as e:
+            raise ScreenerError(
+                "Schwab authentication required for technical history. Run "
+                "'gui-env/bin/python -m core.schwab_client login' once, then retry."
+            ) from e
         if on_log:
             on_log(f"Pass 2: fetching 45-day history for {len(price_qualified)} symbols …")
         histories = {}
         total   = len(price_qualified)
         skipped = 0
+        hist_start_dt = datetime.combine(hist_start, datetime.min.time())
+        end_dt        = datetime.combine(today, datetime.min.time())
 
         for i, item in enumerate(price_qualified):
             sym = item["symbol"]
@@ -608,36 +593,20 @@ def run_technical_filter(
                 return []
 
             try:
-                eod = client.stock_history_eod(
-                    symbol=sym, start_date=hist_start, end_date=trade_date
-                )
+                data = schwab_client.price_history_daily(
+                    client, sym, start=hist_start_dt, end=end_dt)
+                closes = [c["close"] for c in data.get("candles", [])
+                          if c.get("close") is not None]
             except Exception:
-                skipped += 1
-                if on_progress:
-                    on_progress(i + 1, total)
-                continue
+                closes = []
 
-            if eod is None or len(eod) < bb_period + 2:
-                skipped += 1
-                if on_progress:
-                    on_progress(i + 1, total)
-                continue
-
-            close_col = find_close_col(eod)
-            if close_col is None:
-                skipped += 1
-                if on_progress:
-                    on_progress(i + 1, total)
-                continue
-
-            closes = eod[close_col].dropna().astype(float)
             if len(closes) < bb_period + 2:
                 skipped += 1
                 if on_progress:
                     on_progress(i + 1, total)
                 continue
 
-            histories[sym] = closes.tolist()
+            histories[sym] = closes
 
             if on_progress:
                 on_progress(i + 1, total)
@@ -672,7 +641,6 @@ def run_technical_filter(
     if on_log:
         on_log(f"Technical filter done — {len(tech_candidates)} candidates.")
 
-    from datetime import datetime
     Path(candidates_cache_file).write_text(json.dumps({
         **full_key,
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
