@@ -537,6 +537,7 @@ def run_price_screen(
     config: dict,
     on_log=None,
     on_progress=None,
+    on_found=None,
     stop_flag=None,
     watchlist_file: str | Path | None = None,
     price_cache_file: str | Path = "price_screen_cache.json",
@@ -546,6 +547,8 @@ def run_price_screen(
 
     Writes ``price_screen_cache.json`` and returns ``[{"symbol", "price"}, …]``.
     This is the slow, rarely-changing pass; the GUI drives it from its own button.
+    ``on_found(rows)`` is called with each batch's newly qualified rows so the GUI
+    can populate the list as the scan runs.
     """
     price_min      = config.get("price_min",      10.0)
     price_max      = config.get("price_max",     500.0)
@@ -607,13 +610,17 @@ def run_price_screen(
         except Exception:
             data = {}
 
+        batch_qualified: list[dict] = []
         for sym in batch:
             price = data.get(sym, {}).get("quote", {}).get("lastPrice")
             if price is None:
                 skipped += 1
             elif price_min <= price <= price_max:
-                price_qualified.append({"symbol": sym, "price": round(float(price), 2)})
+                batch_qualified.append({"symbol": sym, "price": round(float(price), 2)})
 
+        price_qualified.extend(batch_qualified)
+        if on_found and batch_qualified:
+            on_found(batch_qualified)
         if on_progress:
             on_progress(min(i + chunk, total), total)
         time.sleep(0.1)   # gentle pace between the ~20 batched quote calls
@@ -629,11 +636,32 @@ def run_price_screen(
     return price_qualified
 
 
+def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period,
+                        bb_std_mult, rsi_threshold, bb_pct_threshold) -> dict | None:
+    """Apply the RSI/BB% filter to one close series; return a candidate row or None."""
+    closes = pd.Series(closes_list, dtype=float)
+    if len(closes) < bb_period + 2:
+        return None
+    rsi = calc_rsi(closes, rsi_period)
+    if rsi >= rsi_threshold:
+        return None
+    bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
+    if bb_pct >= bb_pct_threshold:
+        return None
+    return {
+        "symbol": sym,
+        "price":  round(price_lookup.get(sym, float(closes.iloc[-1])), 2),
+        "rsi":    round(rsi, 1),
+        "bb_pct": round(bb_pct, 1),
+    }
+
+
 def run_technical_filter(
     config: dict,
     price_qualified: list[dict],
     on_log=None,
     on_progress=None,
+    on_found=None,
     stop_flag=None,
     history_cache_file: str | Path = "tech_history_cache.json",
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
@@ -644,6 +672,8 @@ def run_technical_filter(
     Writes ``tech_candidates_cache.json`` and returns
     ``[{"symbol", "price", "rsi", "bb_pct"}, …]``. Takes the price-screened list
     (from :func:`run_price_screen`) as input so it can be re-run on its own.
+    ``on_found(rows)`` is called with each candidate as its history arrives so the
+    GUI can populate the list as the fetch runs.
     """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
@@ -661,6 +691,12 @@ def run_technical_filter(
         if on_log:
             on_log("No price-screened symbols — run the Price Scan first.")
         return []
+
+    price_lookup = {item["symbol"]: item["price"] for item in price_qualified}
+    filter_kw = dict(
+        rsi_period=rsi_period, bb_period=bb_period, bb_std_mult=bb_std_mult,
+        rsi_threshold=rsi_threshold, bb_pct_threshold=bb_pct_threshold,
+    )
 
     # ── Pass 2: fetch 45-day history (cache keyed on price params only) ────────
     hist_path = Path(history_cache_file)
@@ -695,7 +731,14 @@ def run_technical_filter(
         def _fetch_history(sym):
             data = schwab_client.price_history_daily(
                 client, sym, start=hist_start_dt, end=end_dt)
-            return [c["close"] for c in data.get("candles", []) if c.get("close") is not None]
+            closes = [c["close"] for c in data.get("candles", []) if c.get("close") is not None]
+            # Evaluate the indicator as the history arrives so qualifying symbols
+            # can stream into the GUI list instead of waiting for every fetch.
+            if on_found:
+                cand = _evaluate_candidate(sym, closes, price_lookup, **filter_kw)
+                if cand:
+                    on_found([cand])
+            return closes
 
         fetched, limiter = _concurrent_fetch(
             [item["symbol"] for item in price_qualified], _fetch_history,
@@ -716,25 +759,12 @@ def run_technical_filter(
         hist_path.write_text(json.dumps({**price_key, "histories": histories}))
 
     # ── Apply RSI / BB% filter in memory (instant from cache) ─────────────────
-    price_lookup = {item["symbol"]: item["price"] for item in price_qualified}
     tech_candidates: list[dict] = []
 
     for sym, closes_list in histories.items():
-        closes = pd.Series(closes_list, dtype=float)
-        if len(closes) < bb_period + 2:
-            continue
-        rsi = calc_rsi(closes, rsi_period)
-        if rsi >= rsi_threshold:
-            continue
-        bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
-        if bb_pct >= bb_pct_threshold:
-            continue
-        tech_candidates.append({
-            "symbol": sym,
-            "price":  round(price_lookup.get(sym, float(closes.iloc[-1])), 2),
-            "rsi":    round(rsi, 1),
-            "bb_pct": round(bb_pct, 1),
-        })
+        cand = _evaluate_candidate(sym, closes_list, price_lookup, **filter_kw)
+        if cand is not None:
+            tech_candidates.append(cand)
 
     if on_log:
         on_log(f"Technical filter done — {len(tech_candidates)} candidates.")

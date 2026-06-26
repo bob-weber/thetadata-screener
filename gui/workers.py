@@ -8,9 +8,6 @@ OPTIONS_RESULTS_CACHE = "options_results_cache.json"
 _OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side", "yield_min", "yield_max"]
 
 
-PRICE_SCREEN_CACHE = "price_screen_cache.json"
-
-
 class UniverseWorker(QThread):
     """Refresh the scan universe — SEC EDGAR list validated against Schwab pricing."""
     log_msg  = pyqtSignal(str)
@@ -32,12 +29,22 @@ class UniverseWorker(QThread):
             self.error.emit(f"Unexpected error: {e}")
 
 
-class PriceScreenWorker(QThread):
-    """Pass 1 — price screen. Driven by the Stock Scanner's 'Run Price Scan' button."""
-    log_msg  = pyqtSignal(str)
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
+class StockScanWorker(QThread):
+    """Combined stock scan — Pass 1 (price screen) then Pass 2 (technical filter).
+
+    Driven by the Stock Scanner's single 'Run Scan' button. Pass 2 only ever sees
+    the price-qualified symbols, so out-of-range stocks are never fetched. The
+    price-qualified list is handed straight to Pass 2 (no cache round-trip).
+    Separate progress/found signals let each table fill during its own pass.
+    """
+    log_msg        = pyqtSignal(str)
+    price_progress = pyqtSignal(int, int)
+    tech_progress  = pyqtSignal(int, int)
+    price_found    = pyqtSignal(list)
+    tech_found     = pyqtSignal(list)
+    price_done     = pyqtSignal(list)   # price-qualified rows, when Pass 1 finishes
+    finished       = pyqtSignal(list)   # final technical candidates
+    error          = pyqtSignal(str)
 
     def __init__(self, config: dict, watchlist_file: str | None = None):
         super().__init__()
@@ -49,60 +56,31 @@ class PriceScreenWorker(QThread):
         self._stop = True
 
     def run(self):
-        from core.screener import run_price_screen, ScreenerError
+        from core.screener import run_price_screen, run_technical_filter, ScreenerError
         try:
-            results = run_price_screen(
+            price_qualified = run_price_screen(
                 self._config,
                 on_log=self.log_msg.emit,
-                on_progress=lambda c, t: self.progress.emit(c, t),
+                on_progress=lambda c, t: self.price_progress.emit(c, t),
+                on_found=lambda rows: self.price_found.emit(rows),
                 stop_flag=lambda: self._stop,
                 watchlist_file=self._watchlist,
                 use_cache=False,
             )
-            self.finished.emit(results)
-        except ScreenerError as e:
-            self.error.emit(str(e))
-        except Exception as e:
-            self.error.emit(f"Unexpected error: {e}")
+            self.price_done.emit(price_qualified)
+            if self._stop:
+                return
+            if not price_qualified:
+                self.log_msg.emit("No symbols in price range — skipping technical scan.")
+                self.finished.emit([])
+                return
 
-
-class TechnicalWorker(QThread):
-    """Pass 2 — RSI/BB% filter over the saved price-screen list."""
-    log_msg  = pyqtSignal(str)
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-
-    def __init__(self, config: dict):
-        super().__init__()
-        self._config = config
-        self._stop   = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        from core.screener import run_technical_filter, ScreenerError
-
-        price_path = Path(PRICE_SCREEN_CACHE)
-        if not price_path.exists():
-            self.error.emit("No price-screen results — run the Price Scan first.")
-            return
-        try:
-            price_qualified = json.loads(price_path.read_text()).get("qualified", [])
-        except Exception as e:
-            self.error.emit(f"Could not read price-screen cache: {e}")
-            return
-        if not price_qualified:
-            self.error.emit("Price screen returned no symbols — run the Price Scan first.")
-            return
-
-        try:
             results = run_technical_filter(
                 self._config,
                 price_qualified,
                 on_log=self.log_msg.emit,
-                on_progress=lambda c, t: self.progress.emit(c, t),
+                on_progress=lambda c, t: self.tech_progress.emit(c, t),
+                on_found=lambda rows: self.tech_found.emit(rows),
                 stop_flag=lambda: self._stop,
                 use_cache=False,
             )

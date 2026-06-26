@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from .workers import PriceScreenWorker, TechnicalWorker, UniverseWorker
+from .workers import StockScanWorker, UniverseWorker
 
 PRICE_CACHE      = "price_screen_cache.json"
 CANDIDATES_CACHE = "tech_candidates_cache.json"
@@ -55,6 +55,18 @@ def _fill_table(table: QTableWidget, rows: list[dict], cols: list[str]):
     table.setSortingEnabled(False)
     table.setRowCount(len(rows))
     for r, row in enumerate(rows):
+        for c, key in enumerate(cols):
+            table.setItem(r, c, _make_item(row.get(key, "")))
+    table.setSortingEnabled(True)
+    table.resizeColumnsToContents()
+
+
+def _append_rows(table: QTableWidget, rows: list[dict], cols: list[str]):
+    """Append rows to a table without disturbing those already shown."""
+    table.setSortingEnabled(False)
+    for row in rows:
+        r = table.rowCount()
+        table.insertRow(r)
         for c, key in enumerate(cols):
             table.setItem(r, c, _make_item(row.get(key, "")))
     table.setSortingEnabled(True)
@@ -152,18 +164,18 @@ class StockScannerTab(QWidget):
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._price_btn = QPushButton("Run Price Scan")
-        self._tech_btn  = QPushButton("Run Technical Scan")
+        self._scan_btn = QPushButton("Run Scan")
+        self._scan_btn.setToolTip(
+            "Price screen (Pass 1) then RSI/BB% technical filter (Pass 2) on the "
+            "in-range symbols only.")
         self._stop_btn  = QPushButton("Stop")
-        for b in (self._price_btn, self._tech_btn, self._stop_btn):
+        for b in (self._scan_btn, self._stop_btn):
             b.setFixedHeight(32)
         self._stop_btn.setEnabled(False)
-        self._price_btn.clicked.connect(self._run_price)
-        self._tech_btn.clicked.connect(self._run_technical)
+        self._scan_btn.clicked.connect(self._run_scan)
         self._stop_btn.clicked.connect(self._stop)
         btn_row.addStretch()
-        btn_row.addWidget(self._price_btn)
-        btn_row.addWidget(self._tech_btn)
+        btn_row.addWidget(self._scan_btn)
         btn_row.addWidget(self._stop_btn)
         root.addLayout(btn_row)
 
@@ -241,14 +253,13 @@ class StockScannerTab(QWidget):
         except ValueError as e:
             self._log.append(f"Invalid parameter: {e}")
             return None
-        self._price_btn.setEnabled(False)
-        self._tech_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._universe_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._log.clear()
         return config
 
-    def _run_price(self):
+    def _run_scan(self):
         config = self._begin_scan()
         if config is None:
             return
@@ -256,27 +267,19 @@ class StockScannerTab(QWidget):
         self._price_box.setTitle("Price-Screened — 0 symbols")
         self._price_bar.setValue(0)
         self._price_plabel.setText("—")
-
-        watchlist = self._watchlist_edit.text().strip() or None
-        self._worker = PriceScreenWorker(config, watchlist)
-        self._worker.log_msg.connect(self._log.append)
-        self._worker.progress.connect(self._on_price_progress)
-        self._worker.finished.connect(self._on_price_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
-
-    def _run_technical(self):
-        config = self._begin_scan()
-        if config is None:
-            return
         self._cand_table.setRowCount(0)
         self._cand_box.setTitle("Technical Candidates — 0 candidates")
         self._tech_bar.setValue(0)
         self._tech_plabel.setText("—")
 
-        self._worker = TechnicalWorker(config)
+        watchlist = self._watchlist_edit.text().strip() or None
+        self._worker = StockScanWorker(config, watchlist)
         self._worker.log_msg.connect(self._log.append)
-        self._worker.progress.connect(self._on_tech_progress)
+        self._worker.price_progress.connect(self._on_price_progress)
+        self._worker.tech_progress.connect(self._on_tech_progress)
+        self._worker.price_found.connect(self._on_price_found)
+        self._worker.tech_found.connect(self._on_tech_found)
+        self._worker.price_done.connect(self._on_price_finished)
         self._worker.finished.connect(self._on_tech_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -287,8 +290,7 @@ class StockScannerTab(QWidget):
         self._stop_btn.setEnabled(False)
 
     def _idle(self):
-        self._price_btn.setEnabled(True)
-        self._tech_btn.setEnabled(True)
+        self._scan_btn.setEnabled(True)
         self._universe_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
 
@@ -308,8 +310,7 @@ class StockScannerTab(QWidget):
             f"Universe: {len(symbols):,} tickers · updated {updated}")
 
     def _update_universe(self):
-        self._price_btn.setEnabled(False)
-        self._tech_btn.setEnabled(False)
+        self._scan_btn.setEnabled(False)
         self._universe_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
         self._log.clear()
@@ -340,10 +341,19 @@ class StockScannerTab(QWidget):
         if total > 0:
             self._tech_bar.setValue(int(current * 100 / total))
 
+    def _on_price_found(self, rows: list):
+        _append_rows(self._price_table, rows, _PRICE_COLS)
+        self._price_box.setTitle(
+            f"Price-Screened — {self._price_table.rowCount()} symbols  |  scanning…")
+
+    def _on_tech_found(self, rows: list):
+        _append_rows(self._cand_table, rows, _COLS)
+        self._cand_box.setTitle(
+            f"Technical Candidates — {self._cand_table.rowCount()} candidates  |  scanning…")
+
     def _on_price_finished(self, results: list):
-        self._idle()
+        # Pass 1 done; the technical pass continues, so don't go idle here.
         self._price_bar.setValue(100)
-        self._log.append(f"Price scan done — {len(results)} symbol(s) in range.")
         ts = self._read_scan_timestamp(PRICE_CACHE)
         _fill_table(self._price_table, results, _PRICE_COLS)
         self._price_box.setTitle(f"Price-Screened — {len(results)} symbols  |  last scan: {ts}")
