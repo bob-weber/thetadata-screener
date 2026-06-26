@@ -1,4 +1,3 @@
-import io
 import re
 import time
 import json
@@ -194,66 +193,41 @@ def fetch_stock_prices(
     return results
 
 
-def fetch_option_eod_chain(symbol: str, exp: date, trade_date: date, right: str = "P") -> pd.DataFrame | None:
-    exp_str        = exp.strftime("%Y%m%d")
-    trade_date_str = trade_date.strftime("%Y%m%d")
-    right_str      = "put" if right == "P" else "call"
+def _fetch_schwab_chain(client, symbol: str, right: str, to_date: date) -> dict:
+    """Real-time option chain from Schwab as {expiration_date: DataFrame}.
 
+    A single API call per symbol covers every expiration through ``to_date``.
+    Each frame carries strike/bid/ask/delta columns. Returns {} on any error or
+    empty chain so the caller can simply skip the symbol. (We never pass
+    from_date — Schwab 400s when it equals today; the near end is filtered by
+    the caller from the returned expirations.)
+    """
+    from core import schwab_client
+    ct = (client.Options.ContractType.PUT if right == "P"
+          else client.Options.ContractType.CALL)
     try:
-        r = requests.get(
-            f"{THETA_BASE}/v3/option/history/eod",
-            params={
-                "symbol":     symbol,
-                "expiration": exp_str,
-                "strike":     "*",
-                "right":      right_str,
-                "start_date": trade_date_str,
-                "end_date":   trade_date_str,
-            },
-            timeout=15,
-        )
-        if r.status_code != 200 or not r.text.strip():
-            return None
-        text = r.text.strip()
-        if text.startswith("No data"):
-            return None
-        # Plain-text response (no commas) = terminal error message, not CSV data.
-        if "," not in text.split("\n")[0]:
-            raise ScreenerError(f"ThetaData terminal error: {text[:300]}")
-        df = pd.read_csv(io.StringIO(text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        return df if not df.empty else None
-    except ScreenerError:
-        raise
+        data = schwab_client.option_chain(client, symbol, contract_type=ct, to_date=to_date)
     except Exception:
-        return None
+        return {}
+    if data.get("status") != "SUCCESS":
+        return {}
 
-
-def fetch_option_expirations(symbol: str) -> list[date]:
-    """Return the option expirations ThetaData actually lists for a symbol."""
-    try:
-        r = requests.get(
-            f"{THETA_BASE}/v3/option/list/expirations",
-            params={"symbol": symbol},
-            timeout=15,
-        )
-        if r.status_code != 200 or not r.text.strip():
-            return []
-        text = r.text.strip()
-        if text.startswith("No data") or "," not in text.split("\n")[0]:
-            return []
-        df = pd.read_csv(io.StringIO(text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        col = "expiration" if "expiration" in df.columns else df.columns[-1]
-        out = []
-        for v in df[col].tolist():
-            try:
-                out.append(date.fromisoformat(str(v).strip()))
-            except ValueError:
-                continue
-        return out
-    except Exception:
-        return []
+    exp_map = data.get("putExpDateMap" if right == "P" else "callExpDateMap", {})
+    chains: dict[date, pd.DataFrame] = {}
+    for exp_key, strikes in exp_map.items():
+        # keys look like "2026-06-26:1" (date:days-to-expiration)
+        try:
+            exp_d = date.fromisoformat(exp_key.split(":")[0])
+        except ValueError:
+            continue
+        rows = [
+            {"strike": c.get("strikePrice"), "bid": c.get("bid"),
+             "ask": c.get("ask"), "delta": c.get("delta")}
+            for contracts in strikes.values() for c in contracts
+        ]
+        if rows:
+            chains[exp_d] = pd.DataFrame(rows)
+    return chains
 
 
 def snap_expiration(requested: date, available: list[date]) -> date | None:
@@ -663,22 +637,29 @@ def run_options_filter(
     weeklies_only    = config.get("weeklies_only",    False)
     price_col        = "bid" if side == "sell" else "ask"
 
-    today       = date.today()
-    trade_date  = _current_trade_date()   # today's EOD once past 4pm ET, else prior day
+    today = date.today()
 
     exp_date_str  = config.get("expiration_date")
     requested_exp = date.fromisoformat(exp_date_str) if exp_date_str else None
-    if requested_exp is None:
-        dte_min         = config.get("dte_min",  4)
-        dte_max         = config.get("dte_max", 21)
-        dte_expirations = [today + timedelta(days=d) for d in range(dte_min, dte_max + 1)]
+    dte_min = config.get("dte_min",  4)
+    dte_max = config.get("dte_max", 21)
     results = []
     total   = len(candidates)
 
+    # Option chains come from Schwab (real-time); authenticate once. The scanner
+    # runs off the main thread, so never block on stdin — require a cached token.
+    from core import schwab_client
+    try:
+        client = schwab_client.get_client(interactive=False)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise ScreenerError(
+            "Schwab authentication required for option chains. Run "
+            "'gui-env/bin/python -m core.schwab_client login' once, then retry."
+        ) from e
+
     if on_log:
         label = f"{'Put' if right == 'P' else 'Call'} {'sells' if side == 'sell' else 'buys'}"
-        on_log(f"Scanning {label} chains as of EOD {trade_date.isoformat()} "
-               f"for {total} candidates …")
+        on_log(f"Scanning {label} chains (Schwab real-time) for {total} candidates …")
 
     for i, row in enumerate(candidates):
         if stop_flag and stop_flag():
@@ -690,18 +671,29 @@ def run_options_filter(
         stock_price = row["price"]
         sym_hits    = 0
 
-        if requested_exp is not None or weeklies_only:
-            listed = fetch_option_expirations(sym)
-            if weeklies_only and not _has_weeklies(listed, today):
-                if on_log:
-                    on_log(f"  {sym}: no weekly options — skipped")
-                if on_progress:
-                    on_progress(i + 1, total)
-                time.sleep(options_throttle)
-                continue
+        # One Schwab call per symbol returns every expiration through the horizon.
+        horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
+        chains  = _fetch_schwab_chain(client, sym, right, horizon)
+        if not chains:
+            if on_log:
+                on_log(f"  {sym}: no chain data")
+            if on_progress:
+                on_progress(i + 1, total)
+            time.sleep(options_throttle)
+            continue
+
+        available = sorted(chains)
+
+        if weeklies_only and not _has_weeklies(available, today):
+            if on_log:
+                on_log(f"  {sym}: no weekly options — skipped")
+            if on_progress:
+                on_progress(i + 1, total)
+            time.sleep(options_throttle)
+            continue
 
         if requested_exp is not None:
-            exp = snap_expiration(requested_exp, listed)
+            exp = snap_expiration(requested_exp, available)
             if exp is None:
                 if on_log:
                     on_log(f"  {sym}: no listed expiration on or before {requested_exp}")
@@ -713,15 +705,13 @@ def run_options_filter(
                 on_log(f"  {sym}: {requested_exp} not listed — using {exp}")
             expirations = [exp]
         else:
-            expirations = dte_expirations
+            expirations = [e for e in available if dte_min <= (e - today).days <= dte_max]
 
         for exp in expirations:
-            chain = fetch_option_eod_chain(sym, exp, trade_date, right=right)
-            if chain is None or chain.empty or price_col not in chain.columns:
-                if on_log:
-                    on_log(f"  {sym}: no chain data for {exp}")
+            chain = chains[exp]
+            if price_col not in chain.columns:
                 continue
-
+            chain = chain.copy()
             chain[price_col] = pd.to_numeric(chain[price_col], errors="coerce")
             chain = chain[chain[price_col] > 0].dropna(subset=[price_col]).copy()
             if chain.empty:
