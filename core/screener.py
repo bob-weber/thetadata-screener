@@ -90,10 +90,12 @@ UNIVERSE_FILE    = "universe.json"           # persisted scan universe; refreshe
 DROPPED_FILE     = "universe_dropped.json"   # diagnostic: EDGAR names Schwab didn't price
 
 # Per-symbol Schwab fetches (Pass 2 history, option chains) run concurrently
-# behind a self-tuning rate limiter (no GUI knob). Start near Schwab's sustainable
-# account-wide ceiling (~10 req/s); back off on 429/403 and recover automatically.
+# behind a self-tuning rate limiter (no GUI knob). Start conservatively below
+# Schwab's account-wide ceiling: starting at the ceiling provokes 429/403s, and
+# each hit triggers a multi-second cool-off, so a gentler start avoids the long
+# stalls. Back off further on 429/403 and recover automatically.
 _FETCH_WORKERS    = 8
-_FETCH_START_RATE = 10   # requests/sec
+_FETCH_START_RATE = 7    # requests/sec
 
 _FUND_RE = re.compile(
     r"\betf\b"
@@ -114,6 +116,14 @@ def _is_fund(name: str) -> bool:
 
 class ScreenerError(Exception):
     pass
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Human-readable elapsed time, e.g. '45.2s' or '1m 23s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m}m {s:02d}s"
 
 
 def calc_rsi(closes: pd.Series, period: int = 14) -> float:
@@ -740,6 +750,7 @@ def run_technical_filter(
                     on_found([cand])
             return closes
 
+        fetch_start = time.monotonic()
         fetched, limiter = _concurrent_fetch(
             [item["symbol"] for item in price_qualified], _fetch_history,
             workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
@@ -748,6 +759,7 @@ def run_technical_filter(
             if on_log:
                 on_log("Stopped by user.")
             return []
+        elapsed = time.monotonic() - fetch_start
 
         histories = {s: c for s, c in fetched.items() if len(c) >= bb_period + 2}
         skipped   = len(price_qualified) - len(histories)
@@ -755,7 +767,9 @@ def run_technical_filter(
             on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
                    f"~{limiter.rate:.0f} req/s (recovers automatically).")
         if on_log:
-            on_log(f"Pass 2 done — history for {len(histories)} symbols, {skipped} skipped")
+            on_log(f"Pass 2 done — history for {len(histories)} symbols, {skipped} skipped "
+                   f"in {_fmt_elapsed(elapsed)} "
+                   f"({len(price_qualified) / max(elapsed, 1e-3):.1f} symbols/s)")
         hist_path.write_text(json.dumps({**price_key, "histories": histories}))
 
     # ── Apply RSI / BB% filter in memory (instant from cache) ─────────────────
@@ -867,6 +881,7 @@ def run_options_filter(
     # One Schwab call per symbol covers every expiration through the horizon;
     # fetch all candidates concurrently behind the shared self-tuning limiter.
     horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
+    fetch_start = time.monotonic()
     fetched, limiter = _concurrent_fetch(
         [row["symbol"] for row in candidates],
         lambda sym: _fetch_schwab_chain(client, sym, right, horizon),
@@ -876,9 +891,13 @@ def run_options_filter(
         if on_log:
             on_log("Stopped by user.")
         return []
+    elapsed = time.monotonic() - fetch_start
     if limiter.hits and on_log:
         on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
                f"~{limiter.rate:.0f} req/s (recovers automatically).")
+    if on_log:
+        on_log(f"Fetched {len(fetched)}/{total} chains in {_fmt_elapsed(elapsed)} "
+               f"({total / max(elapsed, 1e-3):.1f} symbols/s)")
 
     # ── Filter the fetched chains in memory ───────────────────────────────────
     for row in candidates:
