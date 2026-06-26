@@ -647,8 +647,20 @@ def run_price_screen(
 
 
 def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period,
-                        bb_std_mult, rsi_threshold, bb_pct_threshold) -> dict | None:
-    """Apply the RSI/BB% filter to one close series; return a candidate row or None."""
+                        bb_std_mult, rsi_threshold, bb_pct_threshold,
+                        append_live=True) -> dict | None:
+    """Apply the RSI/BB% filter to one close series; return a candidate row or None.
+
+    ``closes_list`` holds daily closes *through yesterday*. When ``append_live`` is
+    set (a live trading session), the symbol's current quote from ``price_lookup``
+    is appended as today's close so RSI/BB% reflect the exact live price rather than
+    the prior session's close. ``closes_list`` already excludes today's bar, so this
+    never double-counts.
+    """
+    live = price_lookup.get(sym)
+    closes_list = list(closes_list)
+    if append_live and live is not None:
+        closes_list.append(live)
     closes = pd.Series(closes_list, dtype=float)
     if len(closes) < bb_period + 2:
         return None
@@ -660,7 +672,7 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         return None
     return {
         "symbol": sym,
-        "price":  round(price_lookup.get(sym, float(closes.iloc[-1])), 2),
+        "price":  round(live if live is not None else float(closes.iloc[-1]), 2),
         "rsi":    round(rsi, 1),
         "bb_pct": round(bb_pct, 1),
     }
@@ -702,10 +714,18 @@ def run_technical_filter(
             on_log("No price-screened symbols — run the Price Scan first.")
         return []
 
+    # "Today" is the current market (ET) date — the machine's local date can differ
+    # near midnight. On a trading day we substitute the live quote for today's bar;
+    # on a weekend/holiday there's no new bar, so the stored closes stand as-is.
+    from zoneinfo import ZoneInfo
+    et_today         = datetime.now(ZoneInfo("America/New_York")).date()
+    is_trading_today = _last_trading_day(et_today) == et_today
+
     price_lookup = {item["symbol"]: item["price"] for item in price_qualified}
     filter_kw = dict(
         rsi_period=rsi_period, bb_period=bb_period, bb_std_mult=bb_std_mult,
         rsi_threshold=rsi_threshold, bb_pct_threshold=bb_pct_threshold,
+        append_live=is_trading_today,
     )
 
     # ── Pass 2: fetch 45-day history (cache keyed on price params only) ────────
@@ -733,7 +753,9 @@ def run_technical_filter(
         if on_log:
             on_log(f"Pass 2: fetching 45-day history for {len(price_qualified)} symbols …")
         hist_start_dt = datetime.combine(hist_start, datetime.min.time())
-        end_dt        = datetime.combine(today, datetime.min.time())
+        # End a day out so today's bar is always returned regardless of the
+        # machine's timezone vs. ET; we strip it below and use the live quote.
+        end_dt        = datetime.combine(today + timedelta(days=1), datetime.min.time())
 
         # Schwab's price-history endpoint is single-symbol, so we can't batch — but
         # the calls are independent network I/O, so fetch them concurrently behind
@@ -741,7 +763,15 @@ def run_technical_filter(
         def _fetch_history(sym):
             data = schwab_client.price_history_daily(
                 client, sym, start=hist_start_dt, end=end_dt)
-            closes = [c["close"] for c in data.get("candles", []) if c.get("close") is not None]
+            # Keep daily closes *through yesterday* (ET); today's still-forming bar
+            # is dropped here and replaced by the live quote in _evaluate_candidate,
+            # so the indicators track the exact current price without double-counting.
+            closes = [
+                c["close"] for c in data.get("candles", [])
+                if c.get("close") is not None
+                and datetime.fromtimestamp(c["datetime"] / 1000,
+                                           ZoneInfo("America/New_York")).date() < et_today
+            ]
             # Evaluate the indicator as the history arrives so qualifying symbols
             # can stream into the GUI list instead of waiting for every fetch.
             if on_found:
@@ -761,7 +791,9 @@ def run_technical_filter(
             return []
         elapsed = time.monotonic() - fetch_start
 
-        histories = {s: c for s, c in fetched.items() if len(c) >= bb_period + 2}
+        # Stored closes run through yesterday; the live bar is appended at
+        # evaluation, so one fewer stored close is needed for a full window.
+        histories = {s: c for s, c in fetched.items() if len(c) >= bb_period + 1}
         skipped   = len(price_qualified) - len(histories)
         if limiter.hits and on_log:
             on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
