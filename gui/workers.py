@@ -11,6 +11,27 @@ _OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side", "yield_min", "yie
 PRICE_SCREEN_CACHE = "price_screen_cache.json"
 
 
+class UniverseWorker(QThread):
+    """Refresh the scan universe — SEC EDGAR list validated against Schwab pricing."""
+    log_msg  = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(dict)
+    error    = pyqtSignal(str)
+
+    def run(self):
+        from core.screener import build_universe, ScreenerError
+        try:
+            data = build_universe(
+                on_log=self.log_msg.emit,
+                on_progress=lambda c, t: self.progress.emit(c, t),
+            )
+            self.finished.emit(data)
+        except ScreenerError as e:
+            self.error.emit(str(e))
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {e}")
+
+
 class PriceScreenWorker(QThread):
     """Pass 1 — price screen. Driven by the Stock Scanner's 'Run Price Scan' button."""
     log_msg  = pyqtSignal(str)

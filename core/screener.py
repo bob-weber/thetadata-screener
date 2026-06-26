@@ -87,6 +87,8 @@ def _current_trade_date() -> date:
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 VALID_EXCHANGES  = {"NYSE", "Nasdaq", "NYSE MKT"}
+UNIVERSE_FILE    = "universe.json"           # persisted scan universe; refreshed on demand
+DROPPED_FILE     = "universe_dropped.json"   # diagnostic: EDGAR names Schwab didn't price
 
 _FUND_RE = re.compile(
     r"\betf\b"
@@ -254,58 +256,157 @@ def _has_weeklies(expirations: list[date], ref: date, horizon_days: int = 70) ->
     return any((b - a).days <= 10 for a, b in zip(near, near[1:]))
 
 
-def _get_company_symbols(client, on_log=None) -> list[str]:
-    """Return NYSE/Nasdaq company tickers, excluding ETFs and funds."""
-    sec_symbols: set[str] = set()
-    try:
-        if on_log:
-            on_log("Fetching SEC EDGAR company list …")
-        r = requests.get(
-            SEC_TICKERS_URL,
-            headers={"User-Agent": "screener/1.0 contact@example.com"},
-            timeout=30,
+def _fetch_edgar_symbols(on_log=None) -> list[str]:
+    """NYSE/Nasdaq common-stock tickers from SEC EDGAR, ETFs/funds filtered out."""
+    if on_log:
+        on_log("Fetching SEC EDGAR company list …")
+    r = requests.get(
+        SEC_TICKERS_URL,
+        headers={"User-Agent": "screener/1.0 contact@example.com"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "fields" in data and "data" in data:
+        df = pd.DataFrame(data["data"], columns=data["fields"])
+    else:
+        df = pd.DataFrame(list(data.values()))
+
+    df = df[df["exchange"].isin(VALID_EXCHANGES)].copy()
+    df["ticker"] = df["ticker"].str.upper().str.strip()
+    # Single-char suffixes W/R denote warrants/rights at any length.
+    # U denotes SPAC units only when appended to a 4-char base (5+ chars total);
+    # shorter tickers like LULU/ROKU are legitimate standalone symbols.
+    df = df[
+        ~df["ticker"].str.endswith("W") &
+        ~df["ticker"].str.endswith("R") &
+        ~(df["ticker"].str.endswith("U") & (df["ticker"].str.len() >= 5)) &
+        ~df["ticker"].str.contains(r"[\^~\+]", regex=True)
+    ]
+    df = df[~df["name"].apply(_is_fund)]
+    df = df.drop_duplicates(subset="ticker")
+    symbols = sorted(df["ticker"].tolist())
+    if on_log:
+        on_log(f"SEC company universe: {len(symbols)} tickers after ETF/fund filter")
+    return symbols
+
+
+def _filter_priceable(client, symbols: list[str], on_log=None, on_progress=None,
+                      chunk: int = 250) -> list[str]:
+    """Keep only symbols Schwab recognizes, via batched quotes (a few calls)."""
+    from core import schwab_client
+    good: list[str] = []
+    total = len(symbols)
+    for i in range(0, total, chunk):
+        batch = symbols[i:i + chunk]
+        try:
+            data = schwab_client.quotes(client, batch)
+            # Recognized symbols are top-level keys; unknowns land in errors.invalidSymbols.
+            good.extend(s for s in batch if s in data)
+        except Exception:
+            good.extend(batch)   # on a request error, keep the batch rather than drop it
+        if on_progress:
+            on_progress(min(i + chunk, total), total)
+    if on_log:
+        on_log(f"Priceable in Schwab: {len(good)}/{total}")
+    return good
+
+
+def _classify_dropped(sym: str) -> str:
+    """Bucket a dropped EDGAR ticker by its suffix after a -/./ separator.
+
+    class_share names (e.g. BRK-B) are the ones likely lost only to the EDGAR
+    '-' vs Schwab '/' format difference; the rest are genuinely out of scope.
+    """
+    parts = re.split(r"[-./]", sym, maxsplit=1)
+    if len(parts) < 2:
+        return "unlisted"                 # no separator → Schwab simply has no quote
+    suffix = parts[1]
+    if suffix.startswith("P"):
+        return "preferred"                # ABR-PD, AGM-PE, …
+    if suffix in ("W", "WT", "WS"):
+        return "warrant"                  # ACHR-WT
+    if suffix in ("R", "RT"):
+        return "rights"
+    if len(suffix) == 1 and suffix.isalpha():
+        return "class_share"              # BRK-B → likely BRK/B in Schwab
+    return "other"
+
+
+def _record_dropped(dropped: list[str], on_log=None,
+                    dropped_file: str | Path = DROPPED_FILE) -> None:
+    """Persist the dropped tickers + a breakdown so exclusions are inspectable."""
+    from collections import Counter
+    kinds = Counter(_classify_dropped(s) for s in dropped)
+    class_shares = sorted(s for s in dropped if _classify_dropped(s) == "class_share")
+    Path(dropped_file).write_text(json.dumps({
+        "updated":      date.today().isoformat(),
+        "count":        len(dropped),
+        "by_kind":      dict(kinds),
+        "class_share":  class_shares,     # candidates lost to -/. vs / format
+        "dropped":      dropped,
+    }, indent=2))
+    if on_log:
+        eg = ", ".join(class_shares[:3])
+        on_log(
+            f"Dropped {len(dropped)}: {len(class_shares)} dual-class"
+            f"{f' (e.g. {eg})' if eg else ''}, {kinds.get('preferred', 0)} preferred, "
+            f"{kinds.get('warrant', 0)} warrant, {kinds.get('rights', 0)} rights, "
+            f"{kinds.get('unlisted', 0)} unlisted — see {dropped_file}"
         )
-        r.raise_for_status()
-        data = r.json()
-        if "fields" in data and "data" in data:
-            df = pd.DataFrame(data["data"], columns=data["fields"])
-        else:
-            df = pd.DataFrame(list(data.values()))
 
-        df = df[df["exchange"].isin(VALID_EXCHANGES)].copy()
-        df["ticker"] = df["ticker"].str.upper().str.strip()
-        # Single-char suffixes W/R denote warrants/rights at any length.
-        # U denotes SPAC units only when appended to a 4-char base (5+ chars total);
-        # shorter tickers like LULU/ROKU are legitimate standalone symbols.
-        df = df[
-            ~df["ticker"].str.endswith("W") &
-            ~df["ticker"].str.endswith("R") &
-            ~(df["ticker"].str.endswith("U") & (df["ticker"].str.len() >= 5)) &
-            ~df["ticker"].str.contains(r"[\^~\+]", regex=True)
-        ]
-        df = df[~df["name"].apply(_is_fund)]
-        df = df.drop_duplicates(subset="ticker")
-        sec_symbols = set(df["ticker"].tolist())
-        if on_log:
-            on_log(f"SEC company universe: {len(sec_symbols)} tickers after ETF/fund filter")
-    except Exception as e:
-        if on_log:
-            on_log(f"SEC EDGAR unavailable ({e}) — falling back to full ThetaData list")
 
+def build_universe(on_log=None, on_progress=None,
+                   universe_file: str | Path = UNIVERSE_FILE,
+                   validate: bool = True) -> dict:
+    """Fetch the EDGAR universe, drop names Schwab can't price, and persist it.
+
+    Returns the saved dict ``{updated, source, count, symbols}``. When Schwab is
+    unavailable (no cached token), saves the unvalidated EDGAR list instead of
+    failing, so the stock scanner still has a universe to work from. The names
+    Schwab rejects are written to DROPPED_FILE with a breakdown by kind.
+    """
+    edgar = _fetch_edgar_symbols(on_log)
+    if not edgar:
+        raise ScreenerError("SEC EDGAR returned no symbols.")
+
+    symbols = edgar
+    source  = "SEC EDGAR"
+    if validate:
+        try:
+            from core import schwab_client
+            client = schwab_client.get_client(interactive=False)
+        except Exception as e:
+            client = None
+            if on_log:
+                on_log(f"Schwab unavailable ({e}) — saving unvalidated EDGAR list")
+        if client is not None:
+            symbols = _filter_priceable(client, edgar, on_log, on_progress)
+            source  = "SEC EDGAR + Schwab priceable"
+            _record_dropped(sorted(set(edgar) - set(symbols)), on_log)
+
+    data = {
+        "updated": date.today().isoformat(),
+        "source":  source,
+        "count":   len(symbols),
+        "symbols": symbols,
+    }
+    Path(universe_file).write_text(json.dumps(data, indent=2))
+    if on_log:
+        on_log(f"Universe saved: {len(symbols)} tickers → {universe_file}")
+    return data
+
+
+def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None:
+    """Return the persisted universe symbols, or None if there's no usable file."""
+    p = Path(universe_file)
+    if not p.exists():
+        return None
     try:
-        theta_df = client.stock_list_symbols()
-        col = "symbol" if "symbol" in theta_df.columns else theta_df.columns[0]
-        theta_symbols = set(theta_df[col].str.upper().str.strip().tolist())
-    except Exception as e:
-        raise ScreenerError(f"Failed to fetch ThetaData symbol list: {e}")
-
-    if sec_symbols:
-        combined = sorted(sec_symbols & theta_symbols)
-        if on_log:
-            on_log(f"After ThetaData cross-reference: {len(combined)} symbols")
-        return combined
-
-    return sorted(theta_symbols)
+        symbols = json.loads(p.read_text()).get("symbols")
+        return symbols or None
+    except Exception:
+        return None
 
 
 def _connect_client(on_log=None):
@@ -374,12 +475,19 @@ def run_price_screen(
     client = _connect_client(on_log)
 
     # ── Symbol universe ───────────────────────────────────────────────────────
+    # Precedence: manual watchlist → saved universe.json → bootstrap from EDGAR.
     if watchlist_file and Path(watchlist_file).exists():
         all_symbols = [t.strip() for t in Path(watchlist_file).read_text().splitlines() if t.strip()]
         if on_log:
             on_log(f"Using watchlist: {len(all_symbols)} symbols")
     else:
-        all_symbols = _get_company_symbols(client, on_log)
+        all_symbols = load_universe()
+        if all_symbols is None:
+            if on_log:
+                on_log("No saved universe — building from SEC EDGAR (use Update Universe to refresh) …")
+            all_symbols = build_universe(on_log=on_log).get("symbols", [])
+        elif on_log:
+            on_log(f"Using saved universe: {len(all_symbols)} tickers")
 
     if on_log:
         on_log(f"Pass 1: price screen — {len(all_symbols)} symbols …")

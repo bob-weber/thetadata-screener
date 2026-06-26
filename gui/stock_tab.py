@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from .workers import PriceScreenWorker, TechnicalWorker
+from .workers import PriceScreenWorker, TechnicalWorker, UniverseWorker
 
 PRICE_CACHE      = "price_screen_cache.json"
 CANDIDATES_CACHE = "tech_candidates_cache.json"
@@ -69,6 +69,7 @@ class StockScannerTab(QWidget):
         self._worker = None
         self._setup_ui()
         self._load_cached_results()
+        self._refresh_universe_label()
 
     # ── startup cache loading ──────────────────────────────────────────────────
 
@@ -138,6 +139,18 @@ class StockScannerTab(QWidget):
         pf.addRow("Watchlist file:", wl_row)
 
         root.addWidget(params_box)
+
+        # ── Universe ──────────────────────────────────────────────────────────
+        uni_row = QHBoxLayout()
+        self._universe_label = QLabel("Universe: —")
+        self._universe_btn = QPushButton("Update Universe")
+        self._universe_btn.setToolTip(
+            "Refresh the scan universe from SEC EDGAR, validated against Schwab "
+            "pricing. Only needed when listings change.")
+        self._universe_btn.clicked.connect(self._update_universe)
+        uni_row.addWidget(self._universe_label, 1)
+        uni_row.addWidget(self._universe_btn)
+        root.addLayout(uni_row)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -233,6 +246,7 @@ class StockScannerTab(QWidget):
             return None
         self._price_btn.setEnabled(False)
         self._tech_btn.setEnabled(False)
+        self._universe_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._log.clear()
         return config
@@ -278,7 +292,46 @@ class StockScannerTab(QWidget):
     def _idle(self):
         self._price_btn.setEnabled(True)
         self._tech_btn.setEnabled(True)
+        self._universe_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+
+    # ── universe ────────────────────────────────────────────────────────────────
+    def _refresh_universe_label(self):
+        from core.screener import load_universe, UNIVERSE_FILE
+        symbols = load_universe()
+        if symbols is None:
+            self._universe_label.setText(
+                "Universe: none saved — click Update Universe (or set a watchlist)")
+            return
+        try:
+            updated = json.loads(Path(UNIVERSE_FILE).read_text()).get("updated", "?")
+        except Exception:
+            updated = "?"
+        self._universe_label.setText(
+            f"Universe: {len(symbols):,} tickers · updated {updated}")
+
+    def _update_universe(self):
+        self._price_btn.setEnabled(False)
+        self._tech_btn.setEnabled(False)
+        self._universe_btn.setEnabled(False)
+        self._stop_btn.setEnabled(False)
+        self._log.clear()
+        self._log.append("Updating universe from SEC EDGAR …")
+        self._worker = UniverseWorker()
+        self._worker.log_msg.connect(self._log.append)
+        self._worker.progress.connect(self._on_universe_progress)
+        self._worker.finished.connect(self._on_universe_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _on_universe_progress(self, current: int, total: int):
+        self._universe_label.setText(f"Validating against Schwab … {current:,}/{total:,}")
+
+    def _on_universe_finished(self, data: dict):
+        self._idle()
+        self._log.append(
+            f"Universe updated — {data.get('count', 0):,} tickers ({data.get('source', '')}).")
+        self._refresh_universe_label()
 
     def _on_price_progress(self, current: int, total: int):
         self._price_plabel.setText(f"{current:,} / {total:,}")

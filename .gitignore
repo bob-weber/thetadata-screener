@@ -40,3 +40,5 @@ __pycache__/
 # Editor / OS
 .DS_Store
 *.swp
+universe.json
+universe_dropped.json
