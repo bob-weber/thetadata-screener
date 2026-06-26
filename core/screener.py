@@ -89,11 +89,11 @@ VALID_EXCHANGES  = {"NYSE", "Nasdaq", "NYSE MKT"}
 UNIVERSE_FILE    = "universe.json"           # persisted scan universe; refreshed on demand
 DROPPED_FILE     = "universe_dropped.json"   # diagnostic: EDGAR names Schwab didn't price
 
-# Pass 2 history fetch is concurrent with a self-tuning rate limiter (no GUI knob).
-# Start near Schwab's sustainable ceiling (~10 req/s); back off on 429/403 and
-# recover automatically, so it runs as fast as Schwab allows without manual tuning.
-_HISTORY_WORKERS    = 8
-_HISTORY_START_RATE = 10   # requests/sec
+# Per-symbol Schwab fetches (Pass 2 history, option chains) run concurrently
+# behind a self-tuning rate limiter (no GUI knob). Start near Schwab's sustainable
+# account-wide ceiling (~10 req/s); back off on 429/403 and recover automatically.
+_FETCH_WORKERS    = 8
+_FETCH_START_RATE = 10   # requests/sec
 
 _FUND_RE = re.compile(
     r"\betf\b"
@@ -179,18 +179,15 @@ def _fetch_schwab_chain(client, symbol: str, right: str, to_date: date) -> dict:
     """Real-time option chain from Schwab as {expiration_date: DataFrame}.
 
     A single API call per symbol covers every expiration through ``to_date``.
-    Each frame carries strike/bid/ask/delta columns. Returns {} on any error or
-    empty chain so the caller can simply skip the symbol. (We never pass
-    from_date — Schwab 400s when it equals today; the near end is filtered by
-    the caller from the returned expirations.)
+    Each frame carries strike/bid/ask/delta columns. Returns {} for a genuine
+    no-chain response; HTTP errors propagate so the caller's rate limiter can see
+    429/403. (We never pass from_date — Schwab 400s when it equals today; the near
+    end is filtered by the caller from the returned expirations.)
     """
     from core import schwab_client
     ct = (client.Options.ContractType.PUT if right == "P"
           else client.Options.ContractType.CALL)
-    try:
-        data = schwab_client.option_chain(client, symbol, contract_type=ct, to_date=to_date)
-    except Exception:
-        return {}
+    data = schwab_client.option_chain(client, symbol, contract_type=ct, to_date=to_date)
     if data.get("status") != "SUCCESS":
         return {}
 
@@ -414,6 +411,110 @@ def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None
         return None
 
 
+class _RateLimiter:
+    """Self-tuning global pacer for concurrent Schwab calls.
+
+    Starts at ``start_rate`` req/s and holds the aggregate rate just under
+    Schwab's account-wide limit: Schwab 429/403s with no Retry-After, so on a
+    rate-limit hit we pause every worker and slow down, then recover toward the
+    start rate on sustained success. No upward probing → we don't provoke limits.
+    """
+    def __init__(self, start_rate: float):
+        self._lock      = threading.Lock()
+        self._start     = 1.0 / start_rate   # fastest allowed interval (seconds)
+        self.interval   = self._start        # current interval; grows on limit
+        self._next_slot = 0.0
+        self._pause     = 0.0                # global cool-off after a hit
+        self._last_grow = 0.0
+        self.hits       = 0
+
+    def pace(self):
+        with self._lock:
+            now  = time.monotonic()
+            slot = max(now, self._next_slot, self._pause)
+            self._next_slot = slot + self.interval
+        delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def hit(self, attempt: int):
+        with self._lock:
+            self.hits += 1
+            now = time.monotonic()
+            if now - self._last_grow > 1.0:        # grow at most once/sec (don't over-correct a burst)
+                self.interval = min(self.interval * 1.5, 1.0)
+                self._last_grow = now
+            self._pause = max(self._pause, now + min(0.5 * 2 ** attempt, 8.0))
+
+    def recover(self):
+        with self._lock:
+            if self.interval > self._start:
+                self.interval = max(self._start, self.interval * 0.9)
+
+    @property
+    def rate(self) -> float:
+        return 1.0 / self.interval
+
+
+def _concurrent_fetch(keys, call_one, *, workers, start_rate,
+                      on_progress=None, stop_flag=None):
+    """Fetch ``call_one(key)`` for every key concurrently under a shared limiter.
+
+    ``call_one`` makes ONE Schwab request and returns its result, raising on HTTP
+    error (429/403 → rate-limit backoff; other errors → give up after 2 tries).
+    Returns ``(results, limiter)`` where results maps key → value for everything
+    that returned (None values are dropped). ``results`` is None if the user
+    stopped. Raises ScreenerError if hard-blocked with no progress for 30s.
+    """
+    limiter = _RateLimiter(start_rate)
+    results: dict = {}
+
+    def _worker(key):
+        other_errors = 0
+        for attempt in range(8):
+            limiter.pace()
+            try:
+                value = call_one(key)
+                limiter.recover()
+                return key, value
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status in (429, 403):           # 429 burst, or 403 once Schwab escalates
+                    limiter.hit(attempt)
+                else:
+                    other_errors += 1
+                    if other_errors >= 2:          # genuine failure (not rate limit) → give up
+                        break
+                    time.sleep(0.3)
+        return key, None
+
+    total = len(keys)
+    done  = 0
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker, k) for k in keys]
+        for fut in as_completed(futures):
+            if stop_flag and stop_flag():
+                for f in futures:
+                    f.cancel()
+                return None, limiter
+            # Circuit breaker: rate-limited with no progress after 30s = hard block.
+            if not results and limiter.hits and time.monotonic() - start > 30:
+                for f in futures:
+                    f.cancel()
+                raise ScreenerError(
+                    "Schwab is blocking requests (rate limit / temporary cool-off). "
+                    "Wait a few minutes, then retry. If it persists, re-run the "
+                    "Schwab login.")
+            key, value = fut.result()
+            done += 1
+            if value is not None:
+                results[key] = value
+            if on_progress:
+                on_progress(done, total)
+    return results, limiter
+
+
 def _price_key(config: dict) -> dict:
     return {
         "date":      date.today().isoformat(),
@@ -585,108 +686,31 @@ def run_technical_filter(
             ) from e
         if on_log:
             on_log(f"Pass 2: fetching 45-day history for {len(price_qualified)} symbols …")
-        histories = {}
-        total   = len(price_qualified)
-        skipped = 0
-        done    = 0
         hist_start_dt = datetime.combine(hist_start, datetime.min.time())
         end_dt        = datetime.combine(today, datetime.min.time())
 
-        # Schwab's price-history endpoint is single-symbol, so we can't batch —
-        # but the calls are independent network I/O, so fetch them concurrently.
-        # A self-tuning global pacer holds the aggregate rate just under Schwab's
-        # limit: it starts at _HISTORY_START_RATE, and since Schwab 429/403s with
-        # no Retry-After, on a rate-limit it pauses every worker and slows down,
-        # then recovers toward the start rate on sustained success. No GUI knob.
-        max_workers    = config.get("history_workers", _HISTORY_WORKERS)
-        start_interval = 1.0 / config.get("history_rate", _HISTORY_START_RATE)
-        rate_lock   = threading.Lock()
-        next_slot   = [0.0]
-        interval    = [start_interval]   # min seconds between requests; grows on limit, recovers on success
-        pause_until = [0.0]              # global cool-off after a rate-limit hit
-        last_grow   = [0.0]
-        rl_hits     = [0]
-
-        def _pace():
-            with rate_lock:
-                now  = time.monotonic()
-                slot = max(now, next_slot[0], pause_until[0])
-                next_slot[0] = slot + interval[0]
-            delay = slot - now
-            if delay > 0:
-                time.sleep(delay)
-
-        def _hit_rate_limit(attempt):
-            with rate_lock:
-                rl_hits[0] += 1
-                now = time.monotonic()
-                if now - last_grow[0] > 1.0:        # grow at most once/sec (avoid over-correcting a burst)
-                    interval[0] = min(interval[0] * 1.5, 1.0)
-                    last_grow[0] = now
-                pause_until[0] = max(pause_until[0], now + min(0.5 * 2 ** attempt, 8.0))
-
-        def _recover():
-            # Ease back toward the start rate after a backoff; never faster than start
-            # (no upward probing → we don't deliberately provoke rate limits).
-            with rate_lock:
-                if interval[0] > start_interval:
-                    interval[0] = max(start_interval, interval[0] * 0.9)
-
-        # The schwab-py client (httpx under the hood) is safe to share across
-        # threads; the token is valid for the whole scan, so no refresh races.
+        # Schwab's price-history endpoint is single-symbol, so we can't batch — but
+        # the calls are independent network I/O, so fetch them concurrently behind
+        # the shared self-tuning limiter.
         def _fetch_history(sym):
-            other_errors = 0
-            for attempt in range(8):
-                _pace()
-                try:
-                    data = schwab_client.price_history_daily(
-                        client, sym, start=hist_start_dt, end=end_dt)
-                    _recover()
-                    return sym, [c["close"] for c in data.get("candles", [])
-                                 if c.get("close") is not None]
-                except Exception as e:
-                    status = getattr(getattr(e, "response", None), "status_code", None)
-                    if status in (429, 403):          # 429 burst, or 403 once Schwab escalates
-                        _hit_rate_limit(attempt)      # rate-limited: back off globally and retry
-                    else:
-                        other_errors += 1
-                        if other_errors >= 2:         # genuine failure (not rate limit) → give up
-                            break
-                        time.sleep(0.3)
-            return sym, []
+            data = schwab_client.price_history_daily(
+                client, sym, start=hist_start_dt, end=end_dt)
+            return [c["close"] for c in data.get("candles", []) if c.get("close") is not None]
 
-        scan_start = time.monotonic()
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_history, item["symbol"]) for item in price_qualified]
-            for fut in as_completed(futures):
-                if stop_flag and stop_flag():
-                    for f in futures:
-                        f.cancel()
-                    if on_log:
-                        on_log("Stopped by user.")
-                    return []
-                # Circuit breaker: rate-limited with no successful fetch after 30s
-                # means Schwab has hard-blocked us — fail fast instead of grinding.
-                if not histories and rl_hits[0] and time.monotonic() - scan_start > 30:
-                    for f in futures:
-                        f.cancel()
-                    raise ScreenerError(
-                        "Schwab is blocking requests (rate limit / temporary cool-off). "
-                        "Wait a few minutes, then retry. If it persists, re-run the "
-                        "Schwab login.")
-                sym, closes = fut.result()
-                done += 1
-                if len(closes) < bb_period + 2:
-                    skipped += 1
-                else:
-                    histories[sym] = closes
-                if on_progress:
-                    on_progress(done, total)
+        fetched, limiter = _concurrent_fetch(
+            [item["symbol"] for item in price_qualified], _fetch_history,
+            workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
+            on_progress=on_progress, stop_flag=stop_flag)
+        if fetched is None:                          # user stopped
+            if on_log:
+                on_log("Stopped by user.")
+            return []
 
-        if rl_hits[0] and on_log:
-            on_log(f"Schwab rate-limited {rl_hits[0]}× — auto-throttled to "
-                   f"~{1 / interval[0]:.0f} req/s (recovers automatically).")
-
+        histories = {s: c for s, c in fetched.items() if len(c) >= bb_period + 2}
+        skipped   = len(price_qualified) - len(histories)
+        if limiter.hits and on_log:
+            on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
+                   f"~{limiter.rate:.0f} req/s (recovers automatically).")
         if on_log:
             on_log(f"Pass 2 done — history for {len(histories)} symbols, {skipped} skipped")
         hist_path.write_text(json.dumps({**price_key, "histories": histories}))
@@ -781,7 +805,6 @@ def run_options_filter(
 ) -> list[dict]:
     yield_min        = config.get("yield_min",        0.009)
     yield_max        = config.get("yield_max",        0.020)
-    options_throttle = config.get("options_throttle", 0.5)
     right            = config.get("right",            "P")    # "P" or "C"
     side             = config.get("side",             "sell") # "sell" or "buy"
     weeklies_only    = config.get("weeklies_only",    False)
@@ -811,35 +834,36 @@ def run_options_filter(
         label = f"{'Put' if right == 'P' else 'Call'} {'sells' if side == 'sell' else 'buys'}"
         on_log(f"Scanning {label} chains (Schwab real-time) for {total} candidates …")
 
-    for i, row in enumerate(candidates):
-        if stop_flag and stop_flag():
-            if on_log:
-                on_log("Stopped by user.")
-            break
+    # One Schwab call per symbol covers every expiration through the horizon;
+    # fetch all candidates concurrently behind the shared self-tuning limiter.
+    horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
+    fetched, limiter = _concurrent_fetch(
+        [row["symbol"] for row in candidates],
+        lambda sym: _fetch_schwab_chain(client, sym, right, horizon),
+        workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
+        on_progress=on_progress, stop_flag=stop_flag)
+    if fetched is None:                              # user stopped
+        if on_log:
+            on_log("Stopped by user.")
+        return []
+    if limiter.hits and on_log:
+        on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
+               f"~{limiter.rate:.0f} req/s (recovers automatically).")
 
+    # ── Filter the fetched chains in memory ───────────────────────────────────
+    for row in candidates:
         sym         = row["symbol"]
         stock_price = row["price"]
-        sym_hits    = 0
-
-        # One Schwab call per symbol returns every expiration through the horizon.
-        horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
-        chains  = _fetch_schwab_chain(client, sym, right, horizon)
+        chains      = fetched.get(sym)
         if not chains:
             if on_log:
                 on_log(f"  {sym}: no chain data")
-            if on_progress:
-                on_progress(i + 1, total)
-            time.sleep(options_throttle)
             continue
 
         available = sorted(chains)
-
         if weeklies_only and not _has_weeklies(available, today):
             if on_log:
                 on_log(f"  {sym}: no weekly options — skipped")
-            if on_progress:
-                on_progress(i + 1, total)
-            time.sleep(options_throttle)
             continue
 
         if requested_exp is not None:
@@ -847,9 +871,6 @@ def run_options_filter(
             if exp is None:
                 if on_log:
                     on_log(f"  {sym}: no listed expiration on or before {requested_exp}")
-                if on_progress:
-                    on_progress(i + 1, total)
-                time.sleep(options_throttle)
                 continue
             if exp != requested_exp and on_log:
                 on_log(f"  {sym}: {requested_exp} not listed — using {exp}")
@@ -883,7 +904,6 @@ def run_options_filter(
             chain = in_range.copy()
             if chain.empty:
                 continue
-            sym_hits += len(chain)
 
             dte = (exp - today).days
 
@@ -914,11 +934,6 @@ def run_options_filter(
                     "yield_pct":  round(float(opt["yield_pct"]) * 100, 2),
                     "delta":      delta,
                 })
-
-        if on_progress:
-            on_progress(i + 1, total)
-
-        time.sleep(options_throttle)
 
     return results
 

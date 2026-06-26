@@ -262,9 +262,6 @@ class OptionsScannerTab(QWidget):
         yh.addWidget(QLabel("%"))
         pf.addRow("Yield range:", yield_row)
 
-        self._opts_throttle = QLineEdit("0.5")
-        pf.addRow("Throttle (s):", self._opts_throttle)
-
         root.addWidget(params_box)
 
         # ── Buttons + status ──────────────────────────────────────────────────
@@ -327,7 +324,6 @@ class OptionsScannerTab(QWidget):
             "expiration_date":  self._exp_date.date().toString("yyyy-MM-dd"),
             "yield_min":        float(self._yield_min.text()) / 100.0,
             "yield_max":        float(self._yield_max.text()) / 100.0,
-            "options_throttle": float(self._opts_throttle.text()),
             "weeklies_only":    self._weeklies_only.isChecked(),
         }
 
