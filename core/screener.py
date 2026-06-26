@@ -65,9 +65,13 @@ def _last_trading_day(ref: date) -> date:
 
 def _prev_trading_day() -> date:
     """Return the most recent trading day strictly before today."""
-    today    = date.today()
-    holidays = _us_market_holidays(today.year) | _us_market_holidays(today.year - 1)
-    d = today - timedelta(days=1)
+    return _last_session_before(date.today())
+
+
+def _last_session_before(ref: date) -> date:
+    """Return the most recent trading day strictly before ``ref``."""
+    holidays = _us_market_holidays(ref.year) | _us_market_holidays(ref.year - 1)
+    d = ref - timedelta(days=1)
     while d.weekday() >= 5 or d in holidays:
         d -= timedelta(days=1)
     return d
@@ -421,6 +425,30 @@ def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None
         return None
 
 
+# Persistent per-symbol daily-close store for Pass 2. Each entry holds the close
+# series *through the last completed session* (today's bar is never stored — the
+# live quote stands in for it). Symbols already current are skipped on the next
+# scan; stale ones are fully refetched, which also self-heals split/dividend
+# re-adjustments. Keyed per symbol, so it survives price-range/threshold changes.
+HISTORY_STORE_FILE = "history_store_cache.json"
+
+
+def _load_history_store(path: str | Path = HISTORY_STORE_FILE) -> dict:
+    """Load the per-symbol close store as {symbol: {"last": iso_date, "closes": [...]}}."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_history_store(store: dict, path: str | Path = HISTORY_STORE_FILE) -> None:
+    Path(path).write_text(json.dumps(store))
+
+
 class _RateLimiter:
     """Self-tuning global pacer for concurrent Schwab calls.
 
@@ -685,17 +713,23 @@ def run_technical_filter(
     on_progress=None,
     on_found=None,
     stop_flag=None,
-    history_cache_file: str | Path = "tech_history_cache.json",
+    history_store_file: str | Path = HISTORY_STORE_FILE,
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
     use_cache: bool = True,
 ) -> list[dict]:
-    """Pass 2 — fetch 45-day history for the price-qualified list and apply RSI/BB%.
+    """Pass 2 — get 45-day history for the price-qualified list and apply RSI/BB%.
 
     Writes ``tech_candidates_cache.json`` and returns
     ``[{"symbol", "price", "rsi", "bb_pct"}, …]``. Takes the price-screened list
     (from :func:`run_price_screen`) as input so it can be re-run on its own.
-    ``on_found(rows)`` is called with each candidate as its history arrives so the
-    GUI can populate the list as the fetch runs.
+    ``on_found(rows)`` is called with each candidate as it's evaluated so the GUI
+    can populate the list as the scan runs.
+
+    Daily history is served from a persistent per-symbol store
+    (:data:`HISTORY_STORE_FILE`): symbols already current through the last
+    completed session are reused with no fetch; the rest are fetched in full and
+    the store is updated. ``use_cache=False`` forces a full refetch of every
+    symbol (still updating the store).
     """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
@@ -706,7 +740,6 @@ def run_technical_filter(
     today      = date.today()
     hist_start = today - timedelta(days=45)
 
-    price_key = _price_key(config)
     full_key  = _full_key(config)
 
     if not price_qualified:
@@ -728,20 +761,41 @@ def run_technical_filter(
         append_live=is_trading_today,
     )
 
-    # ── Pass 2: fetch 45-day history (cache keyed on price params only) ────────
-    hist_path = Path(history_cache_file)
-    histories: dict[str, list] | None = None
-    if use_cache and hist_path.exists():
-        try:
-            cached = json.loads(hist_path.read_text())
-            if all(cached.get(k) == v for k, v in price_key.items()):
-                histories = cached["histories"]
-                if on_log:
-                    on_log(f"History cache hit — {len(histories)} close series loaded, computing indicators …")
-        except Exception:
-            pass
+    # ── Per-symbol history store: reuse what's current, fetch only the rest ────
+    # The store holds daily closes through the last completed session; today's bar
+    # is always synthesized from the live quote, so a "current" symbol needs no
+    # fetch (its daily closes can't change intraday). Stale/new symbols are fetched
+    # in full, which also re-syncs any split/dividend re-adjustment.
+    last_session_str = _last_session_before(et_today).isoformat()
+    store_path = Path(history_store_file)
+    store      = _load_history_store(store_path)
 
-    if histories is None:
+    symbols = [item["symbol"] for item in price_qualified]
+    fresh: dict[str, list] = {}
+    stale: list[str]       = []
+    for sym in symbols:
+        entry = store.get(sym)
+        if use_cache and entry and entry.get("last") == last_session_str and entry.get("closes"):
+            fresh[sym] = entry["closes"]
+        else:
+            stale.append(sym)
+
+    # Already-current symbols stream in immediately — no fetch needed for these.
+    if on_found:
+        for sym, closes in fresh.items():
+            cand = _evaluate_candidate(sym, closes, price_lookup, **filter_kw)
+            if cand:
+                on_found([cand])
+
+    n_total = len(symbols)
+    if on_progress and fresh:
+        on_progress(len(fresh), n_total)
+    if on_log:
+        on_log(f"Pass 2: {len(fresh)} symbols current in store, fetching {len(stale)} …")
+
+    fetched: dict[str, tuple] = {}
+    elapsed = 0.0
+    if stale:
         from core import schwab_client
         try:
             client = schwab_client.get_client(interactive=False)
@@ -750,12 +804,11 @@ def run_technical_filter(
                 "Schwab authentication required for technical history. Run "
                 "'gui-env/bin/python -m core.schwab_client login' once, then retry."
             ) from e
-        if on_log:
-            on_log(f"Pass 2: fetching 45-day history for {len(price_qualified)} symbols …")
         hist_start_dt = datetime.combine(hist_start, datetime.min.time())
         # End a day out so today's bar is always returned regardless of the
         # machine's timezone vs. ET; we strip it below and use the live quote.
-        end_dt        = datetime.combine(today + timedelta(days=1), datetime.min.time())
+        end_dt = datetime.combine(today + timedelta(days=1), datetime.min.time())
+        ET = ZoneInfo("America/New_York")
 
         # Schwab's price-history endpoint is single-symbol, so we can't batch — but
         # the calls are independent network I/O, so fetch them concurrently behind
@@ -766,45 +819,57 @@ def run_technical_filter(
             # Keep daily closes *through yesterday* (ET); today's still-forming bar
             # is dropped here and replaced by the live quote in _evaluate_candidate,
             # so the indicators track the exact current price without double-counting.
-            closes = [
-                c["close"] for c in data.get("candles", [])
+            kept = [
+                c for c in data.get("candles", [])
                 if c.get("close") is not None
-                and datetime.fromtimestamp(c["datetime"] / 1000,
-                                           ZoneInfo("America/New_York")).date() < et_today
+                and datetime.fromtimestamp(c["datetime"] / 1000, ET).date() < et_today
             ]
-            # Evaluate the indicator as the history arrives so qualifying symbols
-            # can stream into the GUI list instead of waiting for every fetch.
+            closes    = [c["close"] for c in kept]
+            last_date = (datetime.fromtimestamp(kept[-1]["datetime"] / 1000, ET)
+                         .date().isoformat()) if kept else None
+            # Evaluate as the history arrives so qualifying symbols stream into the
+            # GUI list instead of waiting for every fetch.
             if on_found:
                 cand = _evaluate_candidate(sym, closes, price_lookup, **filter_kw)
                 if cand:
                     on_found([cand])
-            return closes
+            return closes, last_date
+
+        def _prog(done, _total):
+            if on_progress:
+                on_progress(len(fresh) + done, n_total)
 
         fetch_start = time.monotonic()
         fetched, limiter = _concurrent_fetch(
-            [item["symbol"] for item in price_qualified], _fetch_history,
+            stale, _fetch_history,
             workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
-            on_progress=on_progress, stop_flag=stop_flag)
+            on_progress=_prog, stop_flag=stop_flag)
         if fetched is None:                          # user stopped
             if on_log:
                 on_log("Stopped by user.")
             return []
         elapsed = time.monotonic() - fetch_start
-
-        # Stored closes run through yesterday; the live bar is appended at
-        # evaluation, so one fewer stored close is needed for a full window.
-        histories = {s: c for s, c in fetched.items() if len(c) >= bb_period + 1}
-        skipped   = len(price_qualified) - len(histories)
         if limiter.hits and on_log:
             on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
                    f"~{limiter.rate:.0f} req/s (recovers automatically).")
-        if on_log:
-            on_log(f"Pass 2 done — history for {len(histories)} symbols, {skipped} skipped "
-                   f"in {_fmt_elapsed(elapsed)} "
-                   f"({len(price_qualified) / max(elapsed, 1e-3):.1f} symbols/s)")
-        hist_path.write_text(json.dumps({**price_key, "histories": histories}))
 
-    # ── Apply RSI / BB% filter in memory (instant from cache) ─────────────────
+    # ── Merge reused + freshly fetched closes; persist the store ──────────────
+    # Stored closes run through yesterday; the live bar is appended at evaluation,
+    # so one fewer stored close is needed for a full window.
+    histories: dict[str, list] = dict(fresh)
+    for sym, (closes, last_date) in fetched.items():
+        if len(closes) >= bb_period + 1:
+            histories[sym] = closes
+            if last_date:
+                store[sym] = {"last": last_date, "closes": closes}
+    _save_history_store(store, store_path)
+
+    if on_log:
+        rate = f" ({len(stale) / max(elapsed, 1e-3):.1f} fetched/s)" if stale else ""
+        on_log(f"Pass 2 done — {len(histories)} histories "
+               f"({len(fresh)} reused, {len(fetched)} fetched) in {_fmt_elapsed(elapsed)}{rate}")
+
+    # ── Apply RSI / BB% filter in memory ──────────────────────────────────────
     tech_candidates: list[dict] = []
 
     for sym, closes_list in histories.items():
@@ -830,7 +895,7 @@ def run_stock_filter(
     on_pass2_progress=None,
     stop_flag=None,
     price_cache_file: str | Path   = "price_screen_cache.json",
-    history_cache_file: str | Path = "tech_history_cache.json",
+    history_store_file: str | Path = HISTORY_STORE_FILE,
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
     watchlist_file: str | Path | None = None,
     skip_candidates_cache: bool = False,
@@ -867,7 +932,7 @@ def run_stock_filter(
         on_log=on_log,
         on_progress=on_pass2_progress,
         stop_flag=stop_flag,
-        history_cache_file=history_cache_file,
+        history_store_file=history_store_file,
         candidates_cache_file=candidates_cache_file,
     )
 

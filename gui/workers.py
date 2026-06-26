@@ -82,7 +82,7 @@ class StockScanWorker(QThread):
                 on_progress=lambda c, t: self.tech_progress.emit(c, t),
                 on_found=lambda rows: self.tech_found.emit(rows),
                 stop_flag=lambda: self._stop,
-                use_cache=False,
+                use_cache=True,   # reuse per-symbol history store; live price always re-applied
             )
             self.finished.emit(results)
         except ScreenerError as e:
