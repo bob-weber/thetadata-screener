@@ -117,12 +117,10 @@ class StockScannerTab(QWidget):
         self._bb_pct_threshold = QLineEdit("33.0")
         self._rsi_period       = QLineEdit("14")
         self._bb_period        = QLineEdit("20")
-        self._throttle         = QLineEdit("0.1")
         pf.addRow("RSI threshold (<):", self._rsi_threshold)
         pf.addRow("BB% threshold (<):", self._bb_pct_threshold)
         pf.addRow("RSI period:",        self._rsi_period)
         pf.addRow("BB period:",         self._bb_period)
-        pf.addRow("Throttle (s):",      self._throttle)
 
         wl_row = QWidget()
         wh = QHBoxLayout(wl_row)
@@ -235,7 +233,6 @@ class StockScannerTab(QWidget):
             "bb_pct_threshold": float(self._bb_pct_threshold.text()),
             "rsi_period":       int(self._rsi_period.text()),
             "bb_period":        int(self._bb_period.text()),
-            "stock_throttle":   float(self._throttle.text()),
         }
 
     def _begin_scan(self) -> dict | None:

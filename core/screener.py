@@ -1,7 +1,9 @@
 import re
 import time
 import json
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -86,6 +88,12 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 VALID_EXCHANGES  = {"NYSE", "Nasdaq", "NYSE MKT"}
 UNIVERSE_FILE    = "universe.json"           # persisted scan universe; refreshed on demand
 DROPPED_FILE     = "universe_dropped.json"   # diagnostic: EDGAR names Schwab didn't price
+
+# Pass 2 history fetch is concurrent with a self-tuning rate limiter (no GUI knob).
+# Start near Schwab's sustainable ceiling (~10 req/s); back off on 429/403 and
+# recover automatically, so it runs as fast as Schwab allows without manual tuning.
+_HISTORY_WORKERS    = 8
+_HISTORY_START_RATE = 10   # requests/sec
 
 _FUND_RE = re.compile(
     r"\betf\b"
@@ -440,7 +448,6 @@ def run_price_screen(
     """
     price_min      = config.get("price_min",      10.0)
     price_max      = config.get("price_max",     500.0)
-    stock_throttle = config.get("stock_throttle",  0.1)
 
     price_key  = _price_key(config)
     price_path = Path(price_cache_file)
@@ -508,7 +515,7 @@ def run_price_screen(
 
         if on_progress:
             on_progress(min(i + chunk, total), total)
-        time.sleep(stock_throttle)
+        time.sleep(0.1)   # gentle pace between the ~20 batched quote calls
 
     if on_log:
         on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
@@ -542,7 +549,6 @@ def run_technical_filter(
     bb_std_mult      = config.get("bb_std_mult",       2.0)
     rsi_threshold    = config.get("rsi_threshold",    40.0)
     bb_pct_threshold = config.get("bb_pct_threshold", 33.0)
-    stock_throttle   = config.get("stock_throttle",    0.1)
 
     today      = date.today()
     hist_start = today - timedelta(days=45)
@@ -582,36 +588,104 @@ def run_technical_filter(
         histories = {}
         total   = len(price_qualified)
         skipped = 0
+        done    = 0
         hist_start_dt = datetime.combine(hist_start, datetime.min.time())
         end_dt        = datetime.combine(today, datetime.min.time())
 
-        for i, item in enumerate(price_qualified):
-            sym = item["symbol"]
-            if stop_flag and stop_flag():
-                if on_log:
-                    on_log("Stopped by user.")
-                return []
+        # Schwab's price-history endpoint is single-symbol, so we can't batch —
+        # but the calls are independent network I/O, so fetch them concurrently.
+        # A self-tuning global pacer holds the aggregate rate just under Schwab's
+        # limit: it starts at _HISTORY_START_RATE, and since Schwab 429/403s with
+        # no Retry-After, on a rate-limit it pauses every worker and slows down,
+        # then recovers toward the start rate on sustained success. No GUI knob.
+        max_workers    = config.get("history_workers", _HISTORY_WORKERS)
+        start_interval = 1.0 / config.get("history_rate", _HISTORY_START_RATE)
+        rate_lock   = threading.Lock()
+        next_slot   = [0.0]
+        interval    = [start_interval]   # min seconds between requests; grows on limit, recovers on success
+        pause_until = [0.0]              # global cool-off after a rate-limit hit
+        last_grow   = [0.0]
+        rl_hits     = [0]
 
-            try:
-                data = schwab_client.price_history_daily(
-                    client, sym, start=hist_start_dt, end=end_dt)
-                closes = [c["close"] for c in data.get("candles", [])
-                          if c.get("close") is not None]
-            except Exception:
-                closes = []
+        def _pace():
+            with rate_lock:
+                now  = time.monotonic()
+                slot = max(now, next_slot[0], pause_until[0])
+                next_slot[0] = slot + interval[0]
+            delay = slot - now
+            if delay > 0:
+                time.sleep(delay)
 
-            if len(closes) < bb_period + 2:
-                skipped += 1
+        def _hit_rate_limit(attempt):
+            with rate_lock:
+                rl_hits[0] += 1
+                now = time.monotonic()
+                if now - last_grow[0] > 1.0:        # grow at most once/sec (avoid over-correcting a burst)
+                    interval[0] = min(interval[0] * 1.5, 1.0)
+                    last_grow[0] = now
+                pause_until[0] = max(pause_until[0], now + min(0.5 * 2 ** attempt, 8.0))
+
+        def _recover():
+            # Ease back toward the start rate after a backoff; never faster than start
+            # (no upward probing → we don't deliberately provoke rate limits).
+            with rate_lock:
+                if interval[0] > start_interval:
+                    interval[0] = max(start_interval, interval[0] * 0.9)
+
+        # The schwab-py client (httpx under the hood) is safe to share across
+        # threads; the token is valid for the whole scan, so no refresh races.
+        def _fetch_history(sym):
+            other_errors = 0
+            for attempt in range(8):
+                _pace()
+                try:
+                    data = schwab_client.price_history_daily(
+                        client, sym, start=hist_start_dt, end=end_dt)
+                    _recover()
+                    return sym, [c["close"] for c in data.get("candles", [])
+                                 if c.get("close") is not None]
+                except Exception as e:
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status in (429, 403):          # 429 burst, or 403 once Schwab escalates
+                        _hit_rate_limit(attempt)      # rate-limited: back off globally and retry
+                    else:
+                        other_errors += 1
+                        if other_errors >= 2:         # genuine failure (not rate limit) → give up
+                            break
+                        time.sleep(0.3)
+            return sym, []
+
+        scan_start = time.monotonic()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_history, item["symbol"]) for item in price_qualified]
+            for fut in as_completed(futures):
+                if stop_flag and stop_flag():
+                    for f in futures:
+                        f.cancel()
+                    if on_log:
+                        on_log("Stopped by user.")
+                    return []
+                # Circuit breaker: rate-limited with no successful fetch after 30s
+                # means Schwab has hard-blocked us — fail fast instead of grinding.
+                if not histories and rl_hits[0] and time.monotonic() - scan_start > 30:
+                    for f in futures:
+                        f.cancel()
+                    raise ScreenerError(
+                        "Schwab is blocking requests (rate limit / temporary cool-off). "
+                        "Wait a few minutes, then retry. If it persists, re-run the "
+                        "Schwab login.")
+                sym, closes = fut.result()
+                done += 1
+                if len(closes) < bb_period + 2:
+                    skipped += 1
+                else:
+                    histories[sym] = closes
                 if on_progress:
-                    on_progress(i + 1, total)
-                continue
+                    on_progress(done, total)
 
-            histories[sym] = closes
-
-            if on_progress:
-                on_progress(i + 1, total)
-
-            time.sleep(stock_throttle)
+        if rl_hits[0] and on_log:
+            on_log(f"Schwab rate-limited {rl_hits[0]}× — auto-throttled to "
+                   f"~{1 / interval[0]:.0f} req/s (recovers automatically).")
 
         if on_log:
             on_log(f"Pass 2 done — history for {len(histories)} symbols, {skipped} skipped")
