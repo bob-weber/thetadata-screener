@@ -234,7 +234,11 @@ def snap_expiration(requested: date, available: list[date]) -> date | None:
     return max(on_or_before) if on_or_before else None
 
 
-def _has_weeklies(expirations: list[date], ref: date, horizon_days: int = 70) -> bool:
+_WEEKLIES_HORIZON_DAYS = 70
+
+
+def _has_weeklies(expirations: list[date], ref: date,
+                  horizon_days: int = _WEEKLIES_HORIZON_DAYS) -> bool:
     """True if the symbol offers weekly options.
 
     Monthly-only names list expirations roughly a month apart (3rd Fridays);
@@ -408,6 +412,10 @@ def build_universe(on_log=None, on_progress=None,
         "symbols": symbols,
     }
     Path(universe_file).write_text(json.dumps(data, indent=2))
+    # Drop the weekly-options flags so they get recomputed against the new
+    # universe on the next options scan (listings change rarely, but a universe
+    # rebuild is the natural point to refresh them).
+    Path(WEEKLIES_CACHE_FILE).unlink(missing_ok=True)
     if on_log:
         on_log(f"Universe saved: {len(symbols)} tickers → {universe_file}")
     return data
@@ -447,6 +455,30 @@ def _load_history_store(path: str | Path = HISTORY_STORE_FILE) -> dict:
 
 def _save_history_store(store: dict, path: str | Path = HISTORY_STORE_FILE) -> None:
     Path(path).write_text(json.dumps(store))
+
+
+WEEKLIES_CACHE_FILE = "weeklies_cache.json"
+
+
+def _load_weeklies_cache(path: str | Path = WEEKLIES_CACHE_FILE) -> dict[str, bool]:
+    """Load the persisted {symbol: has_weeklies} flags.
+
+    Weekly-vs-monthly is a stable property of a stock, so we compute it once per
+    symbol (from a chain wide enough for _has_weeklies to read Friday spacing) and
+    reuse it. Cleared by build_universe so flags refresh when the universe is rebuilt.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return {k: bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_weeklies_cache(flags: dict[str, bool], path: str | Path = WEEKLIES_CACHE_FILE) -> None:
+    Path(path).write_text(json.dumps(flags))
 
 
 class _RateLimiter:
@@ -975,13 +1007,39 @@ def run_options_filter(
         label = f"{'Put' if right == 'P' else 'Call'} {'sells' if side == 'sell' else 'buys'}"
         on_log(f"Scanning {label} chains (Schwab real-time) for {total} candidates …")
 
+    # Weekly-vs-monthly is a stable per-symbol property, cached across scans
+    # (build_universe clears it). Drop known monthly-only names up front so we
+    # never even fetch their chains; the rest are fetched and scanned below.
+    weekly_flags = _load_weeklies_cache() if weeklies_only else {}
+    weekly_dirty = False
+    if weeklies_only:
+        n_before = len(candidates)
+        candidates = [r for r in candidates if weekly_flags.get(r["symbol"]) is not False]
+        skipped = n_before - len(candidates)
+        if skipped and on_log:
+            on_log(f"  Skipped {skipped} known monthly-only names (cached); "
+                   f"fetching {len(candidates)} with weeklies.")
+    total = len(candidates)
+
     # One Schwab call per symbol covers every expiration through the horizon;
     # fetch all candidates concurrently behind the shared self-tuning limiter.
-    horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
+    base_horizon = requested_exp if requested_exp is not None else today + timedelta(days=dte_max)
+    # Symbols whose weekly status is still unknown need a wider chain so
+    # _has_weeklies can read Friday-to-Friday spacing; otherwise targeting the
+    # nearest expiration truncates the chain to a single date — e.g. the Thu 7/2
+    # expiration when 7/3 is the observed Independence Day holiday — and weekly
+    # names get wrongly rejected. Cached names just need the scan window.
+    wide_horizon = max(base_horizon, today + timedelta(days=_WEEKLIES_HORIZON_DAYS))
+
+    def _horizon_for(sym: str) -> date:
+        if weeklies_only and sym not in weekly_flags:
+            return wide_horizon
+        return base_horizon
+
     fetch_start = time.monotonic()
     fetched, limiter = _concurrent_fetch(
         [row["symbol"] for row in candidates],
-        lambda sym: _fetch_schwab_chain(client, sym, right, horizon),
+        lambda sym: _fetch_schwab_chain(client, sym, right, _horizon_for(sym)),
         workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
         on_progress=on_progress, stop_flag=stop_flag)
     if fetched is None:                              # user stopped
@@ -1007,10 +1065,16 @@ def run_options_filter(
             continue
 
         available = sorted(chains)
-        if weeklies_only and not _has_weeklies(available, today):
-            if on_log:
-                on_log(f"  {sym}: no weekly options — skipped")
-            continue
+        if weeklies_only:
+            has_w = weekly_flags.get(sym)
+            if has_w is None:                       # first time we've seen this symbol
+                has_w = _has_weeklies(available, today)
+                weekly_flags[sym] = has_w
+                weekly_dirty = True
+            if not has_w:
+                if on_log:
+                    on_log(f"  {sym}: no weekly options — skipped")
+                continue
 
         if requested_exp is not None:
             exp = snap_expiration(requested_exp, available)
@@ -1081,6 +1145,8 @@ def run_options_filter(
                     "delta":      delta,
                 })
 
+    if weekly_dirty:
+        _save_weeklies_cache(weekly_flags)
     return results
 
 
