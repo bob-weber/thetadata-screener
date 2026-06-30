@@ -112,6 +112,27 @@ def price_history_daily(client: Client, symbol: str, *,
         symbol, start_datetime=start, end_datetime=end))
 
 
+_INTRADAY_METHODS = {
+    1:  "get_price_history_every_minute",
+    5:  "get_price_history_every_five_minutes",
+    10: "get_price_history_every_ten_minutes",
+    15: "get_price_history_every_fifteen_minutes",
+    30: "get_price_history_every_thirty_minutes",
+}
+
+
+def price_history_intraday(client: Client, symbol: str, *, minutes: int = 30,
+                           start=None, end=None, extended_hours=False) -> dict:
+    """Intraday candles at a 1/5/10/15/30-minute interval (start/end are datetimes)."""
+    try:
+        method = getattr(client, _INTRADAY_METHODS[minutes])
+    except KeyError:
+        raise ValueError(f"Unsupported intraday interval: {minutes} min "
+                         f"(use one of {sorted(_INTRADAY_METHODS)})")
+    return _json(method(symbol, start_datetime=start, end_datetime=end,
+                        need_extended_hours_data=extended_hours))
+
+
 # ── First-run login / smoke test ──────────────────────────────────────────────
 
 if __name__ == "__main__":

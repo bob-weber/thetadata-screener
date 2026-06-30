@@ -130,27 +130,73 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-def calc_rsi(closes: pd.Series, period: int = 14) -> float:
-    delta    = closes.diff().dropna()
+def calc_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI as a full series (NaN until `period` bars have accumulated)."""
+    delta    = closes.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     rs       = avg_gain / avg_loss.replace(0, np.nan)
-    rsi      = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    return 100 - (100 / (1 + rs))
+
+
+def calc_bb_bands(closes: pd.Series, period: int = 20,
+                  std_mult: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands as (middle SMA, upper, lower) series."""
+    sma   = closes.rolling(period).mean()
+    std   = closes.rolling(period).std(ddof=0)
+    return sma, sma + std_mult * std, sma - std_mult * std
+
+
+def calc_rsi(closes: pd.Series, period: int = 14) -> float:
+    return float(calc_rsi_series(closes.dropna(), period).iloc[-1])
 
 
 def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> float:
-    sma   = closes.rolling(period).mean()
-    std   = closes.rolling(period).std(ddof=0)
-    upper = sma + std_mult * std
-    lower = sma - std_mult * std
+    _, upper, lower = calc_bb_bands(closes, period, std_mult)
     price = closes.iloc[-1]
     u, l  = upper.iloc[-1], lower.iloc[-1]
     if (u - l) == 0:
         return 50.0
     return float((price - l) / (u - l) * 100)
+
+
+def fetch_history_df(symbol: str, days: int = 180,
+                     intraday_minutes: int | None = None) -> pd.DataFrame:
+    """OHLCV history for one symbol as a DataFrame indexed by timestamp.
+
+    Used by the chart window. ``intraday_minutes`` (1/5/10/15/30) requests
+    intraday candles for the short timeframes; None gives daily candles. Pulls
+    ``days`` of lookback so the 20-bar Bollinger Bands and 14-bar RSI can warm
+    up. Requires a cached Schwab token (no interactive login on the GUI thread).
+    Raises ScreenerError if the token is missing or the symbol returns no candles.
+    """
+    from core import schwab_client
+    try:
+        client = schwab_client.get_client(interactive=False)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise ScreenerError(
+            "Schwab authentication required. Run "
+            "'gui-env/bin/python -m core.schwab_client login' once, then retry."
+        ) from e
+
+    start = datetime.now() - timedelta(days=days)
+    if intraday_minutes:
+        data = schwab_client.price_history_intraday(
+            client, symbol, minutes=intraday_minutes, start=start)
+    else:
+        data = schwab_client.price_history_daily(client, symbol, start=start)
+    candles = [c for c in data.get("candles", []) if c.get("close") is not None]
+    if not candles:
+        raise ScreenerError(f"No price history for {symbol}.")
+
+    df = pd.DataFrame(candles)
+    # Schwab stamps candles in UTC epoch ms; show them in Eastern wall-clock time
+    # (so intraday axes read 9:30–16:00), then drop the tz for clean plotting.
+    df["dt"] = (pd.to_datetime(df["datetime"], unit="ms", utc=True)
+                  .dt.tz_convert("America/New_York").dt.tz_localize(None))
+    return df.set_index("dt")[["open", "high", "low", "close", "volume"]].sort_index()
 
 
 def fetch_stock_prices(

@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QGuiApplication
 
 from .claude_dialog import ClaudeAnalysisDialog
+from .chart_window import ChartWindow
 
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
@@ -20,6 +21,9 @@ _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct", "c
 _HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium", "OTM%", "Capital",
             "Sector", "Beta", "Mkt Cap ($B)",
             "Earnings Date", "In Period?", "Flags", "Notes"]
+
+_SYMBOL_COL = _COLS.index("symbol")
+_LINK_COLOR = "#58a6ff"  # light blue link, legible on the dark table background
 
 _GRADE_COLORS = {
     "A": ("#1a7a1a", "#e6ffe6"),  # dark green text, light green bg
@@ -57,6 +61,7 @@ class LsoAnalysisTab(QWidget):
         self._results_box = None
         self._table       = None
         self._results     = []
+        self._chart_windows = []   # keep refs so non-modal charts aren't GC'd
         self._setup_ui()
         self.refresh_options_status()
 
@@ -147,6 +152,7 @@ class LsoAnalysisTab(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setWordWrap(True)
         self._table.itemDoubleClicked.connect(self._on_double_click)
+        self._table.cellClicked.connect(self._on_cell_clicked)
         rl.addWidget(self._table)
         splitter.addWidget(self._results_box)
 
@@ -197,6 +203,20 @@ class LsoAnalysisTab(QWidget):
         self._stop_btn.setEnabled(False)
         self._log.append(f"ERROR: {msg}")
         self._status_label.setText("Error — see log.")
+
+    def _on_cell_clicked(self, row: int, col: int):
+        """Single-click on the (link-styled) Symbol cell opens its chart."""
+        if col != _SYMBOL_COL:
+            return
+        item = self._table.item(row, col)
+        symbol = item.text().strip() if item else ""
+        if not symbol:
+            return
+        win = ChartWindow(symbol, self)
+        win.finished.connect(lambda _=None, w=win: self._chart_windows.remove(w)
+                             if w in self._chart_windows else None)
+        self._chart_windows.append(win)
+        win.show()
 
     def _on_double_click(self, item: QTableWidgetItem):
         grade_item = self._table.item(item.row(), _COLS.index("grade"))
@@ -287,6 +307,13 @@ class LsoAnalysisTab(QWidget):
                     item.setForeground(QColor(fg))
                     item.setBackground(QColor(bg))
                     item.setData(Qt.ItemDataRole.UserRole, row)
+                elif key == "symbol":
+                    item = QTableWidgetItem(str(val) if val is not None else "")
+                    item.setForeground(QColor(_LINK_COLOR))
+                    font = item.font()
+                    font.setUnderline(True)
+                    item.setFont(font)
+                    item.setToolTip("Click to open price / BB / RSI chart")
                 elif key == "stock_price" and val is not None:
                     item = _SortItem(f"${float(val):.2f}", float(val))
                 elif key == "strike" and val is not None:
