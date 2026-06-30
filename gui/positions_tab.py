@@ -7,12 +7,12 @@ from collections import Counter
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout,
     QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel, QFileDialog, QMessageBox,
-    QAbstractItemView,
+    QAbstractItemView, QApplication,
 )
 
 from .account_store import DEFAULT_ACCT, events_path
@@ -26,6 +26,7 @@ SUPERSEDED_FILE  = Path("my_option_superseded.json")     # legacy (pre-lifecycle
 #                                "hidden" = stored but not shown (used for calc)
 _OPT_COLUMNS = [
     ("symbol",     "Symbol",            "edit"),
+    ("market",     "Market",            "calc"),   # live underlying price (yfinance)
     ("opened",     "Opened",            "edit"),
     ("lifecycle",  "Lifecycle",         "edit"),   # Put → Assigned → Sold, etc.
     ("qty",        "Qty",               "edit"),
@@ -46,6 +47,7 @@ def _oc(field: str) -> int:
     return _OPT_FIELDS.index(field)
 
 _O_SYM_COL       = _oc("symbol")
+_O_MARKET_COL    = _oc("market")
 _O_LIFECYCLE_COL = _oc("lifecycle")
 _O_STRIKE_COL    = _oc("strike")
 _O_CB_COL        = _oc("cost_basis")
@@ -69,6 +71,34 @@ class _StatusItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+def _fmt_price(price) -> str:
+    """Format a live underlying price; '…' means a fetch is still pending."""
+    if price is None:
+        return "…"
+    try:
+        return f"${float(price):,.2f}"
+    except (TypeError, ValueError):
+        return "…"
+
+
+class _PriceWorker(QThread):
+    """Fetch current underlying prices via yfinance off the UI thread."""
+    done = pyqtSignal(int, dict)   # (generation, {symbol: price})
+
+    def __init__(self, symbols: list[str], generation: int):
+        super().__init__()
+        self._symbols    = symbols
+        self._generation = generation
+
+    def run(self):
+        from core.screener import fetch_stock_prices
+        try:
+            rows = fetch_stock_prices(self._symbols)
+        except Exception:
+            rows = []
+        self.done.emit(self._generation, {r["symbol"]: r["price"] for r in rows})
+
+
 class PortfolioTab(QWidget):
     csv_imported    = pyqtSignal(str, str)   # (file path, account) after a successful import
     account_changed = pyqtSignal(str)        # account label text
@@ -80,7 +110,20 @@ class PortfolioTab(QWidget):
         self._range_sel  = None   # None → all time; int → days back; "custom"
         self._range_from = None   # ISO date string when custom
         self._range_to   = None
+        self._price_cache   = {}    # {symbol: price} for the session
+        self._price_workers = []    # keep refs so running threads aren't GC'd mid-run
+        self._price_gen     = 0     # bumped per fetch; stale results are ignored
         self._setup_ui()
+
+        # Wait out any in-flight price fetch on exit so a still-running QThread
+        # isn't destroyed mid-run (which aborts the process).
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_price_workers)
+
+    def _stop_price_workers(self):
+        for w in list(self._price_workers):
+            w.wait(3000)
 
     def _read_events(self, acct: str) -> tuple[list[dict], dict]:
         """Load one account's stored events/outcomes (empty if it has none yet)."""
@@ -141,6 +184,43 @@ class PortfolioTab(QWidget):
         self._opt_table.setSortingEnabled(True)
         self._opt_table.sortByColumn(_O_STATUS_COL, Qt.SortOrder.AscendingOrder)
         self._opt_table.resizeColumnsToContents()
+        self._refresh_market_prices()
+
+    # ── Live market prices ──────────────────────────────────────────────────────
+
+    def _refresh_market_prices(self):
+        """Fetch current underlying prices (uncached symbols only) in the background."""
+        symbols = set()
+        for r in range(self._opt_table.rowCount()):
+            it = self._opt_table.item(r, _O_SYM_COL)
+            if it and it.text().strip():
+                symbols.add(it.text().strip().upper())
+        missing = sorted(s for s in symbols if s not in self._price_cache)
+        if not missing:
+            return
+        self._price_gen += 1
+        worker = _PriceWorker(missing, self._price_gen)
+        worker.done.connect(self._on_prices_loaded)
+        worker.finished.connect(lambda w=worker: self._price_workers.remove(w)
+                                if w in self._price_workers else None)
+        self._price_workers.append(worker)
+        worker.start()
+
+    def _on_prices_loaded(self, generation: int, prices: dict):
+        if generation != self._price_gen:
+            return                                  # superseded by a newer fetch
+        self._price_cache.update(prices)
+        self._opt_table.setSortingEnabled(False)
+        for r in range(self._opt_table.rowCount()):
+            sym_it = self._opt_table.item(r, _O_SYM_COL)
+            if not sym_it:
+                continue
+            price = self._price_cache.get(sym_it.text().strip().upper())
+            mkt_it = self._opt_table.item(r, _O_MARKET_COL)
+            if mkt_it is not None:
+                mkt_it.setText(_fmt_price(price))
+        self._opt_table.setSortingEnabled(True)
+        self._opt_table.resizeColumnToContents(_O_MARKET_COL)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -185,12 +265,16 @@ class PortfolioTab(QWidget):
         self._opt_table.insertRow(row)
         d = data or {}
         for ci, field in enumerate(_OPT_FIELDS):
-            val = str(d.get(field, ""))
-            if field == "status":
+            if field == "market":
+                price = self._price_cache.get(d.get("symbol", ""))
+                item = self._make_item(_fmt_price(price), editable=False)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            elif field == "status":
+                val = str(d.get(field, ""))
                 item = _StatusItem(val)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             else:
-                item = self._make_item(val, editable=False)
+                item = self._make_item(str(d.get(field, "")), editable=False)
             self._opt_table.setItem(row, ci, item)
         return row
 
