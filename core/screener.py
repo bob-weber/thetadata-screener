@@ -122,6 +122,12 @@ class ScreenerError(Exception):
     pass
 
 
+_SCHWAB_AUTH_MSG = (
+    "Schwab login expired — the refresh token is invalid or has been revoked. "
+    "Re-run 'gui-env/bin/python -m core.schwab_client login', then retry."
+)
+
+
 def _fmt_elapsed(seconds: float) -> str:
     """Human-readable elapsed time, e.g. '45.2s' or '1m 23s'."""
     if seconds < 60:
@@ -261,7 +267,8 @@ def _fetch_schwab_chain(client, symbol: str, right: str, to_date: date) -> dict:
             continue
         rows = [
             {"strike": c.get("strikePrice"), "bid": c.get("bid"),
-             "ask": c.get("ask"), "delta": c.get("delta")}
+             "ask": c.get("ask"), "delta": c.get("delta"),
+             "iv": c.get("volatility")}          # annualized IV %, per contract
             for contracts in strikes.values() for c in contracts
         ]
         if rows:
@@ -527,6 +534,84 @@ def _save_weeklies_cache(flags: dict[str, bool], path: str | Path = WEEKLIES_CAC
     Path(path).write_text(json.dumps(flags))
 
 
+# ── Implied volatility: expected move (σ) and a self-calibrating IV-percentile store ─
+def _clean_iv(v) -> float | None:
+    """Coerce a Schwab per-contract IV to a usable annualized %, else None.
+
+    Schwab returns a sentinel (e.g. -999) for no-data and skew-inflated values in
+    the far-OTM tails (e.g. ~490% deep OTM); keep only plausible readings.
+    """
+    try:
+        iv = float(v)
+    except (TypeError, ValueError):
+        return None
+    return iv if 0 < iv <= 300 else None
+
+
+def _period_sigma_pct(iv_pct: float, dte: int) -> float | None:
+    """The underlying's expected move over ``dte`` days, as a %: IV × √(DTE/365)."""
+    if not iv_pct or dte <= 0:
+        return None
+    return iv_pct * (dte / 365.0) ** 0.5
+
+
+def _atm_iv(chain: pd.DataFrame, stock_price: float) -> float | None:
+    """Near-ATM IV of a chain — the strike closest to spot. Used as the underlying's
+    IV level (comparable across candidates), not the skew-inflated far-OTM IV."""
+    if "iv" not in chain.columns or not stock_price:
+        return None
+    df = chain.copy()
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df = df.dropna(subset=["strike"])
+    if df.empty:
+        return None
+    idx = (df["strike"] - stock_price).abs().idxmin()
+    return _clean_iv(df.loc[idx, "iv"])
+
+
+IV_HISTORY_FILE = "iv_history_cache.json"
+_IV_HISTORY_DAYS = 365          # trailing window for the IV percentile
+_IV_PCTILE_MIN_OBS = 5          # below this the percentile is too thin to trust
+
+
+def _load_iv_store(path: str | Path = IV_HISTORY_FILE) -> dict:
+    """Load the per-symbol near-ATM IV history as {symbol: {iso_date: iv_pct}}."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_iv_store(store: dict, path: str | Path = IV_HISTORY_FILE) -> None:
+    Path(path).write_text(json.dumps(store))
+
+
+def _record_iv(store: dict, symbol: str, iv_pct: float, ref: date) -> None:
+    """Record one near-ATM IV reading for today and prune anything older than a year."""
+    cutoff = (ref - timedelta(days=_IV_HISTORY_DAYS)).isoformat()
+    hist = {d: v for d, v in store.get(symbol, {}).items() if d >= cutoff}
+    hist[ref.isoformat()] = round(iv_pct, 2)
+    store[symbol] = hist
+
+
+def _iv_percentile(store: dict, symbol: str, iv_pct: float) -> float | None:
+    """Percent of the symbol's trailing-year IV readings at or below ``iv_pct``.
+
+    Self-calibrating: it only becomes meaningful once several scans have
+    accumulated, so returns None until there are at least a handful of readings.
+    """
+    hist = store.get(symbol, {})
+    vals = list(hist.values())
+    if len(vals) < _IV_PCTILE_MIN_OBS:
+        return None
+    at_or_below = sum(1 for v in vals if v <= iv_pct)
+    return round(at_or_below / len(vals) * 100, 1)
+
+
 class _RateLimiter:
     """Self-tuning global pacer for concurrent Schwab calls.
 
@@ -582,10 +667,13 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
     that returned (None values are dropped). ``results`` is None if the user
     stopped. Raises ScreenerError if hard-blocked with no progress for 30s.
     """
+    from core import schwab_client
     limiter = _RateLimiter(start_rate)
     results: dict = {}
+    auth_error = None   # set by any worker that hits an expired/revoked token
 
     def _worker(key):
+        nonlocal auth_error
         other_errors = 0
         for attempt in range(8):
             limiter.pace()
@@ -594,6 +682,9 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
                 limiter.recover()
                 return key, value
             except Exception as e:
+                if schwab_client.is_auth_error(e):  # expired token → fatal, stop the scan
+                    auth_error = e
+                    break
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if status in (429, 403):           # 429 burst, or 403 once Schwab escalates
                     limiter.hit(attempt)
@@ -614,6 +705,10 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
                 for f in futures:
                     f.cancel()
                 return None, limiter
+            if auth_error is not None:             # expired token → surface it, don't return empty
+                for f in futures:
+                    f.cancel()
+                raise ScreenerError(_SCHWAB_AUTH_MSG) from auth_error
             # Circuit breaker: rate-limited with no progress after 30s = hard block.
             if not results and limiter.hits and time.monotonic() - start > 30:
                 for f in futures:
@@ -723,8 +818,10 @@ def run_price_screen(
         batch = all_symbols[i:i + chunk]
         try:
             data = schwab_client.quotes(client, batch)
-        except Exception:
-            data = {}
+        except Exception as e:
+            if schwab_client.is_auth_error(e):
+                raise ScreenerError(_SCHWAB_AUTH_MSG) from e
+            data = {}   # tolerate a transient per-batch failure
 
         batch_qualified: list[dict] = []
         for sym in batch:
@@ -1058,6 +1155,8 @@ def run_options_filter(
     # never even fetch their chains; the rest are fetched and scanned below.
     weekly_flags = _load_weeklies_cache() if weeklies_only else {}
     weekly_dirty = False
+    iv_store = _load_iv_store()          # self-calibrating near-ATM IV history
+    iv_dirty = False
     if weeklies_only:
         n_before = len(candidates)
         candidates = [r for r in candidates if weekly_flags.get(r["symbol"]) is not False]
@@ -1134,11 +1233,25 @@ def run_options_filter(
         else:
             expirations = [e for e in available if dte_min <= (e - today).days <= dte_max]
 
+        sym_iv_pctile = None            # per-symbol IV percentile (recorded once, nearest exp)
+        sym_iv_recorded = False
         for exp in expirations:
-            chain = chains[exp]
-            if price_col not in chain.columns:
+            full_chain = chains[exp]
+            if price_col not in full_chain.columns:
                 continue
-            chain = chain.copy()
+            dte = (exp - today).days
+
+            # Near-ATM IV (from the full chain, before yield filtering): the
+            # underlying's expected move σ and its IV level for grading/percentile.
+            atm_iv    = _atm_iv(full_chain, stock_price)
+            sigma_pct = _period_sigma_pct(atm_iv, dte) if atm_iv else None
+            if atm_iv and not sym_iv_recorded:
+                sym_iv_pctile = _iv_percentile(iv_store, sym, atm_iv)  # vs prior readings
+                _record_iv(iv_store, sym, atm_iv, today)
+                iv_dirty = True
+                sym_iv_recorded = True
+
+            chain = full_chain.copy()
             chain[price_col] = pd.to_numeric(chain[price_col], errors="coerce")
             chain = chain[chain[price_col] > 0].dropna(subset=[price_col]).copy()
             if chain.empty:
@@ -1161,8 +1274,6 @@ def run_options_filter(
             if chain.empty:
                 continue
 
-            dte = (exp - today).days
-
             for _, opt in chain.iterrows():
                 try:
                     strike = round(float(opt["strike"]), 2)
@@ -1180,6 +1291,10 @@ def run_options_filter(
                 except (TypeError, ValueError):
                     otm_pct = None
 
+                # Cushion in σ at this strike: OTM% / the underlying's expected move.
+                cushion_sigma = (round(otm_pct / sigma_pct, 2)
+                                 if sigma_pct and otm_pct is not None else None)
+
                 results.append({
                     "symbol":     sym,
                     "expiration": exp.strftime("%Y-%m-%d"),
@@ -1189,10 +1304,16 @@ def run_options_filter(
                     "premium":    round(float(opt[price_col]), 2),
                     "yield_pct":  round(float(opt["yield_pct"]) * 100, 2),
                     "delta":      delta,
+                    "iv":            round(atm_iv, 1) if atm_iv else None,
+                    "sigma_pct":     round(sigma_pct, 2) if sigma_pct else None,
+                    "cushion_sigma": cushion_sigma,
+                    "iv_pctile":     sym_iv_pctile,
                 })
 
     if weekly_dirty:
         _save_weeklies_cache(weekly_flags)
+    if iv_dirty:
+        _save_iv_store(iv_store)
     return results
 
 
