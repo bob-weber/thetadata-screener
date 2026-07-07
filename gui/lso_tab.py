@@ -15,10 +15,12 @@ from .chart_window import ChartWindow
 
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
-_COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct", "capital",
+_COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct",
+            "iv", "sigma_pct", "cushion_sigma", "iv_pctile", "capital",
             "sector", "beta", "mkt_cap_b",
             "earnings_date", "earnings_in_period", "flags", "notes"]
-_HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium", "OTM%", "Capital",
+_HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium", "OTM%",
+            "IV%", "σ Move%", "Cushion σ", "IV %ile", "Capital",
             "Sector", "Beta", "Mkt Cap ($B)",
             "Earnings Date", "In Period?", "Flags", "Notes"]
 
@@ -249,8 +251,8 @@ class LsoAnalysisTab(QWidget):
             f"- Yield range: {meta.get('yield_min', 0)*100:.1f}% – {meta.get('yield_max', 0)*100:.1f}%",
             f"- Contracts: {len(self._results)}",
             f"",
-            f"| Grade | Symbol | Stock | Strike | Premium | OTM% | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
-            f"|-------|--------|-------|--------|---------|------|---------|--------|------|--------------|----------|-----------|-------|-------|",
+            f"| Grade | Symbol | Stock | Strike | Premium | OTM% | IV% | σ Move% | Cushion σ | IV %ile | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
+            f"|-------|--------|-------|--------|---------|------|-----|---------|-----------|---------|---------|--------|------|--------------|----------|-----------|-------|-------|",
         ]
 
         sorted_results = sorted(
@@ -274,6 +276,10 @@ class LsoAnalysisTab(QWidget):
                 _v("strike",      "$", "", ".2f"),
                 _v("premium",     "",  "%", ".2f"),
                 _v("otm_pct",     "",  "%", ".1f"),
+                _v("iv",            "",  "%", ".0f"),
+                _v("sigma_pct",     "",  "%", ".1f"),
+                _v("cushion_sigma", "",  "σ", ".2f"),
+                _v("iv_pctile",     "",  "%", ".0f"),
                 cap_str,
                 r.get("sector", ""),
                 _v("beta",        "",  "", ".2f"),
@@ -322,6 +328,18 @@ class LsoAnalysisTab(QWidget):
                     item = _SortItem(f"{float(val):.2f}%", float(val))
                 elif key == "otm_pct" and val is not None:
                     item = _SortItem(f"{float(val):.1f}%", float(val))
+                elif key == "iv":
+                    item = _SortItem(f"{float(val):.0f}%" if val is not None else "—",
+                                     float(val) if val is not None else -1.0)
+                elif key == "sigma_pct":
+                    item = _SortItem(f"{float(val):.1f}%" if val is not None else "—",
+                                     float(val) if val is not None else -1.0)
+                elif key == "cushion_sigma":
+                    item = _SortItem(f"{float(val):.2f}σ" if val is not None else "—",
+                                     float(val) if val is not None else -99.0)
+                elif key == "iv_pctile":
+                    item = _SortItem(f"{float(val):.0f}%" if val is not None else "—",
+                                     float(val) if val is not None else -1.0)
                 elif key == "capital" and val is not None:
                     item = _SortItem(f"${int(val):,}", float(val))
                 elif key == "beta" and val is not None:

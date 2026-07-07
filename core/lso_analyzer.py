@@ -95,8 +95,67 @@ def _score_otm(otm_pct: float) -> tuple[int, str, str | None]:
     ), "WIDE OTM"
 
 
-def apply_contract_adjustments(result: dict, otm_pct: float | None) -> dict:
-    """Re-score and re-grade a symbol result for a specific contract's OTM%."""
+def _score_sigma_cushion(cushion_sigma: float | None, gappy: bool) -> tuple[int, str, str | None]:
+    """Primary volatility-adjusted gate: OTM cushion measured in expected-moves (σ).
+
+    Require ≥1σ (≥1.5σ for gappy names — earnings in period, or geopolitical-
+    commodity sectors). Below the threshold the premium isn't paying for the risk.
+    """
+    if cushion_sigma is None:
+        return 0, "σ-cushion unavailable (no IV data)", None
+    need = 1.5 if gappy else 1.0
+    if cushion_sigma < need:
+        extra = " (gappy name → needs 1.5σ)" if gappy else ""
+        return -30, (
+            f"Cushion {cushion_sigma:.2f}σ < {need:g}σ{extra} — premium isn't "
+            "paying for the risk; assignment takes only a normal move"
+        ), f"SUB-{need:g}σ"
+    if cushion_sigma < 1.5:
+        return 0, f"Cushion {cushion_sigma:.2f}σ — adequate (≥1σ)", None
+    return +5, f"Cushion {cushion_sigma:.2f}σ — strong (≥1.5σ)", None
+
+
+def _score_iv(iv_pct: float | None) -> tuple[int, str, str | None]:
+    """Absolute IV band for management viability (roll/CC premium in every phase)."""
+    if not iv_pct:
+        return 0, "", None
+    if iv_pct < 25:
+        return -15, (
+            f"IV {iv_pct:.0f}% < 25% — grinder: thin premium to enter, roll, "
+            "and sell covered calls if assigned"
+        ), "LOW IV"
+    if iv_pct <= 80:
+        return 0, f"IV {iv_pct:.0f}% — normal working range", None
+    return -8, (
+        f"IV {iv_pct:.0f}% > 80% — rich premium but size down and treat "
+        "gappiness seriously"
+    ), "HIGH IV"
+
+
+def _score_iv_pctile(iv_pctile: float | None) -> tuple[int, str, str | None]:
+    """Timing: prefer selling when IV is rich vs. the name's own trailing year."""
+    if iv_pctile is None:
+        return 0, "", None
+    if iv_pctile >= 67:
+        return +3, f"IV percentile {iv_pctile:.0f}% — elevated; premium rich, likely to compress in your favor", None
+    if iv_pctile <= 33:
+        return -3, f"IV percentile {iv_pctile:.0f}% — low vs. its own year; premium light right now", None
+    return 0, f"IV percentile {iv_pctile:.0f}% — mid-range", None
+
+
+def apply_contract_adjustments(
+    result: dict,
+    otm_pct: float | None,
+    *,
+    iv: float | None = None,
+    cushion_sigma: float | None = None,
+    iv_pctile: float | None = None,
+) -> dict:
+    """Re-score and re-grade a symbol result for a specific contract.
+
+    Layers the OTM% band, the σ-cushion gate (primary), the absolute IV band, and
+    the IV-percentile timing signal on top of the symbol's fundamental score.
+    """
     if otm_pct is None:
         return result
 
@@ -107,16 +166,32 @@ def apply_contract_adjustments(result: dict, otm_pct: float | None) -> dict:
     flag_list = [] if flags_str == "—" else flags_str.split(" | ")
     note_list = [] if notes_str == "No major concerns" else notes_str.split(" • ")
 
-    adj, note, flag = _score_otm(otm_pct)
-    if flag:
-        flag_list.append(flag)
-    note_list.append(note)
+    # "Gappy" → require a wider (1.5σ) cushion: earnings inside the period, or a
+    # geopolitical-commodity sector (per the strategy's gappiness overlay).
+    gappy = bool(result.get("earnings_in_period")) or \
+        result.get("sector") in ("Energy", "Basic Materials")
 
-    new_score = max(0, min(100, score + adj))
+    total_adj = 0
+    for adj, note, flag in (
+        _score_otm(otm_pct),
+        _score_sigma_cushion(cushion_sigma, gappy),
+        _score_iv(iv),
+        _score_iv_pctile(iv_pctile),
+    ):
+        total_adj += adj
+        if flag:
+            flag_list.append(flag)
+        if note:
+            note_list.append(note)
+
+    new_score = max(0, min(100, score + total_adj))
     return {
         **result,
         "score": new_score,
         "grade": _score_to_grade(new_score),
+        "iv":            iv,
+        "cushion_sigma": cushion_sigma,
+        "iv_pctile":     iv_pctile,
         "flags": " | ".join(flag_list) if flag_list else "—",
         "notes": " • ".join(note_list) if note_list else "No major concerns",
     }

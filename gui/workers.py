@@ -300,13 +300,19 @@ class LsoWorker(QThread):
                 otm_pct = round((stock_price - strike) / stock_price * 100, 2)
             else:
                 otm_pct = contract.get("otm_pct")
-            adjusted = apply_contract_adjustments(sym_analysis[sym], otm_pct)
+            adjusted = apply_contract_adjustments(
+                sym_analysis[sym], otm_pct,
+                iv=contract.get("iv"),
+                cushion_sigma=contract.get("cushion_sigma"),
+                iv_pctile=contract.get("iv_pctile"),
+            )
             merged.append({
                 **adjusted,
                 "stock_price": stock_price,
                 "strike":      strike,
                 "premium":     contract.get("yield_pct"),
                 "otm_pct":     otm_pct,
+                "sigma_pct":     contract.get("sigma_pct"),
                 "capital":     round(strike * 100) if strike is not None else None,
             })
 
