@@ -319,15 +319,25 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     }
 
 
-# Option leg description parsers (capture: action, qty, to-open expiration,
-# strike, type). Calendar rolls list the to-open expiration first, then /to-close.
+# Option leg description parsers (capture: action, qty, symbol, to-open
+# expiration, strike, type). Calendar/diagonal rolls list the to-open
+# expiration first, then /to-close; diagonals also carry a to-close strike
+# (captured separately since a strike change means a different collateral key).
 _OPT_CAL_RE = re.compile(
-    r'\b(SOLD|BOT)\s+([+-]?\d+)\s+CALENDAR\s+\S+\s+100.*?'
-    r'(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
-    r'\s+([\d.]+)\s+(PUT|CALL)', re.IGNORECASE)
+    r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+CALENDAR\s+(?P<symbol>\S+)\s+100.*?'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
+    r'\s+(?P<strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
+_OPT_DIAG_RE = re.compile(
+    r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+DIAGONAL\s+(?P<symbol>\S+)\s+100.*?'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
+    r'\s+(?P<strike>[\d.]+)/(?P<close_strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
+_OPT_VERT_RE = re.compile(
+    r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+VERTICAL\s+(?P<symbol>\S+)\s+100.*?'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
+    r'\s+(?P<strike>[\d.]+)/[\d.]+\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 _OPT_SINGLE_RE = re.compile(
-    r'\b(SOLD|BOT)\s+([+-]?\d+)\s+\S+\s+100.*?'
-    r'(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})\s+([\d.]+)\s+(PUT|CALL)', re.IGNORECASE)
+    r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+(?P<symbol>\S+)\s+100.*?'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})\s+(?P<strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 
 
 def _parse_exp_date(s: str) -> date | None:
@@ -340,19 +350,33 @@ def _parse_exp_date(s: str) -> date | None:
 
 
 def _parse_opt_leg(desc: str) -> dict | None:
-    m = _OPT_CAL_RE.search(desc) or _OPT_SINGLE_RE.search(desc)
+    m = _OPT_CAL_RE.search(desc)
+    is_roll = m is not None
+    if m is None:
+        m = _OPT_DIAG_RE.search(desc)
+        is_roll = m is not None
+    if m is None:
+        m = _OPT_VERT_RE.search(desc)
+    if m is None:
+        m = _OPT_SINGLE_RE.search(desc)
     if not m:
         return None
-    exp = _parse_exp_date(m.group(3))
+    exp = _parse_exp_date(m.group("exp"))
     if exp is None:
         return None
-    return {
-        "action": m.group(1).upper(),
-        "qty":    int(m.group(2)),
-        "exp":    exp,
-        "strike": float(m.group(4)),
-        "type":   m.group(5).upper(),
+    leg = {
+        "action":  m.group("action").upper(),
+        "qty":     int(m.group("qty")),
+        "symbol":  m.group("symbol").upper(),
+        "exp":     exp,
+        "strike":  float(m.group("strike")),
+        "type":    m.group("type").upper(),
+        "is_roll": is_roll,
     }
+    groups = m.groupdict()
+    if groups.get("close_strike"):
+        leg["close_strike"] = float(groups["close_strike"])
+    return leg
 
 
 def _bdays(start: date, end: date) -> list[date]:
@@ -401,14 +425,21 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
                           range_to: str | None) -> dict | None:
     """Weekly return on capital actually deployed in trades.
 
-    Realized per day = option premium accrued evenly across the business days a
-    leg is open (trade date → to-open expiration) PLUS stock-sale gain/loss
-    (avg-cost) booked on the sale day. Capital at risk = short-put collateral
-    (strike×100×qty) on each open day; a week's allocated is the average over
-    days a position is open. Weekly RoR = weekly realized / weekly allocated.
+    Both premium accrual and capital-at-risk are tracked per (symbol, strike,
+    type) chain over time, walked chronologically: each event's window ends
+    where the next event for that same chain begins, instead of running to its
+    own original/far expiration — so a leg rolled again next week stops
+    accruing premium and collateral once it's actually rolled, rather than
+    both stacking with whatever replaced it. Only the most recent event in a
+    chain (nothing rolled/closed it yet) still projects forward to its own
+    parsed expiration, since we don't know if/when it'll be rolled again.
+    Premium is accrued evenly across a window's business days; capital at risk
+    is short-put collateral (strike×100×qty) on each open day. A week's
+    allocated is the average over days a position is open. Weekly RoR = weekly
+    realized / weekly allocated.
     """
-    daily_prem:   dict[date, float] = {}
-    daily_collat: dict[date, float] = {}
+    legs_by_key: dict[tuple[str, float, str], list[tuple[date, dict]]] = {}
+
     for t in data.get("opt_trades", []):
         leg = _parse_opt_leg(t.get("desc", ""))
         if not leg:
@@ -417,13 +448,70 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
             trade_d = date.fromisoformat(t["date"])
         except Exception:
             continue
-        bdays   = _bdays(trade_d, leg["exp"])
-        per_day = t["amount"] / len(bdays)
-        collat  = (leg["strike"] * 100 * abs(leg["qty"])
-                   if leg["type"] == "PUT" and leg["action"] == "SOLD" else 0.0)
-        for d in bdays:
-            daily_prem[d] = daily_prem.get(d, 0.0) + per_day
-            if collat:
+        leg["amount"] = t["amount"]
+        legs_by_key.setdefault((leg["symbol"], leg["strike"], leg["type"]), []).append(
+            (trade_d, leg))
+        # A diagonal roll also closes out the to-close leg's *different*
+        # strike, which lives under a separate key and would otherwise never
+        # learn its position was rolled away — inject a synthetic close (no
+        # premium of its own; the row's amount is already booked above) so
+        # that chain's window ends here instead of stacking with the new leg.
+        close_strike = leg.get("close_strike")
+        if close_strike is not None and close_strike != leg["strike"]:
+            closing_leg = {
+                "action": "BOT", "qty": leg["qty"], "symbol": leg["symbol"],
+                "exp": trade_d, "strike": close_strike, "type": leg["type"],
+                "is_roll": False, "amount": 0.0,
+            }
+            legs_by_key.setdefault(
+                (leg["symbol"], close_strike, leg["type"]), []).append(
+                (trade_d, closing_leg))
+
+    # Walk each (symbol, strike, type) chain chronologically. A roll
+    # (CALENDAR/DIAGONAL) closes the prior leg and opens the new one in the
+    # same order, so it replaces the open quantity outright rather than adding
+    # to it; a plain SOLD/BOT adjusts the running quantity instead.
+    daily_prem:   dict[date, float] = {}
+    daily_collat: dict[date, float] = {}
+    for events in legs_by_key.values():
+        events.sort(key=lambda e: e[0])
+        open_qty = 0
+        for i, (ev_date, leg) in enumerate(events):
+            if leg["is_roll"] and leg["action"] == "SOLD":
+                open_qty = abs(leg["qty"])
+            elif leg["action"] == "SOLD":
+                open_qty += abs(leg["qty"])
+            else:  # BOT — closes contracts
+                open_qty = max(open_qty - abs(leg["qty"]), 0)
+
+            next_date = events[i + 1][0] if i + 1 < len(events) else None
+            same_day_superseded = next_date is not None and next_date <= ev_date
+            # The premium window always collapses to at least ev_date itself
+            # (via _bdays's own start/end clamp) even when superseded same-day,
+            # so every trade's cash is booked somewhere — it's never dropped.
+            # A last event that leaves nothing open (a close with no later
+            # roll) has nothing left to project forward — it books entirely on
+            # its own trade date rather than smoothing out to its parsed
+            # expiration, which is only a meaningful projection while a
+            # position is still actually open.
+            if next_date is not None:
+                window_end = min(next_date - timedelta(days=1), leg["exp"])
+            elif open_qty > 0:
+                window_end = leg["exp"]
+            else:
+                window_end = ev_date
+            bdays   = _bdays(ev_date, window_end)
+            per_day = leg["amount"] / len(bdays)
+            for d in bdays:
+                daily_prem[d] = daily_prem.get(d, 0.0) + per_day
+
+            # Collateral, unlike premium, is skipped for a same-day-superseded
+            # leg — it never carried overnight risk, so it shouldn't stack with
+            # whatever replaced it on that same day.
+            if same_day_superseded or open_qty <= 0 or leg["type"] != "PUT":
+                continue
+            collat = leg["strike"] * 100 * open_qty
+            for d in bdays:
                 daily_collat[d] = daily_collat.get(d, 0.0) + collat
 
     # Stock realized gain/loss, all on the day of sale.
@@ -787,7 +875,7 @@ class WeeklyRorTab(QWidget):
         for bar, alloc, r in zip(bars_r, allocated, ror):
             if alloc <= 0:
                 continue
-            label = f"${alloc/1000:.0f}k" if alloc >= 1000 else f"${alloc:.0f}"
+            label = f"${alloc/1000:.1f}k" if alloc >= 1000 else f"${alloc:.0f}"
             self._ax_r.annotate(
                 label, (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                 xytext=(0, 4 if r >= 0 else -4), textcoords="offset points",
