@@ -152,29 +152,39 @@ def login() -> Client:
         "Paste the https://127.0.0.1/...?code=... address here, then press Enter> "
     ).strip()
 
+    # authlib's fetch_token silently falls back to a *client_credentials* grant
+    # when the pasted URL has no '?code=' — that returns an app-only token with
+    # NO refresh token (1-hour, dies with nothing to refresh), yet raises no
+    # error because Schwab's market-data endpoints accept it. Reject a code-less
+    # URL up front so a mis-paste can't masquerade as a successful login.
+    if "code=" not in received:
+        raise ValueError(
+            "That address has no '?code=...' in it. Pasting it would silently "
+            "produce a 1-hour app-only token (no refresh token), so login is "
+            "aborted. Re-run login: after you click Allow, copy the FULL URL "
+            "from the browser's ADDRESS BAR — it must contain '?code='."
+        )
+
     client = auth.client_from_received_url(
         creds["app_key"], creds["app_secret"], ctx, received, _write_token_file)
 
-    # Schwab's Market Data Production API issues only a 1-hour access token —
-    # no refresh token. Check what we got and warn the user accordingly.
+    # A proper authorization-code login returns a ~7-day refresh token. If it's
+    # missing, the exchange did not complete as an authorization_code grant —
+    # surface that loudly rather than treating it as normal.
     try:
         inner = _read_token_file().get("token") or {}
         saved_rt = inner.get("refresh_token")
-        expires_in = int(inner.get("expires_in", 3600))
     except Exception:
         saved_rt = None
-        expires_in = 3600
 
     if saved_rt:
-        print(f"\nLogin successful. Refresh token saved — session lasts ~7 days.")
+        print("\nLogin successful. Refresh token saved — session lasts ~7 days.")
     else:
-        import math
-        hours = math.floor(expires_in / 3600)
-        mins  = (expires_in % 3600) // 60
-        dur   = f"{hours}h {mins}m" if hours else f"{mins}m"
-        print(f"\nLogin successful. Access token expires in ~{dur}.")
-        print("This app is registered as Market Data Production, which does not")
-        print("issue refresh tokens. Re-run login once the session expires.")
+        print("\nWARNING: login returned NO refresh token — you have a 1-hour")
+        print("app-only token. This means the OAuth exchange fell back to a")
+        print("client-credentials grant (the redirect URL likely lacked '?code=').")
+        print("Re-run login and paste the FULL 'https://127.0.0.1/...?code=...'")
+        print("address from the browser's address bar after clicking Allow.")
 
     return client
 
