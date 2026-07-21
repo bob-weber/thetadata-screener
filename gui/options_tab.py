@@ -19,11 +19,11 @@ CANDIDATES_CACHE = Path("tech_candidates_cache.json")
 OPTIONS_CACHE    = Path("options_results_cache.json")
 
 _COLS    = ["symbol", "expiration", "dte", "strike", "otm_pct", "premium", "yield_pct",
-            "delta", "iv", "sigma_pct", "cushion_sigma", "iv_pctile"]
+            "delta", "iv", "cushion_sigma", "iv_pctile"]
 _HEADERS = ["Symbol", "Expiration", "DTE", "Strike", "OTM%", "Premium", "Yield%",
-            "Delta", "IV%", "σ Move%", "Cushion σ", "IV %ile"]
+            "Delta", "IV%", "Cushion σ", "IV %ile"]
 _FLOAT_COLS = {"strike", "otm_pct", "premium", "yield_pct", "delta",
-               "iv", "sigma_pct", "cushion_sigma", "iv_pctile"}
+               "iv", "cushion_sigma", "iv_pctile"}
 _INT_COLS   = {"dte"}
 
 

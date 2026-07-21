@@ -312,7 +312,6 @@ class LsoWorker(QThread):
                 "strike":      strike,
                 "premium":     contract.get("yield_pct"),
                 "otm_pct":     otm_pct,
-                "sigma_pct":     contract.get("sigma_pct"),
                 "capital":     round(strike * 100) if strike is not None else None,
             })
 
