@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ToS Returns
+Comment=Portfolio tracker — positions, P&L, and weekly RoR from TOS statements
+Exec=/home/bob/Tresorit/ngData/srcCode/lso-tools/gui-env/bin/python /home/bob/Tresorit/ngData/srcCode/lso-tools/run_portfolio.py
+Path=/home/bob/Tresorit/ngData/srcCode/lso-tools
+Icon=/home/bob/Tresorit/ngData/srcCode/lso-tools/bar-chart-increasing.png
+Terminal=false
+StartupWMClass=tos-returns
+Categories=Office;Finance;
