@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import re
+from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -177,6 +178,32 @@ def _merge(existing: list[dict], new: list[dict], key_fn) -> int:
     return added
 
 
+def _merge_counted(existing: list[dict], new: list[dict], key_fn) -> int:
+    """Merge by multiplicity rather than presence. Returns count added.
+
+    One order can fill in pieces that share a date, description and amount —
+    "SOLD -2 CALENDAR RUN ... @.33" twice is two fills, not a repeat. A
+    statement is complete for its date range, so every fill it lists is kept,
+    while an overlapping statement (which repeats fills already stored) only
+    tops the count up to the higher of the two instead of double-counting.
+    """
+    have = Counter(key_fn(e) for e in existing)
+    want: Counter = Counter()
+    templates: dict = {}
+    for e in new:
+        k = key_fn(e)
+        want[k] += 1
+        templates.setdefault(k, e)
+
+    added = 0
+    for k, n in want.items():
+        for _ in range(n - have.get(k, 0)):
+            existing.append(dict(templates[k]))
+            added += 1
+    existing.sort(key=lambda e: e["date"])
+    return added
+
+
 def merge_statement(data: dict, parsed: dict) -> dict:
     """Merge a parsed statement into accumulated history. Returns counts added."""
     return {
@@ -184,10 +211,10 @@ def merge_statement(data: dict, parsed: dict) -> dict:
                              lambda e: e["ref"] or (e["date"], e["amount"])),
         "balances":   _merge(data["balances"],   parsed["balances"],
                              lambda e: e["date"]),
-        "opt_trades": _merge(data["opt_trades"], parsed["opt_trades"],
-                             lambda e: (e["date"], e["desc"], e["amount"])),
-        "stk_trades": _merge(data["stk_trades"], parsed["stk_trades"],
-                             lambda e: (e["date"], e["desc"], e["amount"])),
+        "opt_trades": _merge_counted(data["opt_trades"], parsed["opt_trades"],
+                                     lambda e: (e["date"], e["desc"], e["amount"])),
+        "stk_trades": _merge_counted(data["stk_trades"], parsed["stk_trades"],
+                                     lambda e: (e["date"], e["desc"], e["amount"])),
     }
 
 
@@ -379,6 +406,42 @@ def _parse_opt_leg(desc: str) -> dict | None:
     return leg
 
 
+def _net_same_day_rolls(legs: list[tuple[date, dict]]) -> None:
+    """Fold a same-day closing BOT into the SOLD leg that replaces it, in place.
+
+    A roll placed as one order arrives as a single CALENDAR/DIAGONAL row that
+    already carries its net credit, but the same roll placed as two orders
+    arrives as a separate buy-to-close and sell-to-open. Left alone the debit
+    books entirely on its trade day (a close that leaves nothing open projects
+    nothing forward) while the credit paying for it accrues out to the new
+    expiration — so rolling far out reads as a large loss this week and a
+    windfall weeks later. Pairing them by symbol and option type, preferring an
+    exact quantity match, books the roll as the one net credit or debit it
+    actually was, over the new leg's window. Strike is deliberately not part of
+    the match: a roll down or up is still a roll. A close with no same-day open
+    is a genuine exit and keeps booking on its own day.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for trade_d, leg in legs:
+        if leg["is_roll"]:
+            continue                     # already a net roll row
+        groups.setdefault((trade_d, leg["symbol"], leg["type"]), []).append(leg)
+
+    for group in groups.values():
+        closes = [l for l in group if l["action"] == "BOT"]
+        opens  = [l for l in group if l["action"] == "SOLD"]
+        if not closes or not opens:
+            continue
+        for close in closes:
+            # Partial fills mean several closes can legitimately fold into one
+            # open, so an open is never consumed by the first close it matches.
+            match = next((o for o in opens if abs(o["qty"]) == abs(close["qty"])), None)
+            if match is None:
+                match = max(opens, key=lambda o: abs(o["amount"]))
+            match["amount"] += close["amount"]
+            close["amount"] = 0.0
+
+
 def _bdays(start: date, end: date) -> list[date]:
     """Business days (Mon-Fri) in [start, end] inclusive; holidays ignored."""
     if end < start:
@@ -436,10 +499,10 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
     Premium is accrued evenly across a window's business days; capital at risk
     is short-put collateral (strike×100×qty) on each open day. A week's
     allocated is the average over days a position is open. Weekly RoR = weekly
-    realized / weekly allocated.
+    realized / weekly allocated. A roll placed as two orders is netted into one
+    event first — see ``_net_same_day_rolls``.
     """
-    legs_by_key: dict[tuple[str, float, str], list[tuple[date, dict]]] = {}
-
+    parsed: list[tuple[date, dict]] = []
     for t in data.get("opt_trades", []):
         leg = _parse_opt_leg(t.get("desc", ""))
         if not leg:
@@ -449,6 +512,14 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
         except Exception:
             continue
         leg["amount"] = t["amount"]
+        parsed.append((trade_d, leg))
+
+    # Before chaining: a buy-to-close and the sell-to-open that replaces it on
+    # the same day are one roll, and must accrue over one window.
+    _net_same_day_rolls(parsed)
+
+    legs_by_key: dict[tuple[str, float, str], list[tuple[date, dict]]] = {}
+    for trade_d, leg in parsed:
         legs_by_key.setdefault((leg["symbol"], leg["strike"], leg["type"]), []).append(
             (trade_d, leg))
         # A diagonal roll also closes out the to-close leg's *different*
@@ -471,18 +542,27 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
     # (CALENDAR/DIAGONAL) closes the prior leg and opens the new one in the
     # same order, so it replaces the open quantity outright rather than adding
     # to it; a plain SOLD/BOT adjusts the running quantity instead.
+    # One roll can fill in pieces, though, and each fill is its own row — so
+    # fills sharing a trade date and to-open expiration are one roll and
+    # accumulate, replacing the chain's open quantity only as a group. Without
+    # that, six contracts rolled as [2, 2, 1, 1] would carry the last fill's
+    # single contract of collateral, understating capital at risk sixfold.
     daily_prem:   dict[date, float] = {}
     daily_collat: dict[date, float] = {}
     for events in legs_by_key.values():
         events.sort(key=lambda e: e[0])
         open_qty = 0
+        roll_group = None
         for i, (ev_date, leg) in enumerate(events):
-            if leg["is_roll"] and leg["action"] == "SOLD":
-                open_qty = abs(leg["qty"])
+            is_roll_open = leg["is_roll"] and leg["action"] == "SOLD"
+            group = (ev_date, leg["exp"]) if is_roll_open else None
+            if is_roll_open:
+                open_qty = (open_qty if group == roll_group else 0) + abs(leg["qty"])
             elif leg["action"] == "SOLD":
                 open_qty += abs(leg["qty"])
             else:  # BOT — closes contracts
                 open_qty = max(open_qty - abs(leg["qty"]), 0)
+            roll_group = group
 
             next_date = events[i + 1][0] if i + 1 < len(events) else None
             same_day_superseded = next_date is not None and next_date <= ev_date
