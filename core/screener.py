@@ -168,6 +168,24 @@ def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> f
     return float((price - l) / (u - l) * 100)
 
 
+def calc_hv(closes: pd.Series, period: int = 20) -> float | None:
+    """Annualized realized (historical) volatility % over the last ``period`` bars.
+
+    Standard deviation of daily log returns, scaled by sqrt(252). Paired with a
+    contract's implied volatility this answers whether options are pricing more
+    movement than the stock has actually been delivering — the same question the
+    IV percentile reaches for, but computable from one scan instead of a year of
+    accumulated readings.
+    """
+    closes = pd.Series(closes, dtype=float).dropna()
+    if len(closes) < period + 1:
+        return None
+    rets = np.log(closes / closes.shift(1)).dropna().iloc[-period:]
+    if len(rets) < period or rets.std(ddof=1) == 0:
+        return None
+    return float(rets.std(ddof=1) * (252 ** 0.5) * 100)
+
+
 def fetch_history_df(symbol: str, days: int = 180,
                      intraday_minutes: int | None = None) -> pd.DataFrame:
     """OHLCV history for one symbol as a DataFrame indexed by timestamp.
@@ -268,7 +286,8 @@ def _fetch_schwab_chain(client, symbol: str, right: str, to_date: date) -> dict:
         rows = [
             {"strike": c.get("strikePrice"), "bid": c.get("bid"),
              "ask": c.get("ask"), "delta": c.get("delta"),
-             "iv": c.get("volatility")}          # annualized IV %, per contract
+             "iv": c.get("volatility"),          # annualized IV %, per contract
+             "open_interest": c.get("openInterest")}
             for contracts in strikes.values() for c in contracts
         ]
         if rows:
@@ -553,6 +572,23 @@ def _period_sigma_pct(iv_pct: float, dte: int) -> float | None:
     if not iv_pct or dte <= 0:
         return None
     return iv_pct * (dte / 365.0) ** 0.5
+
+
+def _spread_pct(opt) -> float | None:
+    """Bid-ask spread as a percentage of the mid, or None if there's no market.
+
+    Measures how much of the premium a round trip gives back. A roll is a
+    buy-to-close plus a sell-to-open, so a strike quoted 0.88/2.36 costs more to
+    get out of than the time value it holds — however good the rest of it looks.
+    """
+    try:
+        bid, ask = float(opt["bid"]), float(opt["ask"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0 or ask < bid:
+        return None
+    return round((ask - bid) / mid * 100, 1)
 
 
 def _atm_iv(chain: pd.DataFrame, stock_price: float) -> float | None:
@@ -899,18 +935,21 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     if len(closes) < bb_period + 2:
         if apply_filters or live is None:
             return None
-        return {"symbol": sym, "price": round(live, 2), "rsi": None, "bb_pct": None}
+        return {"symbol": sym, "price": round(live, 2), "rsi": None,
+                "bb_pct": None, "hv": None}
     rsi = calc_rsi(closes, rsi_period)
     if apply_filters and rsi >= rsi_threshold:
         return None
     bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
     if apply_filters and bb_pct >= bb_pct_threshold:
         return None
+    hv = calc_hv(closes)
     return {
         "symbol": sym,
         "price":  round(live if live is not None else float(closes.iloc[-1]), 2),
         "rsi":    round(rsi, 1),
         "bb_pct": round(bb_pct, 1),
+        "hv":     round(hv, 1) if hv is not None else None,
     }
 
 
@@ -1270,7 +1309,8 @@ def run_options_filter(
         else:
             expirations = [e for e in available if dte_min <= (e - today).days <= dte_max]
 
-        sym_iv_pctile = None            # per-symbol IV percentile (recorded once, nearest exp)
+        # Realized vol of the underlying, from the stock scan's own closes.
+        sym_hv = row.get("hv")
         sym_iv_recorded = False
         for exp in expirations:
             full_chain = chains[exp]
@@ -1283,7 +1323,8 @@ def run_options_filter(
             atm_iv    = _atm_iv(full_chain, stock_price)
             sigma_pct = _period_sigma_pct(atm_iv, dte) if atm_iv else None
             if atm_iv and not sym_iv_recorded:
-                sym_iv_pctile = _iv_percentile(iv_store, sym, atm_iv)  # vs prior readings
+                # Still recorded so a real IV percentile becomes possible after
+                # a year of scanning, even though nothing consumes it today.
                 _record_iv(iv_store, sym, atm_iv, today)
                 iv_dirty = True
                 sym_iv_recorded = True
@@ -1351,11 +1392,22 @@ def run_options_filter(
                     "iv":            round(atm_iv, 1) if atm_iv else None,
                     "sigma_pct":     round(sigma_pct, 2) if sigma_pct else None,
                     "cushion_sigma": cushion_sigma,
-                    "iv_pctile":     sym_iv_pctile,
+                    # Implied vs realized: >1 means options price more movement
+                    # than the stock has actually delivered — premium is rich.
+                    "iv_hv":         (round(atm_iv / sym_hv, 2)
+                                      if atm_iv and sym_hv else None),
+                    "hv":            sym_hv,
                     # Carried from the stock scan so the options table and the
                     # LSO grade can both see where the underlying sits.
                     "rsi":           row.get("rsi"),
                     "bb_pct":        row.get("bb_pct"),
+                    # What it costs to get back out. A position is only as
+                    # rollable as its market is tight — on a deep-ITM strike the
+                    # spread routinely exceeds the whole extrinsic value, so the
+                    # roll exists on paper and nowhere else.
+                    "spread_pct":    _spread_pct(opt),
+                    "open_interest": (int(opt["open_interest"])
+                                      if opt.get("open_interest") is not None else None),
                 })
 
     if weekly_dirty:

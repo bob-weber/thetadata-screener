@@ -19,12 +19,14 @@ CANDIDATES_CACHE = Path("tech_candidates_cache.json")
 OPTIONS_CACHE    = Path("options_results_cache.json")
 
 _COLS    = ["symbol", "expiration", "dte", "strike", "otm_pct", "premium",
-            "delta", "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct"]
+            "bb_pct", "rsi", "iv", "iv_hv", "cushion_sigma", "delta",
+            "spread_pct", "open_interest"]
 _HEADERS = ["Symbol", "Expiration", "DTE", "Strike", "OTM%", "Premium",
-            "Delta", "IV%", "Cushion σ", "IV %ile", "RSI", "BB%"]
+            "BB%", "RSI", "IV%", "IV/HV", "Cushion σ", "Delta",
+            "Spread %", "OI"]
 _FLOAT_COLS = {"strike", "otm_pct", "premium", "delta",
-               "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct"}
-_INT_COLS   = {"dte"}
+               "iv", "cushion_sigma", "iv_hv", "rsi", "bb_pct", "spread_pct"}
+_INT_COLS   = {"dte", "open_interest"}
 
 # Per-column help, shown when hovering a column header.
 _HELP = {
@@ -56,15 +58,30 @@ _HELP = {
                   "The primary risk gate. Below 1σ the premium isn't paying for "
                   "the risk — 1.5σ for gappy names (earnings in the period, or "
                   "Energy / Basic Materials).",
-    "iv_pctile":  "Where today's IV sits within this symbol's own trailing year "
-                  "of readings.\n\nHigh means premium is rich versus its own "
-                  "history and likely to compress in your favour; low means "
-                  "you're selling cheap volatility.",
+    "iv_hv":      "Implied volatility ÷ the stock's own realized volatility "
+                  "(20-day, annualized, from the same closes as RSI and BB%).\n\n"
+                  "Above 1 the option is pricing more movement than the stock has "
+                  "actually been delivering — that gap is what a premium seller "
+                  "is paid for. Below 1 you'd be selling the move cheaper than it "
+                  "has been happening.\n\n"
+                  "Replaces IV %ile, which needed a year of scan history before "
+                  "it meant anything; this works from the first scan.",
     "rsi":        "Wilder's RSI of the underlying, carried from the stock scan.\n\n"
                   "Below 30 is oversold, above 70 overbought.",
     "bb_pct":     "Where the underlying sits inside its Bollinger Bands, carried "
                   "from the stock scan: 0% = lower band, 100% = upper band.\n\n"
                   "Below 0 means price has broken under the lower band.",
+    "spread_pct": "Bid-ask spread as a percentage of the mid — what a round trip "
+                  "costs you.\n\n"
+                  "A roll is a buy-to-close plus a sell-to-open, so this is the "
+                  "toll on managing the position, and it is worst on the deep-ITM "
+                  "strikes where rolling is what you need. Under 10% is tight, "
+                  "10–25% workable for a weekly, over 50% is not a real market.",
+    "open_interest":
+                  "Open contracts at this strike and expiration — the depth "
+                  "behind the quote.\n\n"
+                  "Near zero means the posted bid and ask are theoretical: "
+                  "nobody is trading it, and a fill near the mid is unlikely.",
 }
 
 

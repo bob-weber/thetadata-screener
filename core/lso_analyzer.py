@@ -1,5 +1,5 @@
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import yfinance as yf
 
@@ -96,23 +96,36 @@ def _score_otm(otm_pct: float) -> tuple[int, str, str | None]:
 
 
 def _score_sigma_cushion(cushion_sigma: float | None, gappy: bool) -> tuple[int, str, str | None]:
-    """Primary volatility-adjusted gate: OTM cushion measured in expected-moves (σ).
+    """Volatility-adjusted distance to the strike, in expected moves (σ).
 
-    Require ≥1σ (≥1.5σ for gappy names — earnings in period, or geopolitical-
-    commodity sectors). Below the threshold the premium isn't paying for the risk.
+    Graded by how short the cushion actually is rather than gated on one line.
+    ``need`` is the adequate mark — 1σ, or 1.5σ for gappy names (earnings in the
+    period, or the geopolitical-commodity sectors) — and the bands step half a σ
+    either side of it.
+
+    Half an expected move from the strike is reckless and takes a real penalty.
+    The band just under adequate is where most standard wheel strikes live: a
+    0.5σ cushion is roughly a 0.28-delta put, which is a mainstream trade rather
+    than a disqualifying one, so it costs a tilt and competes on its premium and
+    technicals instead of being vetoed outright.
     """
     if cushion_sigma is None:
         return 0, "σ-cushion unavailable (no IV data)", None
-    need = 1.5 if gappy else 1.0
+    need  = 1.5 if gappy else 1.0
+    extra = " (gappy name)" if gappy else ""
+    if cushion_sigma < need - 0.5:
+        return -15, (
+            f"Cushion {cushion_sigma:.2f}σ — inside half an expected move of the "
+            f"strike{extra}; assignment takes less than a normal move"
+        ), f"SUB-{need - 0.5:g}σ"
     if cushion_sigma < need:
-        extra = " (gappy name → needs 1.5σ)" if gappy else ""
-        return -30, (
-            f"Cushion {cushion_sigma:.2f}σ < {need:g}σ{extra} — premium isn't "
-            "paying for the risk; assignment takes only a normal move"
-        ), f"SUB-{need:g}σ"
-    if cushion_sigma < 1.5:
-        return 0, f"Cushion {cushion_sigma:.2f}σ — adequate (≥1σ)", None
-    return +5, f"Cushion {cushion_sigma:.2f}σ — strong (≥1.5σ)", None
+        return -5, (
+            f"Cushion {cushion_sigma:.2f}σ < {need:g}σ{extra} — short of adequate; "
+            "the premium needs to be earning its keep"
+        ), None
+    if cushion_sigma < need + 0.5:
+        return 0, f"Cushion {cushion_sigma:.2f}σ — adequate (≥{need:g}σ){extra}", None
+    return +5, f"Cushion {cushion_sigma:.2f}σ — strong (≥{need + 0.5:g}σ){extra}", None
 
 
 def _score_iv(iv_pct: float | None) -> tuple[int, str, str | None]:
@@ -132,15 +145,27 @@ def _score_iv(iv_pct: float | None) -> tuple[int, str, str | None]:
     ), "HIGH IV"
 
 
-def _score_iv_pctile(iv_pctile: float | None) -> tuple[int, str, str | None]:
-    """Timing: prefer selling when IV is rich vs. the name's own trailing year."""
-    if iv_pctile is None:
+def _score_iv_hv(iv_hv: float | None) -> tuple[int, str, str | None]:
+    """Timing: is the option pricing more movement than the stock delivers?
+
+    Implied volatility over the underlying's own realized volatility. Above 1 the
+    market is charging more for the move than the stock has actually been making,
+    which is the edge a premium seller is paid for; below 1 you are selling
+    movement cheaper than it has been happening.
+    """
+    if iv_hv is None:
         return 0, "", None
-    if iv_pctile >= 67:
-        return +3, f"IV percentile {iv_pctile:.0f}% — elevated; premium rich, likely to compress in your favor", None
-    if iv_pctile <= 33:
-        return -3, f"IV percentile {iv_pctile:.0f}% — low vs. its own year; premium light right now", None
-    return 0, f"IV percentile {iv_pctile:.0f}% — mid-range", None
+    if iv_hv >= 1.3:
+        return +3, (
+            f"IV/HV {iv_hv:.2f} — options pricing well above the realized move; "
+            "premium is rich"
+        ), None
+    if iv_hv >= 0.9:
+        return 0, f"IV/HV {iv_hv:.2f} — implied roughly in line with realized movement", None
+    return -3, (
+        f"IV/HV {iv_hv:.2f} — implied below realized; you'd be selling the move "
+        "cheaper than the stock has been making it"
+    ), "IV BELOW REALIZED"
 
 
 def _score_rsi(rsi: float | None) -> tuple[int, str, str | None]:
@@ -190,21 +215,49 @@ def _score_bb_pct(bb_pct: float | None) -> tuple[int, str, str | None]:
     ), "ABOVE BAND"
 
 
+def _score_spread(spread_pct: float | None) -> tuple[int, str, str | None]:
+    """Can you get back out? The bid-ask spread as a share of the mid.
+
+    Every roll is a buy-to-close plus a sell-to-open, so the spread is the toll
+    on managing the position — and it is worst on exactly the deep-ITM strikes
+    where rolling is the thing you need. A wide enough market means the roll
+    only ever existed on paper.
+    """
+    if spread_pct is None:
+        return 0, "", None
+    if spread_pct < 10:
+        return +3, f"Spread {spread_pct:.0f}% of mid — tight; cheap to roll or close", None
+    if spread_pct <= 25:
+        return 0, f"Spread {spread_pct:.0f}% of mid — workable for a weekly", None
+    if spread_pct <= 50:
+        return -5, (
+            f"Spread {spread_pct:.0f}% of mid — wide; a round trip gives back a "
+            "meaningful slice of the premium"
+        ), "WIDE SPREAD"
+    return -15, (
+        f"Spread {spread_pct:.0f}% of mid — no real market; the cost to get out "
+        "can exceed the time value you're selling"
+    ), "NO MARKET"
+
+
 def apply_contract_adjustments(
     result: dict,
     otm_pct: float | None,
     *,
     iv: float | None = None,
     cushion_sigma: float | None = None,
-    iv_pctile: float | None = None,
+    iv_hv: float | None = None,
     rsi: float | None = None,
     bb_pct: float | None = None,
+    spread_pct: float | None = None,
+    open_interest: int | None = None,
 ) -> dict:
     """Re-score and re-grade a symbol result for a specific contract.
 
     Layers the OTM% band, the σ-cushion gate (primary), the absolute IV band, the
-    IV-percentile timing signal, and the underlying's technical position (RSI and
-    BB%, from the stock scan) on top of the symbol's fundamental score.
+    IV-vs-realized timing signal, the underlying's technical position (RSI and
+    BB%, from the stock scan), and how tight the market is (bid-ask spread) on
+    top of the symbol's fundamental score.
     """
     if otm_pct is None:
         return result
@@ -226,9 +279,10 @@ def apply_contract_adjustments(
         _score_otm(otm_pct),
         _score_sigma_cushion(cushion_sigma, gappy),
         _score_iv(iv),
-        _score_iv_pctile(iv_pctile),
+        _score_iv_hv(iv_hv),
         _score_rsi(rsi),
         _score_bb_pct(bb_pct),
+        _score_spread(spread_pct),
     ):
         total_adj += adj
         if flag:
@@ -243,9 +297,11 @@ def apply_contract_adjustments(
         "grade": _score_to_grade(new_score),
         "iv":            iv,
         "cushion_sigma": cushion_sigma,
-        "iv_pctile":     iv_pctile,
+        "iv_hv":         iv_hv,
         "rsi":           rsi,
         "bb_pct":        bb_pct,
+        "spread_pct":    spread_pct,
+        "open_interest": open_interest,
         "flags": " | ".join(flag_list) if flag_list else "—",
         "notes": " • ".join(note_list) if note_list else "No major concerns",
     }
@@ -326,10 +382,13 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
                         f"Earnings {ed} falls within option period — "
                         "expect large IV move; high assignment risk"
                     )
-                elif expiration < ed <= date(expiration.year, expiration.month + 1
-                                             if expiration.month < 12 else 1,
-                                             expiration.day):
-                    # Within ~30 days after expiration — IV will be elevated
+                # Within 30 days after expiration — IV is already elevated going
+                # in. Built by day arithmetic rather than incrementing the month:
+                # month+1 wrapped December into the same year (so the branch
+                # could never fire) and overflowed on month-end expirations
+                # (31 Jan -> 31 Feb), raising a ValueError the except below
+                # swallowed without trace.
+                elif expiration < ed <= expiration + timedelta(days=30):
                     score -= 5
                     notes.append(f"Earnings {ed} shortly after expiration — IV may be elevated")
         except Exception:

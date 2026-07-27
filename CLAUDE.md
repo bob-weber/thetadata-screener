@@ -47,8 +47,9 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
 
 - **`lso_analyzer.py`** — scores and grades symbols for LSO (wheel-strategy) suitability using yfinance metadata.
   - `analyze_symbol()` — fetches sector, beta, market cap, dividend, earnings date from `yf.Ticker.info` and `ticker.calendar`. Starts at base score 70; applies adjustments from `_SECTOR_SCORES`, `_INDUSTRY_EXTRA`, `_score_beta()`, `_score_market_cap()`.
-  - `apply_contract_adjustments()` — re-scores per-contract based on OTM% (handles ITM, near-ATM, comfortable, conservative bands).
-  - Grading: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F < 40.
+  - `apply_contract_adjustments()` — re-scores per contract: OTM% band, σ-cushion gate, IV level, IV/HV, RSI, BB% and bid-ask spread.
+  - Grading: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F < 40 (score clamped 0–100).
+  - **Every factor, its band and its rationale is documented in [`docs/grading.md`](docs/grading.md)** — update it alongside any scoring change.
 
 ### Screener GUI (`gui/`)
 

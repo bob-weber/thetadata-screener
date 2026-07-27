@@ -17,11 +17,13 @@ from . import column_help
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
 _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct",
-            "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct", "capital",
+            "iv", "cushion_sigma", "iv_hv", "rsi", "bb_pct",
+            "spread_pct", "open_interest", "capital",
             "sector", "beta", "mkt_cap_b",
             "earnings_date", "earnings_in_period", "flags", "notes"]
 _HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium %", "OTM%",
-            "IV%", "Cushion σ", "IV %ile", "RSI", "BB%", "Capital",
+            "IV%", "Cushion σ", "IV/HV", "RSI", "BB%",
+            "Spread %", "OI", "Capital",
             "Sector", "Beta", "Mkt Cap ($B)",
             "Earnings Date", "In Period?", "Flags", "Notes"]
 
@@ -56,9 +58,12 @@ _HELP = {
                    "expiration. The primary risk gate.\n\n"
                    "Scores −30 below 1σ (1.5σ for gappy names — earnings in the "
                    "period, or Energy / Basic Materials), 0 from 1–1.5σ, +5 above.",
-    "iv_pctile":   "Today's IV within this symbol's own trailing year.\n\n"
-                   "Scores +3 at 67% or above (premium rich, likely to compress "
-                   "in your favour), −3 at 33% or below, 0 between.",
+    "iv_hv":       "Implied volatility ÷ the stock's own 20-day realized "
+                   "volatility, both annualized.\n\n"
+                   "Above 1 the option prices more movement than the stock has "
+                   "been making — the gap a premium seller is paid for.\n\n"
+                   "Scores +3 at 1.30 or above (premium rich), 0 from 0.90–1.30 "
+                   "(in line), −3 below 0.90 (selling the move too cheap).",
     "rsi":         "Wilder's RSI of the underlying, from the stock scan.\n\n"
                    "Scores −5 below 20 (capitulation, not a dip), +5 from 20–40 "
                    "(the pullback the screen looks for), 0 from 40–60, −3 from "
@@ -67,6 +72,17 @@ _HELP = {
                    "band, 100% = upper.\n\n"
                    "Scores −5 below 0 (a breakdown, not a dip), +5 from 0–33, "
                    "0 from 33–67, −3 from 67–100, −5 above 100.",
+    "spread_pct":  "Bid-ask spread as a percentage of the mid — the toll on "
+                   "every roll, since each one is a buy-to-close plus a "
+                   "sell-to-open.\n\n"
+                   "Scores +3 under 10% (tight), 0 from 10–25%, −5 from 25–50% "
+                   "(a round trip gives back real premium), −15 above 50% — at "
+                   "that point getting out can cost more than the time value "
+                   "you sold.",
+    "open_interest":
+                   "Open contracts at this strike and expiration.\n\n"
+                   "Not scored, but near zero means the quote is theoretical "
+                   "and the spread above is unlikely to be achievable.",
     "capital":     "Cash secured per contract: strike × 100.",
     "sector":      "Sector from yfinance. Adjusts the base score — staples, "
                    "utilities and healthcare score up; biotech, crypto-adjacent "
@@ -315,8 +331,8 @@ class LsoAnalysisTab(QWidget):
             f"- Premium %: {meta.get('premium_pct_min', 0)*100:.1f}% – {meta.get('premium_pct_max', 0)*100:.1f}%",
             f"- Contracts: {len(self._results)}",
             f"",
-            f"| Grade | Symbol | Stock | Strike | Premium % | OTM% | IV% | Cushion σ | IV %ile | RSI | BB% | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
-            f"|-------|--------|-------|--------|-----------|------|-----|-----------|---------|-----|-----|---------|--------|------|--------------|----------|-----------|-------|-------|",
+            f"| Grade | Symbol | Stock | Strike | Premium % | OTM% | IV% | Cushion σ | IV/HV | RSI | BB% | Spread % | OI | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
+            f"|-------|--------|-------|--------|-----------|------|-----|-----------|---------|-----|-----|----------|-----|---------|--------|------|--------------|----------|-----------|-------|-------|",
         ]
 
         sorted_results = sorted(
@@ -342,9 +358,11 @@ class LsoAnalysisTab(QWidget):
                 _v("otm_pct",     "",  "%", ".1f"),
                 _v("iv",            "",  "%", ".0f"),
                 _v("cushion_sigma", "",  "σ", ".2f"),
-                _v("iv_pctile",     "",  "%", ".0f"),
+                _v("iv_hv",         "",  "",  ".2f"),
                 _v("rsi",           "",  "",  ".1f"),
                 _v("bb_pct",        "",  "",  ".1f"),
+                _v("spread_pct",    "",  "%", ".0f"),
+                _v("open_interest", "",  "",  ""),
                 cap_str,
                 r.get("sector", ""),
                 _v("beta",        "",  "", ".2f"),
@@ -399,8 +417,8 @@ class LsoAnalysisTab(QWidget):
                 elif key == "cushion_sigma":
                     item = _SortItem(f"{float(val):.2f}σ" if val is not None else "—",
                                      float(val) if val is not None else -99.0)
-                elif key == "iv_pctile":
-                    item = _SortItem(f"{float(val):.0f}%" if val is not None else "—",
+                elif key == "iv_hv":
+                    item = _SortItem(f"{float(val):.2f}" if val is not None else "—",
                                      float(val) if val is not None else -1.0)
                 elif key == "capital" and val is not None:
                     item = _SortItem(f"${int(val):,}", float(val))

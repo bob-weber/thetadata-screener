@@ -273,9 +273,11 @@ class LsoWorker(QThread):
                 sym_analysis[sym], otm_pct,
                 iv=contract.get("iv"),
                 cushion_sigma=contract.get("cushion_sigma"),
-                iv_pctile=contract.get("iv_pctile"),
+                iv_hv=contract.get("iv_hv"),
                 rsi=rsi,
                 bb_pct=bb_pct,
+                spread_pct=contract.get("spread_pct"),
+                open_interest=contract.get("open_interest"),
             )
             merged.append({
                 **adjusted,
