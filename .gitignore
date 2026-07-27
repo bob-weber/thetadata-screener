@@ -1,11 +1,6 @@
 # Credentials — never commit
-creds.txt
 schwab_creds.txt
 schwab_token.json
-
-# ThetaData terminal binary and downloaded server jars
-ThetaTerminalv3.jar
-lib/
 
 # Scan cache files (regenerated on each run)
 *_cache.json
@@ -27,7 +22,6 @@ gains_history_*.json
 
 # Python virtual environments
 gui-env/
-thetadata-env/
 
 # Python cache
 __pycache__/

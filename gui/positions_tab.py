@@ -404,6 +404,24 @@ _TRD_CAL_RE = re.compile(
     r'\s+([\d.]+)\s+(PUT|CALL)',
     re.IGNORECASE,
 )
+# Diagonal roll — like a calendar but the strike moves too, so it carries a
+# to-open and a to-close strike:
+# "SOLD -2 DIAGONAL ICE 100 18 DEC 26/31 JUL 26 140/130 CALL @2.00 CBOE"
+_TRD_DIAG_RE = re.compile(
+    r'(?:SOLD|BOT)\s+\S+\s+DIAGONAL\s+([A-Z]{1,10})\s+100'
+    r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'   # TO-OPEN expiration
+    r'/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'        # TO-CLOSE expiration (skip)
+    r'\s+([\d.]+)/([\d.]+)\s+(PUT|CALL)',   # TO-OPEN / TO-CLOSE strike
+    re.IGNORECASE,
+)
+# Vertical spread — one expiration, two strikes:
+# "BOT +3 VERTICAL DVN 100 (Weeklys) 26 JUN 26 43/43.5 CALL @.26 CBOE"
+_TRD_VERT_RE = re.compile(
+    r'(?:SOLD|BOT)\s+\S+\s+VERTICAL\s+([A-Z]{1,10})\s+100'
+    r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
+    r'\s+([\d.]+)/([\d.]+)\s+(PUT|CALL)',
+    re.IGNORECASE,
+)
 # Single leg: "SOLD -2 KTOS 100 (Weeklys) 22 MAY 26 50 PUT @.71 CBOE"
 _TRD_SINGLE_RE = re.compile(
     r'(?:SOLD|BOT)\s+\S+\s+([A-Z]{1,10})\s+100'
@@ -713,14 +731,24 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
         amount = _money(cells[7])
 
         if typ == "TRD" and re.search(r'\b(PUT|CALL)\b', desc, re.IGNORECASE):
-            roll = _TRD_CAL_RE.search(desc)
-            m = roll or _TRD_SINGLE_RE.search(desc)
+            # Specific spread shapes first: the single-leg pattern can't match
+            # them (the symbol slot would have to be DIAGONAL/VERTICAL), so
+            # without these the row is skipped and its cash never lands.
+            close_strike = None
+            cal  = _TRD_CAL_RE.search(desc)
+            diag = None if cal else _TRD_DIAG_RE.search(desc)
+            vert = None if (cal or diag) else _TRD_VERT_RE.search(desc)
+            m = cal or diag or vert or _TRD_SINGLE_RE.search(desc)
             if not m:
                 continue
-            sym, exp, strike, otyp = m.groups()
+            if diag or vert:
+                sym, exp, strike, close_strike, otyp = m.groups()
+            else:
+                sym, exp, strike, otyp = m.groups()
+            roll = cal or diag           # both close one leg and open another
             qm  = _OPT_QTY_RE.search(desc)
             qty = abs(int(qm.group(2))) if qm else 0
-            events.append({
+            ev = {
                 "sym": sym.upper(), "date": date_str, "kind": "opt",
                 "otype": otyp.upper(), "amount": round(amount, 2), "fees": round(fees, 2),
                 "strike": _norm_strike(strike), "exp": _parse_exp(exp.strip()), "qty": qty,
@@ -728,7 +756,14 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
                 # contracts; without them a buy-to-close reads as another sale.
                 "action": qm.group(1).upper() if qm else "SOLD",
                 "roll": roll is not None,
-            })
+            }
+            # A diagonal also retires a leg at a *different* strike, which lives
+            # under its own cycle and would otherwise never learn it was closed.
+            if close_strike is not None:
+                cs = _norm_strike(close_strike)
+                if cs != ev["strike"]:
+                    ev["close_strike"] = cs
+            events.append(ev)
         elif typ in ("TRD", "EXP"):
             m = _STK_DESC_RE.search(desc)
             if not m:
@@ -863,6 +898,14 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         cycle["qty_by_exp"].get(e["exp"], 0) + signed, 0)
                     cycle["stages"].append("Put")
                     cycle["end_date"] = e["exp"]
+                    # A diagonal moved this position off another strike; that
+                    # cycle is closed by the same row, so retire it rather than
+                    # leaving it open forever alongside its own replacement.
+                    closed = e.get("close_strike")
+                    if closed and closed != key and closed in live:
+                        live[closed]["closed_date"] = e["date"]
+                        live[closed]["open_qty"]    = 0
+                        _retire(closed)
                 else:
                     # A call belongs to whichever position holds the shares it
                     # covers; with none assigned it rides the newest cycle.
