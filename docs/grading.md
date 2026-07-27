@@ -136,6 +136,7 @@ of it; the gappy ladder is the whole thing shifted up 0.5σ.
 
 | Band (normal / gappy) | Adj | Flag | Why |
 |---|---:|---|---|
+| no IV data | −5 | IV UNAVAILABLE | The gate couldn't be applied at all. Scoring an unknown at zero would let an unmeasured contract outrank a measured one, so it costs a little rather than nothing |
 | < 0.5σ / < 1.0σ | −15 | SUB-0.5σ / SUB-1σ | Inside half an expected move — assignment takes *less* than a normal move |
 | 0.5–1.0σ / 1.0–1.5σ | −5 | | Short of adequate; the premium has to earn its keep |
 | 1.0–1.5σ / 1.5–2.0σ | 0 | | Adequate |
@@ -149,6 +150,12 @@ majority of candidates isn't a gate, it's the sorting axis, and at −30 it
 overrode everything else in the model. The graded version keeps a real penalty
 for genuinely thin cushions and lets standard strikes compete on their premium
 and technicals.
+
+When a symbol's chain comes back without usable implied volatility — Schwab
+occasionally answers with `-999` in every volatility field — this factor, IV%
+and IV/HV all go blank together, since all three derive from it. The scan
+retries such a symbol once, logs any that still fail, and the −5 above marks the
+grade provisional.
 
 Note this factor and OTM% measure the same distance, one raw and one
 vol-adjusted, so a contract can be penalised by both. That's intended — they

@@ -1271,6 +1271,37 @@ def run_options_filter(
     if limiter.hits and on_log:
         on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
                f"~{limiter.rate:.0f} req/s (recovers automatically).")
+    # Schwab sometimes answers with -999 in every volatility field — a 200 the
+    # rate limiter can't see, so it sails through as a valid chain. Losing the
+    # near-ATM IV costs the σ-cushion, the IV band and IV/HV all at once, and it
+    # clusters on whatever is fetched late in a run. Give those one more try.
+    price_by_sym = {row["symbol"]: row["price"] for row in candidates}
+
+    def _has_usable_iv(sym: str, chains: dict | None) -> bool:
+        px = price_by_sym.get(sym)
+        return bool(chains) and any(
+            _atm_iv(df, px) is not None for df in chains.values())
+
+    retry = sorted(s for s, ch in fetched.items() if ch and not _has_usable_iv(s, ch))
+    if retry:
+        if on_log:
+            on_log(f"  {len(retry)} symbol(s) came back with no usable IV "
+                   f"({', '.join(retry[:8])}{' …' if len(retry) > 8 else ''}) — retrying")
+        again, _ = _concurrent_fetch(
+            retry,
+            lambda sym: _fetch_schwab_chain(client, sym, right, _horizon_for(sym)),
+            workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
+            stop_flag=stop_flag)
+        recovered = 0
+        for sym, ch in (again or {}).items():
+            if _has_usable_iv(sym, ch):
+                fetched[sym] = ch
+                recovered += 1
+        still = [s for s in retry if not _has_usable_iv(s, fetched.get(s))]
+        if on_log:
+            on_log(f"  recovered IV for {recovered} of {len(retry)}"
+                   + (f"; still missing: {', '.join(still)}" if still else ""))
+
     if on_log:
         on_log(f"Fetched {len(fetched)}/{total} chains in {_fmt_elapsed(elapsed)} "
                f"({total / max(elapsed, 1e-3):.1f} symbols/s)")
@@ -1409,6 +1440,15 @@ def run_options_filter(
                     "open_interest": (int(opt["open_interest"])
                                       if opt.get("open_interest") is not None else None),
                 })
+
+    # Say it out loud. A missing IV blanks three columns and stands the primary
+    # risk gate down, so it shouldn't be something you notice by spotting a gap.
+    if on_log:
+        no_iv = sorted({r["symbol"] for r in results if r.get("iv") is None})
+        if no_iv:
+            on_log(f"  No usable IV for {len(no_iv)} symbol(s) — "
+                   f"{', '.join(no_iv)}. Their σ-cushion, IV% and IV/HV are "
+                   "unavailable and their grades are penalised for it.")
 
     if weekly_dirty:
         _save_weeklies_cache(weekly_flags)

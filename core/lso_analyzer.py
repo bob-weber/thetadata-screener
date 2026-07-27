@@ -110,7 +110,14 @@ def _score_sigma_cushion(cushion_sigma: float | None, gappy: bool) -> tuple[int,
     technicals instead of being vetoed outright.
     """
     if cushion_sigma is None:
-        return 0, "σ-cushion unavailable (no IV data)", None
+        # No IV came back for this symbol, so the primary gate can't be applied
+        # at all — and neither can the IV band or IV/HV. Scoring that at zero
+        # would let an unmeasured contract outrank a measured one, so an
+        # unknown costs a little rather than nothing.
+        return -5, (
+            "σ-cushion unavailable — no IV data for this symbol, so the primary "
+            "risk gate couldn't be applied; treat the grade as provisional"
+        ), "IV UNAVAILABLE"
     need  = 1.5 if gappy else 1.0
     extra = " (gappy name)" if gappy else ""
     if cushion_sigma < need - 0.5:
