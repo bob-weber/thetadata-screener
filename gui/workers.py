@@ -5,7 +5,8 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 OPTIONS_RESULTS_CACHE = "options_results_cache.json"
-_OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side", "yield_min", "yield_max"]
+_OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side",
+                   "premium_pct_min", "premium_pct_max"]
 
 
 class UniverseWorker(QThread):
@@ -98,13 +99,11 @@ class OptionsWorker(QThread):
     finished          = pyqtSignal(list)
     error             = pyqtSignal(str)
 
-    def __init__(self, config: dict, positions: list[str] | None = None,
-                 reject: set[str] | None = None):
+    def __init__(self, config: dict, reject: set[str] | None = None):
         super().__init__()
-        self._config    = config
-        self._positions = positions  # None → use stock scan cache; list → fetch prices live
-        self._reject    = {s.upper() for s in reject} if reject else set()
-        self._stop      = False
+        self._config = config
+        self._reject = {s.upper() for s in reject} if reject else set()
+        self._stop   = False
 
     def stop(self):
         self._stop = True
@@ -118,14 +117,9 @@ class OptionsWorker(QThread):
             "expiration_date": c.get("expiration_date"),
             "right":           c.get("right", "P"),
             "side":            c.get("side", "sell"),
-            "yield_min":       c.get("yield_min"),
-            "yield_max":       c.get("yield_max"),
+            "premium_pct_min": c.get("premium_pct_min"),
+            "premium_pct_max": c.get("premium_pct_max"),
         }
-        if self._positions is not None:
-            key["ticker_source"] = "positions"
-            key["positions"]     = sorted(self._positions)
-        else:
-            key["ticker_source"] = "scanner"
         return key
 
     def _load_scanner_candidates(self) -> list[dict] | None:
@@ -161,48 +155,11 @@ class OptionsWorker(QThread):
             self.log_msg.emit(f"Reject list: excluded {removed} {noun}(s).")
         return kept
 
-    def _fetch_position_candidates(self) -> list[dict] | None:
-        from core.screener import fetch_stock_prices, ScreenerError
-        if self._reject:
-            kept    = [p for p in self._positions if p.upper() not in self._reject]
-            removed = len(self._positions) - len(kept)
-            if removed:
-                self.log_msg.emit(f"Reject list: excluded {removed} position(s).")
-            self._positions = kept
-            if not self._positions:
-                self.error.emit("All positions are on the reject list.")
-                return None
-        self.log_msg.emit(f"Fetching current prices for {len(self._positions)} position(s)…")
-        try:
-            candidates = fetch_stock_prices(
-                self._positions,
-                on_log=self.log_msg.emit,
-                on_progress=lambda c, t: self.opts_progress.emit(c, t),
-                stop_flag=lambda: self._stop,
-            )
-        except ScreenerError as e:
-            self.error.emit(str(e))
-            return None
-        except Exception as e:
-            self.error.emit(f"Unexpected error fetching prices: {e}")
-            return None
-        if not candidates:
-            self.error.emit("Could not fetch a current price for any of the specified tickers.")
-            return None
-        self.candidates_loaded.emit(len(candidates))
-        # Reset progress bar for the upcoming options scan
-        self.opts_progress.emit(0, len(candidates))
-        return candidates
-
     def run(self):
         from core.screener import run_options_filter, ScreenerError
 
-        # ── Load or fetch candidates ──────────────────────────────────────
-        if self._positions is not None:
-            candidates = self._fetch_position_candidates()
-        else:
-            candidates = self._load_scanner_candidates()
-
+        # ── Load candidates from the stock scan ───────────────────────────
+        candidates = self._load_scanner_candidates()
         if candidates is None:
             return
 
@@ -271,11 +228,16 @@ class LsoWorker(QThread):
             f"(exp {exp_str}, scan from {scan_date}) …"
         )
 
+        # The stock scan is also the source of RSI/BB%, so keep the whole
+        # candidate row: an options cache written before those were carried
+        # through still grades on them instead of scoring them as absent.
         price_lookup: dict[str, float] = {}
+        tech_lookup:  dict[str, dict]  = {}
         try:
             cand_data = json.loads(Path("tech_candidates_cache.json").read_text())
             for c in cand_data.get("candidates", []):
                 price_lookup[c["symbol"]] = c["price"]
+                tech_lookup[c["symbol"]]  = c
         except Exception:
             pass
 
@@ -300,17 +262,27 @@ class LsoWorker(QThread):
                 otm_pct = round((stock_price - strike) / stock_price * 100, 2)
             else:
                 otm_pct = contract.get("otm_pct")
+            tech   = tech_lookup.get(sym, {})
+            rsi    = contract.get("rsi")
+            bb_pct = contract.get("bb_pct")
+            if rsi is None:
+                rsi = tech.get("rsi")
+            if bb_pct is None:
+                bb_pct = tech.get("bb_pct")
             adjusted = apply_contract_adjustments(
                 sym_analysis[sym], otm_pct,
                 iv=contract.get("iv"),
                 cushion_sigma=contract.get("cushion_sigma"),
                 iv_pctile=contract.get("iv_pctile"),
+                rsi=rsi,
+                bb_pct=bb_pct,
             )
             merged.append({
                 **adjusted,
                 "stock_price": stock_price,
                 "strike":      strike,
-                "premium":     contract.get("yield_pct"),
+                # Premium % of share price; older caches stored it as yield_pct.
+                "premium":     contract.get("premium_pct", contract.get("yield_pct")),
                 "otm_pct":     otm_pct,
                 "capital":     round(strike * 100) if strike is not None else None,
             })

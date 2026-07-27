@@ -726,22 +726,36 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
     return results, limiter
 
 
+def _scan_symbols(config: dict) -> list[str]:
+    """Explicit symbol list to scan ('my stocks'), or [] for a universe scan."""
+    return [s.strip().upper() for s in (config.get("symbols") or []) if s.strip()]
+
+
 def _price_key(config: dict) -> dict:
+    symbols = _scan_symbols(config)
+    if symbols:
+        # A my-stocks scan ignores the price range, so the range must stay out of
+        # the key — otherwise nudging it would invalidate an identical result.
+        return {"date": date.today().isoformat(), "symbols": sorted(set(symbols))}
     return {
         "date":      date.today().isoformat(),
         "price_min": config.get("price_min", 10.0),
-        "price_max": config.get("price_max", 500.0),
+        "price_max": config.get("price_max", 400.0),
     }
 
 
 def _full_key(config: dict) -> dict:
-    return {
+    key = {
         **_price_key(config),
-        "rsi_threshold":    config.get("rsi_threshold",    40.0),
-        "bb_pct_threshold": config.get("bb_pct_threshold", 33.0),
-        "rsi_period":       config.get("rsi_period",       14),
-        "bb_period":        config.get("bb_period",        20),
+        "rsi_period": config.get("rsi_period", 14),
+        "bb_period":  config.get("bb_period",  20),
     }
+    if not _scan_symbols(config):
+        # Thresholds only shape a universe scan; a my-stocks scan reports every
+        # symbol whatever its RSI/BB%, so they're not part of its identity.
+        key["rsi_threshold"]    = config.get("rsi_threshold",    40.0)
+        key["bb_pct_threshold"] = config.get("bb_pct_threshold", 33.0)
+    return key
 
 
 def run_price_screen(
@@ -760,9 +774,14 @@ def run_price_screen(
     This is the slow, rarely-changing pass; the GUI drives it from its own button.
     ``on_found(rows)`` is called with each batch's newly qualified rows so the GUI
     can populate the list as the scan runs.
+
+    ``config["symbols"]`` scans exactly those tickers ('my stocks') instead of the
+    universe, and keeps every one that quotes: a price range is there to narrow
+    thousands of unknown symbols, not a handful you picked deliberately.
     """
     price_min      = config.get("price_min",      10.0)
-    price_max      = config.get("price_max",     500.0)
+    price_max      = config.get("price_max",     400.0)
+    mine           = _scan_symbols(config)
 
     price_key  = _price_key(config)
     price_path = Path(price_cache_file)
@@ -788,8 +807,12 @@ def run_price_screen(
         ) from e
 
     # ── Symbol universe ───────────────────────────────────────────────────────
-    # Precedence: manual watchlist → saved universe.json → bootstrap from EDGAR.
-    if watchlist_file and Path(watchlist_file).exists():
+    # Precedence: my stocks → manual watchlist → saved universe.json → EDGAR.
+    if mine:
+        all_symbols = mine
+        if on_log:
+            on_log(f"Scanning my stocks: {len(all_symbols)} symbols (price range not applied)")
+    elif watchlist_file and Path(watchlist_file).exists():
         all_symbols = [t.strip() for t in Path(watchlist_file).read_text().splitlines() if t.strip()]
         if on_log:
             on_log(f"Using watchlist: {len(all_symbols)} symbols")
@@ -802,7 +825,7 @@ def run_price_screen(
         elif on_log:
             on_log(f"Using saved universe: {len(all_symbols)} tickers")
 
-    if on_log:
+    if on_log and not mine:
         on_log(f"Pass 1: price screen — {len(all_symbols)} symbols (batched quotes) …")
     price_qualified: list[dict] = []
     total   = len(all_symbols)
@@ -828,7 +851,7 @@ def run_price_screen(
             price = data.get(sym, {}).get("quote", {}).get("lastPrice")
             if price is None:
                 skipped += 1
-            elif price_min <= price <= price_max:
+            elif mine or price_min <= price <= price_max:
                 batch_qualified.append({"symbol": sym, "price": round(float(price), 2)})
 
         price_qualified.extend(batch_qualified)
@@ -839,7 +862,11 @@ def run_price_screen(
         time.sleep(0.1)   # gentle pace between the ~20 batched quote calls
 
     if on_log:
-        on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
+        if mine:
+            on_log(f"Pass 1 done — priced {len(price_qualified)} of my stocks"
+                   + (f", {skipped} with no quote" if skipped else ""))
+        else:
+            on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
 
     price_path.write_text(json.dumps({
         **price_key,
@@ -851,7 +878,7 @@ def run_price_screen(
 
 def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period,
                         bb_std_mult, rsi_threshold, bb_pct_threshold,
-                        append_live=True) -> dict | None:
+                        append_live=True, apply_filters=True) -> dict | None:
     """Apply the RSI/BB% filter to one close series; return a candidate row or None.
 
     ``closes_list`` holds daily closes *through yesterday*. When ``append_live`` is
@@ -859,6 +886,10 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     is appended as today's close so RSI/BB% reflect the exact live price rather than
     the prior session's close. ``closes_list`` already excludes today's bar, so this
     never double-counts.
+
+    With ``apply_filters`` off (a my-stocks scan) the thresholds are measured but
+    never reject: the point is to see where each of your own symbols sits, so a
+    symbol too new to compute an indicator still comes back, with RSI/BB% blank.
     """
     live = price_lookup.get(sym)
     closes_list = list(closes_list)
@@ -866,12 +897,14 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         closes_list.append(live)
     closes = pd.Series(closes_list, dtype=float)
     if len(closes) < bb_period + 2:
-        return None
+        if apply_filters or live is None:
+            return None
+        return {"symbol": sym, "price": round(live, 2), "rsi": None, "bb_pct": None}
     rsi = calc_rsi(closes, rsi_period)
-    if rsi >= rsi_threshold:
+    if apply_filters and rsi >= rsi_threshold:
         return None
     bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
-    if bb_pct >= bb_pct_threshold:
+    if apply_filters and bb_pct >= bb_pct_threshold:
         return None
     return {
         "symbol": sym,
@@ -905,6 +938,9 @@ def run_technical_filter(
     completed session are reused with no fetch; the rest are fetched in full and
     the store is updated. ``use_cache=False`` forces a full refetch of every
     symbol (still updating the store).
+
+    On a my-stocks scan (``config["symbols"]``) the indicators are computed and
+    reported for every symbol rather than used to reject any.
     """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
@@ -934,6 +970,7 @@ def run_technical_filter(
         rsi_period=rsi_period, bb_period=bb_period, bb_std_mult=bb_std_mult,
         rsi_threshold=rsi_threshold, bb_pct_threshold=bb_pct_threshold,
         append_live=is_trading_today,
+        apply_filters=not _scan_symbols(config),
     )
 
     # ── Per-symbol history store: reuse what's current, fetch only the rest ────
@@ -1119,8 +1156,8 @@ def run_options_filter(
     on_progress=None,
     stop_flag=None,
 ) -> list[dict]:
-    yield_min        = config.get("yield_min",        0.009)
-    yield_max        = config.get("yield_max",        0.020)
+    premium_pct_min  = config.get("premium_pct_min",  0.009)
+    premium_pct_max  = config.get("premium_pct_max",  0.020)
     right            = config.get("right",            "P")    # "P" or "C"
     side             = config.get("side",             "sell") # "sell" or "buy"
     weeklies_only    = config.get("weeklies_only",    False)
@@ -1241,7 +1278,7 @@ def run_options_filter(
                 continue
             dte = (exp - today).days
 
-            # Near-ATM IV (from the full chain, before yield filtering): the
+            # Near-ATM IV (from the full chain, before premium filtering): the
             # underlying's expected move σ and its IV level for grading/percentile.
             atm_iv    = _atm_iv(full_chain, stock_price)
             sigma_pct = _period_sigma_pct(atm_iv, dte) if atm_iv else None
@@ -1259,16 +1296,23 @@ def run_options_filter(
                     on_log(f"  {sym}: chain found but no positive {price_col}")
                 continue
 
-            chain["yield_pct"] = chain[price_col] / stock_price
+            # Premium as a percentage of the capital the trade actually ties up —
+            # the "1% rule" figure, and what a strike qualifies on. A short put is
+            # secured by strike x 100 in cash, so the strike is the denominator; a
+            # covered call ties up the shares instead, which are worth the share
+            # price. Using the share price for a put would understate the return,
+            # since the strike sits below it.
+            collateral = chain["strike"] if right == "P" else stock_price
+            chain["premium_pct"] = chain[price_col] / collateral
             in_range = chain[
-                (chain["yield_pct"] >= yield_min) &
-                (chain["yield_pct"] <= yield_max)
+                (chain["premium_pct"] >= premium_pct_min) &
+                (chain["premium_pct"] <= premium_pct_max)
             ]
             if on_log:
                 on_log(
                     f"  {sym}: {len(chain)} strikes, "
-                    f"{len(in_range)} in yield range "
-                    f"({yield_min*100:.1f}%–{yield_max*100:.1f}%)"
+                    f"{len(in_range)} in premium range "
+                    f"({premium_pct_min*100:.1f}%–{premium_pct_max*100:.1f}%)"
                 )
             chain = in_range.copy()
             if chain.empty:
@@ -1302,12 +1346,16 @@ def run_options_filter(
                     "strike":     strike,
                     "otm_pct":    otm_pct,
                     "premium":    round(float(opt[price_col]), 2),
-                    "yield_pct":  round(float(opt["yield_pct"]) * 100, 2),
+                    "premium_pct": round(float(opt["premium_pct"]) * 100, 2),
                     "delta":      delta,
                     "iv":            round(atm_iv, 1) if atm_iv else None,
                     "sigma_pct":     round(sigma_pct, 2) if sigma_pct else None,
                     "cushion_sigma": cushion_sigma,
                     "iv_pctile":     sym_iv_pctile,
+                    # Carried from the stock scan so the options table and the
+                    # LSO grade can both see where the underlying sits.
+                    "rsi":           row.get("rsi"),
+                    "bb_pct":        row.get("bb_pct"),
                 })
 
     if weekly_dirty:

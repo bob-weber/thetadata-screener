@@ -143,6 +143,53 @@ def _score_iv_pctile(iv_pctile: float | None) -> tuple[int, str, str | None]:
     return 0, f"IV percentile {iv_pctile:.0f}% — mid-range", None
 
 
+def _score_rsi(rsi: float | None) -> tuple[int, str, str | None]:
+    """Entry timing on momentum: oversold is the setup, capitulation is a trap.
+
+    A short put is a bet on not falling much further, so a mild pullback is the
+    entry and an extreme reading cuts both ways — the premium is richest exactly
+    where assignment leaves you long a name in freefall.
+    """
+    if rsi is None:
+        return 0, "", None
+    if rsi < 20:
+        return -5, (
+            f"RSI {rsi:.0f} — capitulation, not a dip; assignment risks "
+            "catching a falling knife"
+        ), "RSI EXTREME"
+    if rsi < 40:
+        return +5, f"RSI {rsi:.0f} — oversold; the pullback the screen looks for", None
+    if rsi < 60:
+        return 0, f"RSI {rsi:.0f} — neutral momentum", None
+    if rsi < 70:
+        return -3, f"RSI {rsi:.0f} — extended; entering late in the move", None
+    return -5, (
+        f"RSI {rsi:.0f} — overbought; selling puts near a local high leaves "
+        "little room before the mean catches up"
+    ), "OVERBOUGHT"
+
+
+def _score_bb_pct(bb_pct: float | None) -> tuple[int, str, str | None]:
+    """Where price sits in its Bollinger range: 0 = lower band, 100 = upper."""
+    if bb_pct is None:
+        return 0, "", None
+    if bb_pct < 0:
+        return -5, (
+            f"BB% {bb_pct:.1f} — below the lower band; a breakdown rather than "
+            "a dip within the range"
+        ), "BELOW BAND"
+    if bb_pct < 33:
+        return +5, f"BB% {bb_pct:.1f} — lower third of the range; good entry zone", None
+    if bb_pct <= 67:
+        return 0, f"BB% {bb_pct:.1f} — mid-range", None
+    if bb_pct <= 100:
+        return -3, f"BB% {bb_pct:.1f} — upper third; thin cushion for a short put", None
+    return -5, (
+        f"BB% {bb_pct:.1f} — above the upper band; extended, with the whole "
+        "range to fall back through"
+    ), "ABOVE BAND"
+
+
 def apply_contract_adjustments(
     result: dict,
     otm_pct: float | None,
@@ -150,11 +197,14 @@ def apply_contract_adjustments(
     iv: float | None = None,
     cushion_sigma: float | None = None,
     iv_pctile: float | None = None,
+    rsi: float | None = None,
+    bb_pct: float | None = None,
 ) -> dict:
     """Re-score and re-grade a symbol result for a specific contract.
 
-    Layers the OTM% band, the σ-cushion gate (primary), the absolute IV band, and
-    the IV-percentile timing signal on top of the symbol's fundamental score.
+    Layers the OTM% band, the σ-cushion gate (primary), the absolute IV band, the
+    IV-percentile timing signal, and the underlying's technical position (RSI and
+    BB%, from the stock scan) on top of the symbol's fundamental score.
     """
     if otm_pct is None:
         return result
@@ -177,6 +227,8 @@ def apply_contract_adjustments(
         _score_sigma_cushion(cushion_sigma, gappy),
         _score_iv(iv),
         _score_iv_pctile(iv_pctile),
+        _score_rsi(rsi),
+        _score_bb_pct(bb_pct),
     ):
         total_adj += adj
         if flag:
@@ -192,6 +244,8 @@ def apply_contract_adjustments(
         "iv":            iv,
         "cushion_sigma": cushion_sigma,
         "iv_pctile":     iv_pctile,
+        "rsi":           rsi,
+        "bb_pct":        bb_pct,
         "flags": " | ".join(flag_list) if flag_list else "—",
         "notes": " • ".join(note_list) if note_list else "No major concerns",
     }

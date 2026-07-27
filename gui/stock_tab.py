@@ -5,19 +5,41 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QFileDialog, QSplitter,
+    QRadioButton, QButtonGroup, QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
+from . import column_help
 from .workers import StockScanWorker, UniverseWorker
 
 PRICE_CACHE      = "price_screen_cache.json"
 CANDIDATES_CACHE = "tech_candidates_cache.json"
+MY_STOCKS_FILE   = Path("my_positions.txt")
 
 _PRICE_COLS    = ["symbol", "price"]
 _PRICE_HEADERS = ["Symbol", "Price"]
 
 _COLS    = ["symbol", "price", "rsi", "bb_pct"]
 _HEADERS = ["Symbol", "Price", "RSI", "BB%"]
+
+# Per-column help, shown when hovering a column header.
+_HELP = {
+    "symbol": "Ticker symbol.",
+    "price":  "Last trade price from Schwab.\n\n"
+              "On a trading day this live quote is also used as today's closing "
+              "bar when computing RSI and BB%, so both track the current price "
+              "rather than yesterday's close.",
+    "rsi":    "Wilder's RSI over the RSI-period bars (default 14).\n\n"
+              "Below 30 is oversold, above 70 overbought. A universe scan keeps "
+              "only symbols under the RSI threshold; a My Stocks scan reports it "
+              "for every ticker without filtering.",
+    "bb_pct": "Where price sits inside its Bollinger Bands: 0% = lower band, "
+              "100% = upper band, over the BB period (default 20) at 2σ.\n\n"
+              "Below 0 means price has broken under the lower band; above 100, "
+              "over the upper one.",
+}
+
+
 
 
 class _NumericItem(QTableWidgetItem):
@@ -38,9 +60,11 @@ def _make_item(val) -> QTableWidgetItem:
     return item
 
 
-def _new_table(headers: list[str]) -> QTableWidget:
+def _new_table(headers: list[str], cols: list[str] | None = None) -> QTableWidget:
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
+    if cols:
+        column_help.install(table, cols, _HELP)
     table.setSortingEnabled(True)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -79,9 +103,39 @@ class StockScannerTab(QWidget):
     def __init__(self):
         super().__init__()
         self._worker = None
+
+        # Debounced write-back of the My Stocks editor, flushed on quit so an
+        # edit made just before exiting isn't lost inside the timer window.
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(800)
+        self._save_timer.timeout.connect(self._save_my_stocks)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._flush_saves)
+
         self._setup_ui()
+        self._load_my_stocks()
         self._load_cached_results()
         self._refresh_universe_label()
+
+    # ── my-stocks file helpers ─────────────────────────────────────────────────
+
+    def _load_my_stocks(self):
+        if MY_STOCKS_FILE.exists():
+            self._my_stocks_edit.setPlainText(MY_STOCKS_FILE.read_text())
+
+    def _save_my_stocks(self):
+        MY_STOCKS_FILE.write_text(self._my_stocks_edit.toPlainText())
+
+    def _flush_saves(self):
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._save_my_stocks()
+
+    def _get_my_stocks(self) -> list[str]:
+        raw = self._my_stocks_edit.toPlainText()
+        return [t.strip().upper() for t in raw.splitlines() if t.strip()]
 
     # ── startup cache loading ──────────────────────────────────────────────────
 
@@ -110,6 +164,34 @@ class StockScannerTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
+        # ── Ticker source ─────────────────────────────────────────────────────
+        source_box = QGroupBox("Ticker Source")
+        sh = QHBoxLayout(source_box)
+        sh.setSpacing(16)
+        self._universe_src_btn = QRadioButton("Universe / Watchlist")
+        self._mine_src_btn     = QRadioButton("My Stocks")
+        self._universe_src_btn.setChecked(True)
+        self._source_group = QButtonGroup()
+        self._source_group.addButton(self._universe_src_btn, 0)
+        self._source_group.addButton(self._mine_src_btn,     1)
+        sh.addWidget(self._universe_src_btn)
+        sh.addWidget(self._mine_src_btn)
+        sh.addStretch()
+        root.addWidget(source_box)
+
+        # ── My Stocks editor (hidden until its radio is selected) ─────────────
+        self._my_stocks_box = QGroupBox("My Stocks — one ticker per line")
+        ml = QVBoxLayout(self._my_stocks_box)
+        self._my_stocks_edit = QTextEdit()
+        self._my_stocks_edit.setPlaceholderText("AAPL\nMSFT\nTSLA")
+        self._my_stocks_edit.setFixedHeight(110)
+        self._my_stocks_edit.textChanged.connect(self._save_timer.start)
+        ml.addWidget(self._my_stocks_edit)
+        self._my_stocks_box.setVisible(False)
+        root.addWidget(self._my_stocks_box)
+
+        self._universe_src_btn.toggled.connect(self._on_source_changed)
+
         # ── Parameters ────────────────────────────────────────────────────────
         params_box = QGroupBox("Parameters")
         pf = QFormLayout(params_box)
@@ -119,7 +201,7 @@ class StockScannerTab(QWidget):
         ph = QHBoxLayout(price_row)
         ph.setContentsMargins(0, 0, 0, 0)
         self._price_min = QLineEdit("10.0")
-        self._price_max = QLineEdit("500.0")
+        self._price_max = QLineEdit("400.0")
         ph.addWidget(self._price_min)
         ph.addWidget(QLabel("–"))
         ph.addWidget(self._price_max)
@@ -146,6 +228,7 @@ class StockScannerTab(QWidget):
         wh.addWidget(self._watchlist_edit, 1)
         wh.addWidget(browse_btn)
         wh.addWidget(clear_btn)
+        self._watchlist_row = wl_row
         pf.addRow("Watchlist file:", wl_row)
 
         root.addWidget(params_box)
@@ -209,14 +292,14 @@ class StockScannerTab(QWidget):
         self._price_box = QGroupBox("Price-Screened — 0 symbols")
         self._price_box.setProperty("_base", "Price-Screened")
         prl = QVBoxLayout(self._price_box)
-        self._price_table = _new_table(_PRICE_HEADERS)
+        self._price_table = _new_table(_PRICE_HEADERS, _PRICE_COLS)
         prl.addWidget(self._price_table)
         results_split.addWidget(self._price_box)
 
         self._cand_box = QGroupBox("Technical Candidates — 0 candidates")
         self._cand_box.setProperty("_base", "Technical Candidates")
         cl = QVBoxLayout(self._cand_box)
-        self._cand_table = _new_table(_HEADERS)
+        self._cand_table = _new_table(_HEADERS, _COLS)
         cl.addWidget(self._cand_table)
         results_split.addWidget(self._cand_box)
 
@@ -230,6 +313,18 @@ class StockScannerTab(QWidget):
 
     # ── slots ─────────────────────────────────────────────────────────────────
 
+    def _on_source_changed(self, universe_checked: bool):
+        """Grey out what a my-stocks scan doesn't use, so the UI says what applies.
+
+        A my-stocks scan reports every ticker on the list with its indicators, so
+        the price range and the RSI/BB% thresholds have nothing to reject — but
+        the periods still decide how those indicators are computed.
+        """
+        self._my_stocks_box.setVisible(not universe_checked)
+        for w in (self._price_min, self._price_max, self._rsi_threshold,
+                  self._bb_pct_threshold, self._watchlist_row):
+            w.setEnabled(universe_checked)
+
     def _browse_watchlist(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select watchlist", "", "Text files (*.txt);;All files (*)"
@@ -238,7 +333,7 @@ class StockScannerTab(QWidget):
             self._watchlist_edit.setText(path)
 
     def _get_config(self) -> dict:
-        return {
+        config = {
             "price_min":        float(self._price_min.text()),
             "price_max":        float(self._price_max.text()),
             "rsi_threshold":    float(self._rsi_threshold.text()),
@@ -246,6 +341,9 @@ class StockScannerTab(QWidget):
             "rsi_period":       int(self._rsi_period.text()),
             "bb_period":        int(self._bb_period.text()),
         }
+        if self._mine_src_btn.isChecked():
+            config["symbols"] = self._get_my_stocks()
+        return config
 
     def _begin_scan(self) -> dict | None:
         try:
@@ -260,6 +358,9 @@ class StockScannerTab(QWidget):
         return config
 
     def _run_scan(self):
+        if self._mine_src_btn.isChecked() and not self._get_my_stocks():
+            self._log.append("No tickers in My Stocks — add at least one ticker.")
+            return
         config = self._begin_scan()
         if config is None:
             return

@@ -38,8 +38,9 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
 - **`screener.py`** — all screener logic; the screener GUI calls this exclusively. All market data comes from Schwab via `schwab_client`.
   - `run_price_screen()` — Pass 1: batched Schwab `quotes()` (~250/call) filtered to the price range. Writes `price_screen_cache.json`.
   - `run_technical_filter()` — Pass 2: 45-day history via Schwab `price_history_daily()`, then RSI/BB% filter. Writes `tech_history_cache.json` and `tech_candidates_cache.json`.
-  - `run_options_filter()` — real-time option chains via Schwab (`_fetch_schwab_chain`, one call per symbol) with a yield range filter.
+  - `run_options_filter()` — real-time option chains via Schwab (`_fetch_schwab_chain`, one call per symbol) filtered on premium % (`premium_pct` = premium ÷ stock price, the 1%-rule figure).
   - `run_screener()` — convenience wrapper that chains the passes above.
+  - Ticker source: `config["symbols"]` (the Stock Scanner's "My Stocks" mode, backed by `my_positions.txt`) scans exactly those tickers instead of the universe — the price range and the RSI/BB% thresholds are measured but never reject, so every one of your symbols comes back with its indicators. Both cache keys drop the settings that no longer apply, so they can't collide with a universe scan's results.
   - Symbol universe: persisted to `universe.json`, built from the SEC EDGAR list (NYSE/Nasdaq common stocks, ETFs/funds filtered by name) validated against Schwab pricing via `build_universe()`; rejects go to `universe_dropped.json`. Precedence: `watchlist.txt` → `universe.json` → bootstrap from EDGAR. Refreshed on demand by the Stock Scanner's "Update Universe" button.
 
 - **`schwab_client.py`** — read-only Schwab Market Data client (wraps schwab-py). `get_client()` (cached token + manual-login fallback), `quotes()`, `option_chain()`, `price_history_daily()`. Credentials in gitignored `schwab_creds.txt`; token cached in gitignored `schwab_token.json` (access ~30 min, refresh ~7 days).
@@ -60,8 +61,8 @@ Built with PyQt6. `run_screener.py` just creates the `QApplication` (no local te
   - `TechnicalWorker` → `core.screener.run_technical_filter`
   - `OptionsWorker` → `core.screener.run_options_filter`
   - `LsoWorker` → `core.lso_analyzer.analyze_symbols` + `apply_contract_adjustments`, merges with options results
-- **`stock_tab.py`** — Stock Scanner UI; "Update Universe" button refreshes the universe; emits `scan_finished` when done.
-- **`options_tab.py`** — Options Scanner UI; scans from stock-scan candidates.
+- **`stock_tab.py`** — Stock Scanner UI; a Ticker Source toggle picks Universe/Watchlist or My Stocks (editing `my_positions.txt`, debounced); "Update Universe" button refreshes the universe; emits `scan_finished` when done.
+- **`options_tab.py`** — Options Scanner UI; scans from stock-scan candidates, minus the reject list (`reject_list.txt`, edited here).
 - **`lso_tab.py`** — LSO Analysis UI; reads `options_results_cache.json` and calls `LsoWorker`.
 
 ### Portfolio GUI (`gui/`)

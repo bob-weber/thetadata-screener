@@ -11,20 +11,61 @@ from PyQt6.QtWidgets import (
 
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal
 
+from . import column_help
 from .workers import OptionsWorker
 
-POSITIONS_FILE   = Path("my_positions.txt")
 REJECT_FILE      = Path("reject_list.txt")
 CANDIDATES_CACHE = Path("tech_candidates_cache.json")
 OPTIONS_CACHE    = Path("options_results_cache.json")
 
-_COLS    = ["symbol", "expiration", "dte", "strike", "otm_pct", "premium", "yield_pct",
-            "delta", "iv", "cushion_sigma", "iv_pctile"]
-_HEADERS = ["Symbol", "Expiration", "DTE", "Strike", "OTM%", "Premium", "Yield%",
-            "Delta", "IV%", "Cushion σ", "IV %ile"]
-_FLOAT_COLS = {"strike", "otm_pct", "premium", "yield_pct", "delta",
-               "iv", "cushion_sigma", "iv_pctile"}
+_COLS    = ["symbol", "expiration", "dte", "strike", "otm_pct", "premium",
+            "delta", "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct"]
+_HEADERS = ["Symbol", "Expiration", "DTE", "Strike", "OTM%", "Premium",
+            "Delta", "IV%", "Cushion σ", "IV %ile", "RSI", "BB%"]
+_FLOAT_COLS = {"strike", "otm_pct", "premium", "delta",
+               "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct"}
 _INT_COLS   = {"dte"}
+
+# Per-column help, shown when hovering a column header.
+_HELP = {
+    "symbol":     "Underlying ticker.",
+    "expiration": "Contract expiration date. The scan targets the date set in "
+                  "Parameters, snapping back to the nearest listed expiration on "
+                  "or before it.",
+    "dte":        "Days to expiration, counted from today.",
+    "strike":     "Strike price.\n\nFor a cash-secured put, strike × 100 is the "
+                  "cash locked up per contract — and the price you pay per share "
+                  "if you're assigned.",
+    "otm_pct":    "How far out of the money the strike sits:\n"
+                  "    (stock − strike) ÷ stock\n\n"
+                  "Negative means the strike is already in the money.",
+    "premium":    "Premium per share, in dollars — the bid when selling, the ask "
+                  "when buying. Multiply by 100 for the cash per contract.\n\n"
+                  "The Premium % box in Parameters filters on this as a fraction "
+                  "of the capital it ties up, not on the dollar figure.",
+    "delta":      "Option delta, from Schwab's chain.\n\nFor a short put its "
+                  "absolute value approximates the chance of finishing in the "
+                  "money: −0.20 ≈ 20%. It's also how much the contract price "
+                  "moves per $1 move in the stock.",
+    "iv":         "Implied volatility of the near-the-money contract, annualized.\n\n"
+                  "Under 25% is a grinder — thin premium to enter, roll and sell "
+                  "calls against. Over 80% pays richly but gaps hard.",
+    "cushion_sigma":
+                  "OTM distance measured in expected moves:\n"
+                  "    OTM% ÷ the underlying's expected move to expiration\n\n"
+                  "The primary risk gate. Below 1σ the premium isn't paying for "
+                  "the risk — 1.5σ for gappy names (earnings in the period, or "
+                  "Energy / Basic Materials).",
+    "iv_pctile":  "Where today's IV sits within this symbol's own trailing year "
+                  "of readings.\n\nHigh means premium is rich versus its own "
+                  "history and likely to compress in your favour; low means "
+                  "you're selling cheap volatility.",
+    "rsi":        "Wilder's RSI of the underlying, carried from the stock scan.\n\n"
+                  "Below 30 is oversold, above 70 overbought.",
+    "bb_pct":     "Where the underlying sits inside its Bollinger Bands, carried "
+                  "from the stock scan: 0% = lower band, 100% = upper band.\n\n"
+                  "Below 0 means price has broken under the lower band.",
+}
 
 
 class _NumericItem(QTableWidgetItem):
@@ -55,11 +96,6 @@ class OptionsScannerTab(QWidget):
         self._results_box = None
         self._table       = None
 
-        self._save_timer = QTimer()
-        self._save_timer.setSingleShot(True)
-        self._save_timer.setInterval(800)
-        self._save_timer.timeout.connect(self._save_positions)
-
         self._reject_save_timer = QTimer()
         self._reject_save_timer.setSingleShot(True)
         self._reject_save_timer.setInterval(800)
@@ -72,7 +108,6 @@ class OptionsScannerTab(QWidget):
             app.aboutToQuit.connect(self._flush_saves)
 
         self._setup_ui()
-        self._load_positions()
         self._load_reject()
         self.refresh_scanner_status()
         self._load_cached_results()
@@ -86,8 +121,6 @@ class OptionsScannerTab(QWidget):
 
     def refresh_scanner_status(self):
         """Update the candidates label from the last stock scan cache, if any."""
-        if not self._scanner_btn.isChecked():
-            return
         if not CANDIDATES_CACHE.exists():
             self._candidates_label.setText("Run the Stock Scanner first.")
             return
@@ -127,20 +160,6 @@ class OptionsScannerTab(QWidget):
         self._populate_table(results)
         self._results_box.setTitle(f"Results — {len(results)} contract(s) (EOD {trade_date})")
 
-    # ── positions file helpers ────────────────────────────────────────────────
-
-    def _load_positions(self):
-        if POSITIONS_FILE.exists():
-            self._positions_edit.setPlainText(POSITIONS_FILE.read_text())
-
-    def _save_positions(self):
-        POSITIONS_FILE.write_text(self._positions_edit.toPlainText())
-
-    def _get_positions(self) -> list[str]:
-        raw = self._positions_edit.toPlainText()
-        tickers = [t.strip().upper() for t in raw.splitlines()]
-        return [t for t in tickers if t]
-
     # ── reject-list file helpers ──────────────────────────────────────────────
 
     def _load_reject(self):
@@ -152,9 +171,6 @@ class OptionsScannerTab(QWidget):
 
     def _flush_saves(self):
         """Write out any edits still waiting on a debounce timer (e.g. on quit)."""
-        if self._save_timer.isActive():
-            self._save_timer.stop()
-            self._save_positions()
         if self._reject_save_timer.isActive():
             self._reject_save_timer.stop()
             self._save_reject()
@@ -169,38 +185,7 @@ class OptionsScannerTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
-        # ── Ticker source ─────────────────────────────────────────────────────
-        source_box = QGroupBox("Ticker Source")
-        sh = QHBoxLayout(source_box)
-        sh.setSpacing(16)
-
-        self._scanner_btn   = QRadioButton("Stock Scanner Results")
-        self._positions_btn = QRadioButton("My Positions")
-        self._scanner_btn.setChecked(True)
-        self._source_group = QButtonGroup()
-        self._source_group.addButton(self._scanner_btn,   0)
-        self._source_group.addButton(self._positions_btn, 1)
-        sh.addWidget(self._scanner_btn)
-        sh.addWidget(self._positions_btn)
-        sh.addStretch()
-        root.addWidget(source_box)
-
-        # ── My Positions editor (hidden until radio selected) ─────────────────
-        self._positions_box = QGroupBox("My Positions — one ticker per line")
-        pl = QVBoxLayout(self._positions_box)
-        self._positions_edit = QTextEdit()
-        self._positions_edit.setPlaceholderText("AAPL\nMSFT\nTSLA")
-        self._positions_edit.setFixedHeight(110)
-        self._positions_edit.textChanged.connect(self._save_timer.start)
-        pl.addWidget(self._positions_edit)
-        self._positions_box.setVisible(False)
-        root.addWidget(self._positions_box)
-
-        self._scanner_btn.toggled.connect(
-            lambda checked: self._positions_box.setVisible(not checked)
-        )
-
-        # ── Reject list (always applied, both ticker sources) ─────────────────
+        # ── Reject list (applied to the stock-scan candidates) ────────────────
         reject_box = QGroupBox("Reject List — never scan these (one ticker per line)")
         rj = QVBoxLayout(reject_box)
         self._reject_edit = QTextEdit()
@@ -254,16 +239,16 @@ class OptionsScannerTab(QWidget):
         self._weeklies_only.setChecked(True)
         pf.addRow("", self._weeklies_only)
 
-        yield_row = QWidget()
-        yh = QHBoxLayout(yield_row)
-        yh.setContentsMargins(0, 0, 0, 0)
-        self._yield_min = QLineEdit("0.9")
-        self._yield_max = QLineEdit("2.0")
-        yh.addWidget(self._yield_min)
-        yh.addWidget(QLabel("–"))
-        yh.addWidget(self._yield_max)
-        yh.addWidget(QLabel("%"))
-        pf.addRow("Yield range:", yield_row)
+        prem_row = QWidget()
+        ph2 = QHBoxLayout(prem_row)
+        ph2.setContentsMargins(0, 0, 0, 0)
+        self._premium_min = QLineEdit("0.9")
+        self._premium_max = QLineEdit("2.0")
+        ph2.addWidget(self._premium_min)
+        ph2.addWidget(QLabel("–"))
+        ph2.addWidget(self._premium_max)
+        ph2.addWidget(QLabel("%"))
+        pf.addRow("Premium %:", prem_row)
 
         root.addWidget(params_box)
 
@@ -306,6 +291,7 @@ class OptionsScannerTab(QWidget):
         rl = QVBoxLayout(self._results_box)
         self._table = QTableWidget(0, len(_HEADERS))
         self._table.setHorizontalHeaderLabels(_HEADERS)
+        column_help.install(self._table, _COLS, _HELP, self)
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -325,8 +311,8 @@ class OptionsScannerTab(QWidget):
             "right":            "P" if self._put_btn.isChecked() else "C",
             "side":             "sell" if self._sell_btn.isChecked() else "buy",
             "expiration_date":  self._exp_date.date().toString("yyyy-MM-dd"),
-            "yield_min":        float(self._yield_min.text()) / 100.0,
-            "yield_max":        float(self._yield_max.text()) / 100.0,
+            "premium_pct_min":  float(self._premium_min.text()) / 100.0,
+            "premium_pct_max":  float(self._premium_max.text()) / 100.0,
             "weeklies_only":    self._weeklies_only.isChecked(),
         }
 
@@ -337,14 +323,6 @@ class OptionsScannerTab(QWidget):
             self._log.append(f"Invalid parameter: {e}")
             return
 
-        using_positions = self._positions_btn.isChecked()
-        positions = None
-        if using_positions:
-            positions = self._get_positions()
-            if not positions:
-                self._log.append("No tickers in My Positions — add at least one ticker.")
-                return
-
         self._run_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._log.clear()
@@ -353,12 +331,9 @@ class OptionsScannerTab(QWidget):
         self._opts_bar.setValue(0)
         self._opts_label.setText("—")
 
-        if using_positions:
-            self._candidates_label.setText(f"{len(positions)} position(s) queued")
-        else:
-            self._candidates_label.setText("Loading stock scan results…")
+        self._candidates_label.setText("Loading stock scan results…")
 
-        self._worker = OptionsWorker(config, positions=positions, reject=self._get_reject())
+        self._worker = OptionsWorker(config, reject=self._get_reject())
         self._worker.log_msg.connect(self._log.append)
         self._worker.candidates_loaded.connect(self._on_candidates_loaded)
         self._worker.opts_progress.connect(self._on_opts_progress)
@@ -372,10 +347,7 @@ class OptionsScannerTab(QWidget):
         self._stop_btn.setEnabled(False)
 
     def _on_candidates_loaded(self, count: int):
-        if self._positions_btn.isChecked():
-            self._candidates_label.setText(f"{count} position(s) with prices fetched")
-        else:
-            self._candidates_label.setText(f"{count} candidates from Stock Scanner")
+        self._candidates_label.setText(f"{count} candidates from Stock Scanner")
 
     def _on_opts_progress(self, current: int, total: int):
         self._opts_label.setText(f"{current:,} / {total:,}")
@@ -396,10 +368,7 @@ class OptionsScannerTab(QWidget):
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._log.append(f"ERROR: {msg}")
-        if self._scanner_btn.isChecked():
-            self._candidates_label.setText("Run the Stock Scanner first.")
-        else:
-            self._candidates_label.setText("Ready.")
+        self._candidates_label.setText("Run the Stock Scanner first.")
 
     def _populate_table(self, results: list):
         self._results_box.setTitle(f"Results — {len(results)} contract(s)")

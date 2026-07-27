@@ -8,7 +8,7 @@ from .lso_tab     import LsoAnalysisTab
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ThetaData Screener")
+        self.setWindowTitle("LSO Stock Screener")
         self.resize(1100, 780)
 
         stock_tab   = StockScannerTab()

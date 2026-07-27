@@ -13,16 +13,79 @@ from PyQt6.QtGui import QColor, QGuiApplication
 from .claude_dialog import ClaudeAnalysisDialog
 from .chart_window import ChartWindow
 
+from . import column_help
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
 _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct",
-            "iv", "cushion_sigma", "iv_pctile", "capital",
+            "iv", "cushion_sigma", "iv_pctile", "rsi", "bb_pct", "capital",
             "sector", "beta", "mkt_cap_b",
             "earnings_date", "earnings_in_period", "flags", "notes"]
-_HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium", "OTM%",
-            "IV%", "Cushion σ", "IV %ile", "Capital",
+_HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium %", "OTM%",
+            "IV%", "Cushion σ", "IV %ile", "RSI", "BB%", "Capital",
             "Sector", "Beta", "Mkt Cap ($B)",
             "Earnings Date", "In Period?", "Flags", "Notes"]
+
+# Per-column help, shown when hovering a column header. Where a column feeds the
+# grade, the bands it scores on are spelled out — that scoring is the whole point
+# of this table, and it's otherwise only visible in the Notes column.
+_HELP = {
+    "grade":       "Wheel suitability for this specific contract.\n\n"
+                   "    A ≥ 85    B ≥ 70    C ≥ 55    D ≥ 40    F below\n\n"
+                   "Starts at 70 for the symbol's fundamentals (sector, beta, "
+                   "market cap, dividend, earnings), then every contract factor "
+                   "below adjusts it. Notes lists each adjustment that fired.",
+    "symbol":      "Underlying ticker. Click to open a price / BB / RSI chart.",
+    "stock_price": "Underlying price from the stock scan.",
+    "strike":      "Strike price. For a cash-secured put, strike × 100 is the "
+                   "cash you lock up per contract.",
+    "premium":     "Premium as a percentage of the capital the trade ties up:\n"
+                   "    put  — premium ÷ strike (the cash you secure)\n"
+                   "    call — premium ÷ share price (the shares you hold)\n\n"
+                   "This is the figure the 1% rule is stated in, and what the "
+                   "Options Scanner's Premium % band filters on.",
+    "otm_pct":     "How far out of the money the strike sits.\n\n"
+                   "Scores −100 if in the money, −30 under 2%, −10 under 4%, "
+                   "+3 to 8%, +5 to 12%, −5 to 16%, −30 beyond — a very wide "
+                   "strike still paying 1% means the market has priced in real "
+                   "downside.",
+    "iv":          "Implied volatility of the near-the-money contract, annualized.\n\n"
+                   "Scores −15 under 25% (too thin to roll or sell calls "
+                   "against), 0 from 25–80%, −8 above 80%.",
+    "cushion_sigma":
+                   "OTM distance in expected moves: OTM% ÷ the expected move to "
+                   "expiration. The primary risk gate.\n\n"
+                   "Scores −30 below 1σ (1.5σ for gappy names — earnings in the "
+                   "period, or Energy / Basic Materials), 0 from 1–1.5σ, +5 above.",
+    "iv_pctile":   "Today's IV within this symbol's own trailing year.\n\n"
+                   "Scores +3 at 67% or above (premium rich, likely to compress "
+                   "in your favour), −3 at 33% or below, 0 between.",
+    "rsi":         "Wilder's RSI of the underlying, from the stock scan.\n\n"
+                   "Scores −5 below 20 (capitulation, not a dip), +5 from 20–40 "
+                   "(the pullback the screen looks for), 0 from 40–60, −3 from "
+                   "60–70, −5 at 70 and above.",
+    "bb_pct":      "Where the underlying sits in its Bollinger Bands: 0% = lower "
+                   "band, 100% = upper.\n\n"
+                   "Scores −5 below 0 (a breakdown, not a dip), +5 from 0–33, "
+                   "0 from 33–67, −3 from 67–100, −5 above 100.",
+    "capital":     "Cash secured per contract: strike × 100.",
+    "sector":      "Sector from yfinance. Adjusts the base score — staples, "
+                   "utilities and healthcare score up; biotech, crypto-adjacent "
+                   "and speculative names score down.",
+    "beta":        "Beta vs. the market. Lower is steadier and scores higher; "
+                   "high-beta names swing through your strike more easily.",
+    "mkt_cap_b":   "Market capitalisation in billions. Larger caps score higher "
+                   "for option liquidity and survivability.",
+    "earnings_date":     "Next earnings date from yfinance.",
+    "earnings_in_period":
+                   "Whether earnings fall between now and expiration.\n\n"
+                   "If they do the contract takes a −40 hit and needs the wider "
+                   "1.5σ cushion — an earnings gap is exactly the move a short "
+                   "put can't absorb.",
+    "flags":       "Short risk labels raised by the scoring above. Anything here "
+                   "is worth reading the Notes for.",
+    "notes":       "Every scoring adjustment that fired for this contract, in "
+                   "the order applied — the full explanation of the grade.",
+}
 
 _SYMBOL_COL = _COLS.index("symbol")
 _LINK_COLOR = "#58a6ff"  # light blue link, legible on the dark table background
@@ -146,6 +209,7 @@ class LsoAnalysisTab(QWidget):
 
         self._table = QTableWidget(0, len(_HEADERS))
         self._table.setHorizontalHeaderLabels(_HEADERS)
+        column_help.install(self._table, _COLS, _HELP, self)
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -248,11 +312,11 @@ class LsoAnalysisTab(QWidget):
             f"- Scan date: {meta.get('date', 'unknown')}",
             f"- Expiration: {meta.get('expiration_date', 'unknown')}",
             f"- Right: {meta.get('right', 'P')}  Side: {meta.get('side', 'sell')}",
-            f"- Yield range: {meta.get('yield_min', 0)*100:.1f}% – {meta.get('yield_max', 0)*100:.1f}%",
+            f"- Premium %: {meta.get('premium_pct_min', 0)*100:.1f}% – {meta.get('premium_pct_max', 0)*100:.1f}%",
             f"- Contracts: {len(self._results)}",
             f"",
-            f"| Grade | Symbol | Stock | Strike | Premium | OTM% | IV% | Cushion σ | IV %ile | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
-            f"|-------|--------|-------|--------|---------|------|-----|-----------|---------|---------|--------|------|--------------|----------|-----------|-------|-------|",
+            f"| Grade | Symbol | Stock | Strike | Premium % | OTM% | IV% | Cushion σ | IV %ile | RSI | BB% | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
+            f"|-------|--------|-------|--------|-----------|------|-----|-----------|---------|-----|-----|---------|--------|------|--------------|----------|-----------|-------|-------|",
         ]
 
         sorted_results = sorted(
@@ -279,6 +343,8 @@ class LsoAnalysisTab(QWidget):
                 _v("iv",            "",  "%", ".0f"),
                 _v("cushion_sigma", "",  "σ", ".2f"),
                 _v("iv_pctile",     "",  "%", ".0f"),
+                _v("rsi",           "",  "",  ".1f"),
+                _v("bb_pct",        "",  "",  ".1f"),
                 cap_str,
                 r.get("sector", ""),
                 _v("beta",        "",  "", ".2f"),
