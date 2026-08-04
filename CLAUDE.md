@@ -40,7 +40,7 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
   - `run_technical_filter()` — Pass 2: 45-day history via Schwab `price_history_daily()`, then RSI/BB% filter. Writes `tech_history_cache.json` and `tech_candidates_cache.json`.
   - `run_options_filter()` — real-time option chains via Schwab (`_fetch_schwab_chain`, one call per symbol) filtered on premium % (`premium_pct` = premium ÷ stock price, the 1%-rule figure).
   - `run_screener()` — convenience wrapper that chains the passes above.
-  - Ticker source: `config["symbols"]` (the Stock Scanner's "My Stocks" mode, backed by `my_positions.txt`) scans exactly those tickers instead of the universe — the price range and the RSI/BB% thresholds are measured but never reject, so every one of your symbols comes back with its indicators. Both cache keys drop the settings that no longer apply, so they can't collide with a universe scan's results.
+  - Ticker source: `config["symbols"]` (the Stock Scanner's "Import List" and "Specify Stocks" modes) scans exactly those tickers instead of the universe — the price range and the RSI/BB% thresholds never reject, so every one of your symbols comes back with its indicators. Each row carries `passes` (would it have met the RSI/BB% thresholds), which greys the row out in the Stock Scanner and excludes it from the Options Scanner; a symbol with no computable indicator fails. A universe scan drops its failures outright, so all its rows pass. The price cache key drops the price range for a symbol scan, but thresholds stay in the full key for both — they shape the result either way.
   - Symbol universe: persisted to `universe.json`, built from the SEC EDGAR list (NYSE/Nasdaq common stocks, ETFs/funds filtered by name) validated against Schwab pricing via `build_universe()`; rejects go to `universe_dropped.json`. Precedence: `watchlist.txt` → `universe.json` → bootstrap from EDGAR. Refreshed on demand by the Stock Scanner's "Update Universe" button.
 
 - **`schwab_client.py`** — read-only Schwab Market Data client (wraps schwab-py). `get_client()` (cached token + manual-login fallback), `quotes()`, `option_chain()`, `price_history_daily()`. Credentials in gitignored `schwab_creds.txt`; token cached in gitignored `schwab_token.json` (access ~30 min, refresh ~7 days).
@@ -49,6 +49,7 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
   - `analyze_symbol()` — fetches sector, beta, market cap, dividend, earnings date from `yf.Ticker.info` and `ticker.calendar`. Starts at base score 70; applies adjustments from `_SECTOR_SCORES`, `_INDUSTRY_EXTRA`, `_score_beta()`, `_score_market_cap()`.
   - `apply_contract_adjustments()` — re-scores per contract: OTM% band, σ-cushion gate, IV level, IV/HV, RSI, BB% and bid-ask spread.
   - Grading: A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F < 40 (score clamped 0–100).
+  - `load_durable_tags()` / `tags_for()` — hand-maintained risk tags from `durable-tags.json` (ticker → list of tags), shown in the LSO table's Tags column and never scored. Re-read when the file's mtime changes, so tags added mid-session appear on the next run. A ticker mapped to `[]` is researched-with-no-tag; one absent from the file renders as UNTAGGED and is listed in the status line and log.
   - **Every factor, its band and its rationale is documented in [`docs/grading.md`](docs/grading.md)** — update it alongside any scoring change.
 
 ### Screener GUI (`gui/`)
@@ -62,8 +63,8 @@ Built with PyQt6. `run_screener.py` just creates the `QApplication` (no local te
   - `TechnicalWorker` → `core.screener.run_technical_filter`
   - `OptionsWorker` → `core.screener.run_options_filter`
   - `LsoWorker` → `core.lso_analyzer.analyze_symbols` + `apply_contract_adjustments`, merges with options results
-- **`stock_tab.py`** — Stock Scanner UI; a Ticker Source toggle picks Universe/Watchlist or My Stocks (editing `my_positions.txt`, debounced); "Update Universe" button refreshes the universe; emits `scan_finished` when done.
-- **`options_tab.py`** — Options Scanner UI; scans from stock-scan candidates, minus the reject list (`reject_list.txt`, edited here).
+- **`stock_tab.py`** — Stock Scanner UI; a Ticker Source radio picks one of three: **Universe** (the whole universe, price range and RSI/BB% thresholds enforced), **Import List** (a text file of tickers, re-read at scan time), or **Specify Stocks** (a one-line comma/space-separated list, persisted to `my_positions.txt` one-per-line, debounced). The two explicit-list modes report every ticker with its indicators rather than filtering, greying out (`_style_row`) those outside the thresholds. `_parse_ticker_list()` splits on commas, spaces and newlines for both. "Update Universe" button refreshes the universe; emits `scan_finished` when done.
+- **`options_tab.py`** — Options Scanner UI; scans from stock-scan candidates, minus the rows marked `passes: false` and minus the reject list (`reject_list.txt`, edited here).
 - **`lso_tab.py`** — LSO Analysis UI; reads `options_results_cache.json` and calls `LsoWorker`.
 
 ### Portfolio GUI (`gui/`)
