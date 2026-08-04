@@ -1,3 +1,4 @@
+import csv
 import json
 from datetime import date
 from pathlib import Path
@@ -6,9 +7,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter,
+    QFileDialog, QMessageBox,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QGuiApplication
+from PyQt6.QtGui import QColor
 
 from .claude_dialog import ClaudeAnalysisDialog
 from .chart_window import ChartWindow
@@ -19,12 +21,12 @@ from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 _COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct",
             "iv", "cushion_sigma", "iv_hv", "rsi", "bb_pct",
             "spread_pct", "open_interest", "capital",
-            "sector", "beta", "mkt_cap_b",
+            "sector", "tags", "beta", "mkt_cap_b",
             "earnings_date", "earnings_in_period", "flags", "notes"]
 _HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium %", "OTM%",
             "IV%", "Cushion σ", "IV/HV", "RSI", "BB%",
             "Spread %", "OI", "Capital",
-            "Sector", "Beta", "Mkt Cap ($B)",
+            "Sector", "Tags", "Beta", "Mkt Cap ($B)",
             "Earnings Date", "In Period?", "Flags", "Notes"]
 
 # Per-column help, shown when hovering a column header. Where a column feeds the
@@ -87,6 +89,14 @@ _HELP = {
     "sector":      "Sector from yfinance. Adjusts the base score — staples, "
                    "utilities and healthcare score up; biotech, crypto-adjacent "
                    "and speculative names score down.",
+    "tags":        "Durable risk tags for the underlying, from durable-tags.json "
+                   "— what moves this name that a sector label doesn't capture "
+                   "(AI-capex, rate-sensitive growth, commodity/geopolitical, "
+                   "crypto-linked …).\n\n"
+                   "Read across the table before writing: several contracts "
+                   "sharing a tag are one bet, not diversification.\n\n"
+                   "Not scored. '—' means researched with no tag; UNTAGGED "
+                   "means the ticker isn't in the file yet and should be added.",
     "beta":        "Beta vs. the market. Lower is steadier and scores higher; "
                    "high-beta names swing through your strike more easily.",
     "mkt_cap_b":   "Market capitalisation in billions. Larger caps score higher "
@@ -135,6 +145,14 @@ def _grade_sort_key(grade: str) -> int:
     return {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}.get(grade, 5)
 
 
+def _tags_text(row: dict) -> str:
+    """Tags as one cell: the tags, '—' if researched with none, else UNTAGGED."""
+    if not row.get("tags_researched"):
+        return "UNTAGGED"
+    tags = row.get("tags") or []
+    return ", ".join(tags) if tags else "—"
+
+
 class LsoAnalysisTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -175,7 +193,7 @@ class LsoAnalysisTab(QWidget):
         self._status_label = QLabel("Run the Options Scanner first.")
         self._run_btn    = QPushButton("Analyze for LSO")
         self._stop_btn   = QPushButton("Stop")
-        self._export_btn = QPushButton("Export for Claude")
+        self._export_btn = QPushButton("Export for Claude…")
         self._run_btn.setFixedHeight(32)
         self._stop_btn.setFixedHeight(32)
         self._export_btn.setFixedHeight(32)
@@ -276,8 +294,22 @@ class LsoAnalysisTab(QWidget):
         self._stop_btn.setEnabled(False)
         self._export_btn.setEnabled(bool(results))
         self._progress_bar.setValue(100)
-        self._status_label.setText(f"{len(results)} contracts analyzed.")
+
+        status = f"{len(results)} contracts analyzed."
+        untagged = sorted({r.get("symbol", "") for r in results
+                           if not r.get("tags_researched")})
+        if untagged:
+            status += (f"  {len(untagged)} symbol(s) missing from "
+                       f"durable-tags.json: {', '.join(untagged)}")
+        self._status_label.setText(status)
+
         self._log.append(f"Done — {len(results)} contracts analyzed.")
+        if untagged:
+            self._log.append(
+                f"Not in durable-tags.json ({len(untagged)}): "
+                f"{', '.join(untagged)} — research and add them "
+                f"(use [] for a name with no durable tag)."
+            )
         self._populate_table(results)
 
     def _on_error(self, msg: str):
@@ -314,6 +346,12 @@ class LsoAnalysisTab(QWidget):
         dlg.exec()
 
     def _export(self):
+        """Write the analysed contracts to a CSV, for uploading to a chat.
+
+        Numbers go out bare — no $, %, σ or thousands separators — so they
+        arrive as numbers rather than strings. The table's formatting is for
+        reading on screen; a CSV is for parsing.
+        """
         if not self._results:
             return
 
@@ -322,60 +360,76 @@ class LsoAnalysisTab(QWidget):
         except Exception:
             meta = {}
 
-        lines = [
-            f"# LSO Analysis — {date.today()}",
-            f"",
-            f"- Scan date: {meta.get('date', 'unknown')}",
-            f"- Expiration: {meta.get('expiration_date', 'unknown')}",
-            f"- Right: {meta.get('right', 'P')}  Side: {meta.get('side', 'sell')}",
-            f"- Premium %: {meta.get('premium_pct_min', 0)*100:.1f}% – {meta.get('premium_pct_max', 0)*100:.1f}%",
-            f"- Contracts: {len(self._results)}",
-            f"",
-            f"| Grade | Symbol | Stock | Strike | Premium % | OTM% | IV% | Cushion σ | IV/HV | RSI | BB% | Spread % | OI | Capital | Sector | Beta | Mkt Cap ($B) | Earnings | In Period | Flags | Notes |",
-            f"|-------|--------|-------|--------|-----------|------|-----|-----------|---------|-----|-----|----------|-----|---------|--------|------|--------------|----------|-----------|-------|-------|",
-        ]
+        default = f"lso-analysis-{date.today()}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export LSO analysis", default,
+            "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
 
         sorted_results = sorted(
             self._results,
             key=lambda r: (_grade_sort_key(r.get("grade", "?")), r.get("symbol", ""))
         )
-        for r in sorted_results:
-            def _v(key, prefix="", suffix="", fmt=""):
-                val = r.get(key)
-                if val is None:
-                    return ""
-                formatted = format(val, fmt) if fmt else str(val)
-                return f"{prefix}{formatted}{suffix}"
 
-            cap = r.get("capital")
-            cap_str = f"${int(cap):,}" if cap is not None else ""
-            cells = [
-                r.get("grade", "?"),
-                r.get("symbol", ""),
-                _v("stock_price", "$", "", ".2f"),
-                _v("strike",      "$", "", ".2f"),
-                _v("premium",     "",  "%", ".2f"),
-                _v("otm_pct",     "",  "%", ".1f"),
-                _v("iv",            "",  "%", ".0f"),
-                _v("cushion_sigma", "",  "σ", ".2f"),
-                _v("iv_hv",         "",  "",  ".2f"),
-                _v("rsi",           "",  "",  ".1f"),
-                _v("bb_pct",        "",  "",  ".1f"),
-                _v("spread_pct",    "",  "%", ".0f"),
-                _v("open_interest", "",  "",  ""),
-                cap_str,
-                r.get("sector", ""),
-                _v("beta",        "",  "", ".2f"),
-                _v("mkt_cap_b",   "",  "", ".1f"),
-                r.get("earnings_date", ""),
-                "YES" if r.get("earnings_in_period") else "no",
-                r.get("flags", ""),
-                r.get("notes", ""),
-            ]
-            lines.append("| " + " | ".join(cells) + " |")
+        def _n(row, key, fmt=""):
+            val = row.get(key)
+            if val is None:
+                return ""
+            return format(val, fmt) if fmt else str(val)
 
-        QGuiApplication.clipboard().setText("\n".join(lines))
-        self._status_label.setText(f"Copied {len(self._results)} contracts to clipboard.")
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["LSO Analysis", str(date.today())])
+                w.writerow(["Scan date", meta.get("date", "unknown")])
+                w.writerow(["Expiration", meta.get("expiration_date", "unknown")])
+                w.writerow(["Right", meta.get("right", "P"),
+                            "Side", meta.get("side", "sell")])
+                w.writerow(["Premium pct min", f"{meta.get('premium_pct_min', 0)*100:.1f}",
+                            "Premium pct max", f"{meta.get('premium_pct_max', 0)*100:.1f}"])
+                w.writerow(["Contracts", len(sorted_results)])
+                w.writerow([])
+                w.writerow([
+                    "Grade", "Symbol", "Stock", "Strike", "Premium Pct", "OTM Pct",
+                    "IV Pct", "Cushion Sigma", "IV/HV", "RSI", "BB Pct",
+                    "Spread Pct", "OI", "Capital", "Sector", "Tags", "Beta",
+                    "Mkt Cap B", "Earnings Date", "Earnings In Period",
+                    "Flags", "Notes",
+                ])
+                for r in sorted_results:
+                    cap = r.get("capital")
+                    w.writerow([
+                        r.get("grade", "?"),
+                        r.get("symbol", ""),
+                        _n(r, "stock_price", ".2f"),
+                        _n(r, "strike", ".2f"),
+                        _n(r, "premium", ".2f"),
+                        _n(r, "otm_pct", ".1f"),
+                        _n(r, "iv", ".0f"),
+                        _n(r, "cushion_sigma", ".2f"),
+                        _n(r, "iv_hv", ".2f"),
+                        _n(r, "rsi", ".1f"),
+                        _n(r, "bb_pct", ".1f"),
+                        _n(r, "spread_pct", ".0f"),
+                        _n(r, "open_interest"),
+                        f"{int(cap)}" if cap is not None else "",
+                        r.get("sector", ""),
+                        _tags_text(r),
+                        _n(r, "beta", ".2f"),
+                        _n(r, "mkt_cap_b", ".1f"),
+                        r.get("earnings_date", ""),
+                        "YES" if r.get("earnings_in_period") else "no",
+                        r.get("flags", ""),
+                        r.get("notes", ""),
+                    ])
+        except OSError as e:
+            QMessageBox.warning(self, "Export", f"Could not write {path}:\n{e}")
+            return
+
+        self._status_label.setText(
+            f"Exported {len(sorted_results)} contracts to {path}")
 
     def _populate_table(self, results: list):
         results = sorted(results, key=lambda r: (_grade_sort_key(r.get("grade", "?")), r.get("symbol", "")))
@@ -426,6 +480,20 @@ class LsoAnalysisTab(QWidget):
                     item = _SortItem(f"{float(val):.2f}", float(val))
                 elif key == "mkt_cap_b" and val is not None:
                     item = _SortItem(f"{float(val):.2f}", float(val))
+                elif key == "tags":
+                    tags = val or []
+                    if not row.get("tags_researched"):
+                        item = QTableWidgetItem("UNTAGGED")
+                        item.setForeground(QColor("#8a3300"))
+                        item.setBackground(QColor("#fff0e6"))
+                        item.setToolTip(
+                            f"{row.get('symbol', '')} is not in durable-tags.json — "
+                            "research it and add an entry (use [] for no tags)."
+                        )
+                    else:
+                        item = QTableWidgetItem(", ".join(tags) if tags else "—")
+                        if tags:
+                            item.setToolTip("\n".join(tags))
                 elif key == "earnings_in_period":
                     item = QTableWidgetItem("YES" if val else "no")
                     if val:
