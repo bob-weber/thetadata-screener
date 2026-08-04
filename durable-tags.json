@@ -1,0 +1,526 @@
+{
+  "AA": [
+    "commodity-geopolitical"
+  ],
+  "AAOI": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "AAPL": [
+    "mega-cap-bellwether"
+  ],
+  "ACI": [],
+  "ADI": [
+    "ai-capex-chips"
+  ],
+  "ADP": [],
+  "AEM": [
+    "commodity-geopolitical"
+  ],
+  "AES": [
+    "ai-capex-power"
+  ],
+  "AFRM": [
+    "rate-sensitive-growth"
+  ],
+  "AG": [
+    "commodity-geopolitical"
+  ],
+  "AKAM": [
+    "ai-capex-cloud-pureplay"
+  ],
+  "ALB": [
+    "commodity-geopolitical"
+  ],
+  "ALGN": [],
+  "AMD": [
+    "ai-capex-chips"
+  ],
+  "AMPX": [
+    "rate-sensitive-growth"
+  ],
+  "AMZN": [
+    "mega-cap-bellwether",
+    "ai-capex-cloud-pureplay"
+  ],
+  "APA": [
+    "commodity-geopolitical"
+  ],
+  "APLD": [
+    "ai-capex-cloud-pureplay",
+    "crypto-linked"
+  ],
+  "APP": [
+    "ai-sentiment-spillover",
+    "rate-sensitive-growth"
+  ],
+  "ARM": [
+    "ai-capex-chips",
+    "rate-sensitive-growth"
+  ],
+  "ASTS": [
+    "rate-sensitive-growth"
+  ],
+  "AVGO": [
+    "ai-capex-chips"
+  ],
+  "AXTI": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "BABA": [
+    "commodity-geopolitical"
+  ],
+  "BE": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "BEKE": [],
+  "BIDU": [],
+  "BLSH": [
+    "crypto-linked",
+    "recent-ipo"
+  ],
+  "BP": [
+    "commodity-geopolitical"
+  ],
+  "BTU": [
+    "commodity-geopolitical"
+  ],
+  "CART": [],
+  "CBRS": [
+    "recent-ipo",
+    "ai-sentiment-spillover"
+  ],
+  "CC": [
+    "commodity-geopolitical"
+  ],
+  "CCJ": [
+    "commodity-geopolitical",
+    "ai-capex-power"
+  ],
+  "CDE": [
+    "commodity-geopolitical"
+  ],
+  "CEG": [
+    "ai-capex-power"
+  ],
+  "CELH": [],
+  "CF": [
+    "commodity-geopolitical"
+  ],
+  "CHWY": [],
+  "CI": [],
+  "CIEN": [
+    "ai-sentiment-spillover"
+  ],
+  "CLSK": [
+    "crypto-linked"
+  ],
+  "CNC": [],
+  "CNQ": [
+    "commodity-geopolitical"
+  ],
+  "COIN": [
+    "crypto-linked"
+  ],
+  "COP": [
+    "commodity-geopolitical"
+  ],
+  "CORZ": [
+    "crypto-linked"
+  ],
+  "CRCL": [
+    "crypto-linked",
+    "recent-ipo"
+  ],
+  "CRH": [],
+  "CRM": [
+    "ai-sentiment-spillover"
+  ],
+  "CRSP": [
+    "biotech-binary"
+  ],
+  "CRWV": [
+    "ai-capex-cloud-pureplay",
+    "mega-cap-bellwether"
+  ],
+  "CVNA": [
+    "rate-sensitive-growth"
+  ],
+  "CVX": [
+    "commodity-geopolitical"
+  ],
+  "DAVE": [
+    "rate-sensitive-growth"
+  ],
+  "DECK": [],
+  "DHI": [
+    "rate-sensitive-growth"
+  ],
+  "DKNG": [
+    "rate-sensitive-growth"
+  ],
+  "DOCN": [
+    "ai-capex-cloud-pureplay"
+  ],
+  "DOCU": [],
+  "DVN": [
+    "commodity-geopolitical"
+  ],
+  "ECHO": [],
+  "ELF": [],
+  "ENPH": [
+    "solar-policy"
+  ],
+  "EOG": [
+    "commodity-geopolitical"
+  ],
+  "EQPT": [
+    "recent-ipo"
+  ],
+  "FCX": [
+    "commodity-geopolitical"
+  ],
+  "FDX": [],
+  "FIG": [
+    "recent-ipo"
+  ],
+  "FLY": [
+    "rate-sensitive-growth"
+  ],
+  "GAP": [],
+  "GDDY": [],
+  "GLXY": [
+    "crypto-linked"
+  ],
+  "GNRC": [
+    "ai-capex-power"
+  ],
+  "GOOG": [
+    "mega-cap-bellwether",
+    "ai-sentiment-spillover"
+  ],
+  "GOOGL": [
+    "mega-cap-bellwether",
+    "ai-sentiment-spillover"
+  ],
+  "HAL": [
+    "commodity-geopolitical"
+  ],
+  "HD": [],
+  "HIMS": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "HL": [
+    "commodity-geopolitical"
+  ],
+  "HLT": [],
+  "HSY": [],
+  "HUM": [],
+  "HUT": [
+    "crypto-linked"
+  ],
+  "IBM": [
+    "ai-sentiment-spillover"
+  ],
+  "ICE": [],
+  "INTC": [
+    "ai-capex-chips"
+  ],
+  "IONQ": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "IREN": [
+    "ai-capex-cloud-pureplay",
+    "crypto-linked"
+  ],
+  "ISRG": [],
+  "JD": [],
+  "KGC": [
+    "commodity-geopolitical"
+  ],
+  "KLAC": [
+    "ai-capex-chips"
+  ],
+  "KTOS": [
+    "commodity-geopolitical"
+  ],
+  "LEN": [
+    "rate-sensitive-growth"
+  ],
+  "LHX": [
+    "commodity-geopolitical"
+  ],
+  "LI": [],
+  "LMND": [
+    "rate-sensitive-growth"
+  ],
+  "LRCX": [
+    "ai-capex-chips"
+  ],
+  "LULU": [],
+  "LUNR": [
+    "rate-sensitive-growth"
+  ],
+  "LUV": [],
+  "LYV": [],
+  "MARA": [
+    "crypto-linked"
+  ],
+  "MCHP": [
+    "ai-capex-chips"
+  ],
+  "META": [
+    "mega-cap-bellwether",
+    "ai-sentiment-spillover"
+  ],
+  "MGM": [],
+  "MO": [],
+  "MP": [
+    "commodity-geopolitical"
+  ],
+  "MRVL": [
+    "ai-capex-chips"
+  ],
+  "MSFT": [
+    "mega-cap-bellwether",
+    "ai-capex-cloud-pureplay"
+  ],
+  "MSTR": [
+    "crypto-linked"
+  ],
+  "MU": [
+    "ai-capex-chips"
+  ],
+  "NBIS": [
+    "ai-capex-cloud-pureplay"
+  ],
+  "NCLH": [],
+  "NEM": [
+    "commodity-geopolitical"
+  ],
+  "NFLX": [],
+  "NKE": [],
+  "NN": [
+    "ai-capex-power"
+  ],
+  "NNE": [
+    "ai-capex-power",
+    "rate-sensitive-growth"
+  ],
+  "NRG": [
+    "ai-capex-power"
+  ],
+  "NTR": [
+    "commodity-geopolitical"
+  ],
+  "NVDA": [
+    "mega-cap-bellwether",
+    "ai-capex-chips"
+  ],
+  "NVTS": [
+    "rate-sensitive-growth",
+    "ai-capex-chips"
+  ],
+  "ODD": [],
+  "OKLO": [
+    "ai-capex-power",
+    "rate-sensitive-growth"
+  ],
+  "ON": [
+    "ai-capex-chips"
+  ],
+  "ORCL": [
+    "ai-capex-software"
+  ],
+  "OXY": [
+    "commodity-geopolitical"
+  ],
+  "PAAS": [
+    "commodity-geopolitical"
+  ],
+  "PDD": [],
+  "PG": [],
+  "PL": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "PLTR": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "PPG": [],
+  "QBTS": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "QCOM": [
+    "ai-capex-chips"
+  ],
+  "QXO": [
+    "rate-sensitive-growth"
+  ],
+  "RBLX": [
+    "ai-sentiment-spillover",
+    "rate-sensitive-growth"
+  ],
+  "RBRK": [],
+  "RDDT": [
+    "ai-sentiment-spillover",
+    "rate-sensitive-growth"
+  ],
+  "RDW": [
+    "rate-sensitive-growth"
+  ],
+  "RGTI": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "RH": [
+    "rate-sensitive-growth"
+  ],
+  "RIOT": [
+    "crypto-linked"
+  ],
+  "RKLB": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "RKT": [
+    "rate-sensitive-growth"
+  ],
+  "RUN": [
+    "solar-policy",
+    "rate-sensitive-growth"
+  ],
+  "SCCO": [
+    "commodity-geopolitical"
+  ],
+  "SEDG": [
+    "solar-policy"
+  ],
+  "SERV": [
+    "ai-sentiment-spillover"
+  ],
+  "SGML": [
+    "commodity-geopolitical"
+  ],
+  "SHEL": [
+    "commodity-geopolitical"
+  ],
+  "SHOP": [
+    "ai-sentiment-spillover",
+    "rate-sensitive-growth"
+  ],
+  "SKYT": [
+    "rate-sensitive-growth"
+  ],
+  "SLB": [
+    "commodity-geopolitical"
+  ],
+  "SMCI": [
+    "ai-capex-cloud-pureplay"
+  ],
+  "SMMT": [
+    "biotech-binary"
+  ],
+  "SNPS": [
+    "ai-capex-software"
+  ],
+  "SOFI": [
+    "rate-sensitive-growth"
+  ],
+  "SOUN": [
+    "ai-sentiment-spillover"
+  ],
+  "SPCX": [
+    "recent-ipo",
+    "rate-sensitive-growth"
+  ],
+  "STM": [
+    "ai-capex-chips"
+  ],
+  "STRK": [
+    "crypto-linked"
+  ],
+  "STZ": [],
+  "SU": [
+    "commodity-geopolitical"
+  ],
+  "T": [],
+  "TEAM": [
+    "ai-sentiment-spillover"
+  ],
+  "TECK": [
+    "commodity-geopolitical"
+  ],
+  "TEM": [
+    "biotech-binary"
+  ],
+  "TLN": [
+    "ai-capex-power"
+  ],
+  "TMUS": [],
+  "TSLA": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "TSM": [
+    "ai-capex-chips"
+  ],
+  "TTD": [
+    "ai-sentiment-spillover"
+  ],
+  "TXN": [
+    "ai-capex-chips"
+  ],
+  "UAL": [],
+  "UEC": [
+    "commodity-geopolitical"
+  ],
+  "UPS": [],
+  "UPST": [
+    "rate-sensitive-growth",
+    "ai-sentiment-spillover"
+  ],
+  "USAR": [
+    "commodity-geopolitical",
+    "rate-sensitive-growth"
+  ],
+  "UUUU": [
+    "commodity-geopolitical"
+  ],
+  "VALE": [
+    "commodity-geopolitical"
+  ],
+  "VFC": [],
+  "VKTX": [
+    "biotech-binary"
+  ],
+  "VRT": [
+    "ai-capex-power"
+  ],
+  "VZ": [],
+  "WBD": [
+    "merger-arb"
+  ],
+  "WOLF": [
+    "rate-sensitive-growth"
+  ],
+  "WPM": [
+    "commodity-geopolitical"
+  ],
+  "WULF": [
+    "crypto-linked"
+  ],
+  "XOM": [
+    "commodity-geopolitical"
+  ],
+  "XPEV": [],
+  "ZETA": [
+    "ai-sentiment-spillover"
+  ]
+}

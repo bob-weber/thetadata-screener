@@ -226,11 +226,22 @@ which quote much wider than index options; 15–20% is normal here.
 theoretical whatever the spread says, but a thin-yet-tight market is still
 tradeable, and the spread already captures most of it.
 
+**Tags** are displayed but not scored. They come from `durable-tags.json`, a
+hand-researched map of ticker → risk tags (`ai-capex-chips`,
+`commodity-geopolitical`, `rate-sensitive-growth`, …) naming what actually moves
+a name when the sector label doesn't. Nothing in the grade uses them: the grade
+judges one contract in isolation, while tags are for reading *across* the
+table — four A-grade contracts sharing `ai-capex-chips` are one bet on one
+factor, which no per-contract score can see. A ticker mapped to `[]` has been
+researched and carries no durable tag; a ticker absent from the file shows
+**UNTAGGED** and is listed in the status line and log so it can be added.
+
 ## Where the numbers come from
 
 | Input | Source |
 |---|---|
 | Sector, industry, beta, market cap, dividend, earnings date | yfinance (`Ticker.info`, `Ticker.calendar`) |
+| Tags | `durable-tags.json`, hand-maintained (re-read when the file changes) |
 | Strike, premium, bid/ask, delta, IV, open interest | Schwab option chain, live |
 | RSI, BB%, realized volatility | The stock scan's own daily closes, via the history store |
 | OTM%, σ-cushion, IV/HV, spread% | Computed in `core/screener.py` from the above |

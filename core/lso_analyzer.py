@@ -1,7 +1,17 @@
+import json
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
 import yfinance as yf
+
+# Hand-researched risk tags per ticker: {"CCJ": ["ai-capex-power", ...], ...}.
+# A ticker mapped to an empty list has been researched and carries no durable
+# tag; a ticker absent from the file has not been researched yet, and the two
+# are reported differently so the second can be worked through.
+DURABLE_TAGS_FILE = "durable-tags.json"
+
+_tags_cache: tuple[float, dict[str, list[str]]] | None = None
 
 # Sector score adjustments and explanatory notes
 _SECTOR_SCORES: dict[str, tuple[int, str]] = {
@@ -27,6 +37,43 @@ _INDUSTRY_EXTRA: dict[str, tuple[int, str]] = {
     "coal":                   (-10, "Structural decline; regulatory risk"),
     "uranium":                (-10, "Regulatory and geopolitical sensitivity"),
 }
+
+
+def load_durable_tags() -> dict[str, list[str]]:
+    """Ticker → risk tags from ``durable-tags.json`` (empty dict if unreadable).
+
+    Re-read whenever the file's mtime changes, so tags added during a session
+    show up on the next analysis without restarting the app.
+    """
+    global _tags_cache
+    path = Path(DURABLE_TAGS_FILE)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _tags_cache = None
+        return {}
+    if _tags_cache is not None and _tags_cache[0] == mtime:
+        return _tags_cache[1]
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        _tags_cache = None
+        return {}
+    tags = {
+        str(sym).strip().upper(): [str(t) for t in (val or [])]
+        for sym, val in raw.items()
+    }
+    _tags_cache = (mtime, tags)
+    return tags
+
+
+def tags_for(symbol: str) -> tuple[list[str], bool]:
+    """``(tags, researched)`` for a symbol. Not in the file → ``([], False)``."""
+    tags = load_durable_tags()
+    key = (symbol or "").strip().upper()
+    if key not in tags:
+        return [], False
+    return tags[key], True
 
 
 def _score_beta(beta: float | None) -> tuple[int, str]:
@@ -320,6 +367,9 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
     flags  = []
     notes  = []
 
+    # Tags are local data, not market data — they survive a yfinance failure.
+    tags, tags_researched = tags_for(symbol)
+
     try:
         ticker = yf.Ticker(symbol)
         info   = ticker.info or {}
@@ -410,6 +460,8 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "grade":              grade,
             "score":              score,
             "sector":             sector,
+            "tags":               tags,
+            "tags_researched":    tags_researched,
             "industry":           info.get("industry", ""),
             "beta":               round(beta, 2) if beta is not None else None,
             "mkt_cap_b":          round((cap or 0) / 1e9, 2) if cap else None,
@@ -427,6 +479,8 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "grade":              "?",
             "score":              50,
             "sector":             "Error",
+            "tags":               tags,
+            "tags_researched":    tags_researched,
             "industry":           "",
             "beta":               None,
             "mkt_cap_b":          None,
