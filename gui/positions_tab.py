@@ -9,13 +9,15 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout,
+    QWidget, QVBoxLayout, QGroupBox,
     QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel, QFileDialog, QMessageBox,
     QAbstractItemView, QApplication,
 )
 
-from .account_store import DEFAULT_ACCT, events_path
+from core.lso_analyzer import tags_for
+
+from .account_store import DEFAULT_ACCT, events_path, safe_token
 
 POSITIONS_FILE   = Path("my_option_positions.json")     # legacy cache, rebuilt from events
 STOCKS_FILE      = Path("my_stock_positions.json")       # legacy cache, rebuilt from events
@@ -31,6 +33,8 @@ _OPT_COLUMNS = [
     ("lifecycle",  "Lifecycle",         "edit"),   # Put → Assigned → Sold, etc.
     ("qty",        "Qty",               "edit"),
     ("strike",     "Strike",            "edit"),
+    ("capital",    "Capital",           "calc"),   # at risk now; live rows only
+    ("capital_pct","% of Book",         "calc"),
     ("premium",    "Premium ($)",       "edit"),   # total option premium collected (puts + calls)
     ("expiration", "Expiration",        "edit"),
     ("status",     "Status",            "edit"),
@@ -38,6 +42,8 @@ _OPT_COLUMNS = [
     ("fees",       "Fees",              "edit"),
     ("weekly_ror", "Avg Weekly RoR",    "calc"),
     ("cost_basis", "Cost Basis/Recovery/P&L",  "calc"),
+    # Last, so the stretched final column absorbs variable-length tag lists.
+    ("tags",       "Tags",              "calc"),   # durable-tags.json risk tags
 ]
 _OPT_FIELDS = [c[0] for c in _OPT_COLUMNS]
 _O_HDRS     = [c[1] for c in _OPT_COLUMNS]
@@ -109,6 +115,7 @@ class PortfolioTab(QWidget):
     def __init__(self):
         super().__init__()
         self._events, self._outcomes, self._account = [], {}, ""
+        self._exposure   = {}     # last _annotate_tags_and_capital() result
         self._range_sel  = None   # None → all time; int → days back; "custom"
         self._range_from = None   # ISO date string when custom
         self._range_to   = None
@@ -176,6 +183,12 @@ class PortfolioTab(QWidget):
             rows = [r for r in rows
                     if r["status"] in active or r["opened"] >= cutoff]
 
+        # Exposure is measured on what's on screen — with a range filter active
+        # the table is the book you're looking at, and the panel must agree with
+        # it. Live positions are never filtered out, so the total is unaffected.
+        self._exposure = _annotate_tags_and_capital(rows)
+        self._render_exposure()
+
         rows.sort(key=lambda r: (_STATUS_SORT.get(r["status"], 99), r["symbol"], r["opened"]))
         self._opt_table.setSortingEnabled(False)
         self._opt_table.blockSignals(True)
@@ -187,6 +200,110 @@ class PortfolioTab(QWidget):
         self._opt_table.sortByColumn(_O_STATUS_COL, Qt.SortOrder.AscendingOrder)
         self._opt_table.resizeColumnsToContents()
         self._refresh_market_prices()
+
+    # ── Tag exposure ──────────────────────────────────────────────────────────
+
+    def _render_exposure(self):
+        exp = self._exposure or {}
+        total = exp.get("total", 0.0)
+        if not total:
+            self._exposure_label.setText(
+                "<i>No live positions — nothing at risk to concentrate.</i>")
+            return
+
+        # A symbol can carry several tags, so its capital counts under each and
+        # the percentages deliberately sum past 100%. Said outright, because a
+        # column of percentages that doesn't add up otherwise reads as a bug.
+        parts = []
+        for tag, cap, pct in exp.get("by_tag", []):
+            colour = "#8a0000" if pct >= 30 else ("#8a3300" if pct >= 20 else "#333333")
+            parts.append(
+                f"<span style='color:{colour}'><b>{tag}</b> "
+                f"${cap:,.0f} ({pct:.1f}%)</span>"
+            )
+        html = (f"<b>${total:,.0f}</b> at risk across "
+                f"{len(exp.get('by_symbol', []))} symbols &nbsp;·&nbsp; "
+                + " &nbsp;|&nbsp; ".join(parts))
+        if exp.get("untagged"):
+            html += ("<br><span style='color:#8a3300'>Not in durable-tags.json: "
+                     + ", ".join(exp["untagged"]) + "</span>")
+        html += ("<br><span style='color:grey;font-size:11px'>Tags overlap, so "
+                 "these sum past 100% — each is the share of capital carrying "
+                 "that tag.</span>")
+        self._exposure_label.setText(html)
+
+    def export_for_chat(self):
+        """Write live positions + tag exposure to a CSV, for uploading to a chat.
+
+        One file, two sections separated by a blank line — the same shape TOS's
+        own statements use. Numbers are written bare (no $, no %, no thousands
+        separators) so they arrive as numbers rather than strings; the on-screen
+        formatting is for reading, and a CSV is for parsing.
+        """
+        exp = self._exposure or {}
+        total = exp.get("total", 0.0)
+
+        default = (f"positions-{safe_token(self._account)}-{date.today()}.csv")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export positions for chat", default,
+            "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+
+        def _cell(row, field):
+            it = self._opt_table.item(row, _oc(field))
+            return it.text() if it else ""
+
+        def _num(s):
+            """'$28,800' / '7.8%' → '28800' / '7.8'; anything else unchanged."""
+            return s.replace("$", "").replace(",", "").replace("%", "").strip()
+
+        live = []
+        for r in range(self._opt_table.rowCount()):
+            status = self._opt_table.item(r, _O_STATUS_COL)
+            if status is None or status.text() not in _LIVE_STATUSES:
+                continue
+            live.append([
+                _cell(r, "symbol"),
+                _cell(r, "qty"),
+                _num(_cell(r, "strike")),
+                _num(_cell(r, "capital")),
+                _num(_cell(r, "capital_pct")),
+                _num(_cell(r, "premium")),
+                _cell(r, "expiration"),
+                _cell(r, "status"),
+                _num(_cell(r, "cost_basis")),
+                _cell(r, "tags"),
+            ])
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["Positions", self._account or "account",
+                            str(date.today())])
+                w.writerow([])
+                w.writerow(["Symbol", "Qty", "Strike", "Capital", "Pct of Book",
+                            "Premium", "Expiration", "Status", "Basis", "Tags"])
+                w.writerows(live)
+
+                w.writerow([])
+                w.writerow(["Tag Exposure", f"{total:.0f}", "at risk"])
+                w.writerow([])
+                w.writerow(["Tag", "Capital", "Pct of Book"])
+                for t, c, p in exp.get("by_tag", []):
+                    w.writerow([t, f"{c:.0f}", f"{p:.1f}"])
+                w.writerow([])
+                w.writerow(["Note", "Tags overlap, so Pct of Book sums past 100%"])
+                if exp.get("untagged"):
+                    w.writerow(["Not in durable-tags.json",
+                                ", ".join(exp["untagged"])])
+        except OSError as e:
+            QMessageBox.warning(self, "Export", f"Could not write {path}:\n{e}")
+            return
+
+        self.status_changed.emit(
+            f"Exported {len(live)} live position(s) and tag exposure to {path}")
 
     # ── Live market prices ──────────────────────────────────────────────────────
 
@@ -250,6 +367,15 @@ class PortfolioTab(QWidget):
         for ci in _OPT_HIDDEN_COLS:
             self._opt_table.setColumnHidden(ci, True)
         root.addWidget(self._opt_table, 1)
+
+        self._exposure_box = QGroupBox("Tag exposure — live positions")
+        ebox = QVBoxLayout(self._exposure_box)
+        ebox.setContentsMargins(8, 4, 8, 6)
+        self._exposure_label = QLabel("—")
+        self._exposure_label.setTextFormat(Qt.TextFormat.RichText)
+        self._exposure_label.setWordWrap(True)
+        ebox.addWidget(self._exposure_label)
+        root.addWidget(self._exposure_box)
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
@@ -378,6 +504,8 @@ class PortfolioTab(QWidget):
         STOCKS_FILE.unlink(missing_ok=True)
         SUPERSEDED_FILE.unlink(missing_ok=True)
         self._events, self._outcomes = [], {}
+        self._exposure = {}
+        self._render_exposure()
 
     def clear_all(self):
         """Erase the active account's stored history."""
@@ -1062,6 +1190,7 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
         "cost_basis": pnl_cell,
         "_basis":     basis,
         "_shares":    shares_eq,
+        "_capital":   capital,
     }
 
 
@@ -1098,8 +1227,74 @@ def _blended_rows(rows: list[dict]) -> list[dict]:
             "fees":       f"{sum(float(r['fees']) for r in live):.2f}",
             "weekly_ror": "—",
             "cost_basis": f"{value / shares:.2f}",
+            # Summary of rows already counted individually — carried for display
+            # only. Tag exposure skips Blended so capital isn't counted twice.
+            "_capital":   sum(r.get("_capital") or 0.0 for r in live),
         })
     return out
+
+
+# Statuses that still tie up capital. "Blended" is a per-symbol summary of rows
+# already in this set, so it displays capital but never contributes to exposure.
+_LIVE_STATUSES = ("Open", "Holding")
+
+
+def _annotate_tags_and_capital(rows: list[dict]) -> dict:
+    """Fill each row's tags / capital / % of book in place; return the exposure.
+
+    Capital is only shown where it is still at risk — a closed cycle's
+    collateral has been released, and showing it would inflate every
+    concentration read. Returned dict:
+
+        {"total": float,
+         "by_tag": [(tag, capital, pct), …]  (largest first),
+         "by_symbol": [(symbol, capital, pct, tags), …],
+         "untagged": [symbol, …]}
+    """
+    total = sum(r.get("_capital") or 0.0
+                for r in rows if r["status"] in _LIVE_STATUSES)
+
+    by_tag: dict[str, float] = {}
+    by_symbol: dict[str, float] = {}
+    sym_tags: dict[str, list[str]] = {}
+    untagged: set[str] = set()
+
+    for r in rows:
+        sym = r["symbol"]
+        tags, researched = tags_for(sym)
+        sym_tags[sym] = tags
+        r["tags"] = ", ".join(tags) if researched else "UNTAGGED"
+        if researched and not tags:
+            r["tags"] = "—"
+
+        cap = r.get("_capital") or 0.0
+        live = r["status"] in _LIVE_STATUSES
+        if live or r["status"] == "Blended":
+            r["capital"] = f"${cap:,.0f}" if cap else ""
+            r["capital_pct"] = f"{cap / total * 100:.1f}%" if (cap and total) else ""
+        else:
+            r["capital"] = ""
+            r["capital_pct"] = ""
+
+        if not live or not cap:
+            continue
+        by_symbol[sym] = by_symbol.get(sym, 0.0) + cap
+        if not researched:
+            untagged.add(sym)
+        for t in tags:
+            by_tag[t] = by_tag.get(t, 0.0) + cap
+
+    def _pct(v):
+        return (v / total * 100) if total else 0.0
+
+    return {
+        "total": total,
+        "by_tag": [(t, v, _pct(v))
+                   for t, v in sorted(by_tag.items(), key=lambda kv: -kv[1])],
+        "by_symbol": [(s, v, _pct(v), sym_tags.get(s, []))
+                      for s, v in sorted(by_symbol.items(), key=lambda kv: -kv[1])],
+        "untagged": sorted(untagged),
+    }
 
 
 def _build_fee_lookup(rows: list[list[str]]) -> dict[tuple, float]:
