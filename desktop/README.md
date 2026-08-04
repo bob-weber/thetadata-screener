@@ -14,9 +14,8 @@ Then find "LSO Screener" / "ToS Returns" in the app menu and pin to the taskbar.
 
 ## Notes
 
-- **Absolute paths**: `Exec`, `Path`, and `Icon` are hard-coded to
-  `/home/bob/Tresorit/ngData/srcCode/lso-tools`. Edit them if the repo lives
-  elsewhere or you're on another machine.
+- **Absolute paths**: `Exec`, `Path`, and `Icon` are hard-coded to the repo
+  root. Edit them if the repo moves or you're on another machine.
 - **`Path=` is required.** Both apps read/write their data files by *relative*
   path (`schwab_token.json`, `gains_history_*.json`, the `*_cache.json` files,
   etc.). Without `Path=` setting the working directory, a taskbar launch starts

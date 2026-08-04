@@ -2,9 +2,9 @@
 Type=Application
 Name=LSO Screener
 Comment=Stock/options screener with LSO wheel-strategy grading
-Exec=/home/bob/Tresorit/ngData/srcCode/lso-tools/gui-env/bin/python /home/bob/Tresorit/ngData/srcCode/lso-tools/run_screener.py
-Path=/home/bob/Tresorit/ngData/srcCode/lso-tools
-Icon=/home/bob/Tresorit/ngData/srcCode/lso-tools/candlestick-chart.png
+Exec=/home/bob/src/lso-tools/gui-env/bin/python /home/bob/src/lso-tools/run_screener.py
+Path=/home/bob/src/lso-tools
+Icon=/home/bob/src/lso-tools/candlestick-chart.png
 Terminal=false
 StartupWMClass=lso-screener
 Categories=Office;Finance;
