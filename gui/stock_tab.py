@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -8,6 +9,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QApplication,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor
 
 from . import column_help
 from .workers import StockScanWorker, UniverseWorker
@@ -15,6 +17,27 @@ from .workers import StockScanWorker, UniverseWorker
 PRICE_CACHE      = "price_screen_cache.json"
 CANDIDATES_CACHE = "tech_candidates_cache.json"
 MY_STOCKS_FILE   = Path("my_positions.txt")
+
+# Ticker Source modes
+SRC_UNIVERSE = 0
+SRC_IMPORT   = 1
+SRC_SPECIFY  = 2
+
+
+def _parse_ticker_list(raw: str) -> list[str]:
+    """Tickers from free text — commas, spaces and newlines all separate.
+
+    One parser for both the typed list and the imported file, so a file with
+    comma-separated tickers and a typed list with newlines both work. Order is
+    kept and duplicates dropped.
+    """
+    out, seen = [], set()
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        t = tok.strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 _PRICE_COLS    = ["symbol", "price"]
 _PRICE_HEADERS = ["Symbol", "Price"]
@@ -30,9 +53,9 @@ _HELP = {
               "bar when computing RSI and BB%, so both track the current price "
               "rather than yesterday's close.",
     "rsi":    "Wilder's RSI over the RSI-period bars (default 14).\n\n"
-              "Below 30 is oversold, above 70 overbought. A universe scan keeps "
-              "only symbols under the RSI threshold; a My Stocks scan reports it "
-              "for every ticker without filtering.",
+              "Below 30 is oversold, above 70 overbought. A Universe scan keeps "
+              "only symbols under the RSI threshold; an Import List or Specify "
+              "Stocks scan reports it for every ticker without filtering.",
     "bb_pct": "Where price sits inside its Bollinger Bands: 0% = lower band, "
               "100% = upper band, over the BB period (default 20) at 2σ.\n\n"
               "Below 0 means price has broken under the lower band; above 100, "
@@ -60,6 +83,29 @@ def _make_item(val) -> QTableWidgetItem:
     return item
 
 
+_FAIL_COLOR = QColor("#8a8a8a")   # greyed: measured, but outside the thresholds
+
+
+def _style_row(table: QTableWidget, r: int, row: dict, cols: list[str]):
+    """Grey a row that was measured but missed the RSI/BB% thresholds.
+
+    Only explicit-list scans produce these — a universe scan drops such symbols
+    outright, so every row it returns passes and nothing is greyed.
+    """
+    if row.get("passes", True):
+        return
+    why = ("Outside the RSI / BB% thresholds — excluded from the Options "
+           "Scanner. Shown for reference.")
+    if row.get("rsi") is None or row.get("bb_pct") is None:
+        why = ("Not enough history to compute RSI / BB% — excluded from the "
+               "Options Scanner.")
+    for c in range(len(cols)):
+        item = table.item(r, c)
+        if item is not None:
+            item.setForeground(_FAIL_COLOR)
+            item.setToolTip(why)
+
+
 def _new_table(headers: list[str], cols: list[str] | None = None) -> QTableWidget:
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
@@ -81,6 +127,7 @@ def _fill_table(table: QTableWidget, rows: list[dict], cols: list[str]):
     for r, row in enumerate(rows):
         for c, key in enumerate(cols):
             table.setItem(r, c, _make_item(row.get(key, "")))
+        _style_row(table, r, row, cols)
     table.setSortingEnabled(True)
     table.resizeColumnsToContents()
 
@@ -93,6 +140,7 @@ def _append_rows(table: QTableWidget, rows: list[dict], cols: list[str]):
         table.insertRow(r)
         for c, key in enumerate(cols):
             table.setItem(r, c, _make_item(row.get(key, "")))
+        _style_row(table, r, row, cols)
     table.setSortingEnabled(True)
     table.resizeColumnsToContents()
 
@@ -122,20 +170,24 @@ class StockScannerTab(QWidget):
     # ── my-stocks file helpers ─────────────────────────────────────────────────
 
     def _load_my_stocks(self):
+        """Load the typed list from my_positions.txt into the one-line editor.
+
+        The file stays one ticker per line — it predates this editor and is
+        easier to edit by hand that way — so it is joined for display and split
+        again on save.
+        """
         if MY_STOCKS_FILE.exists():
-            self._my_stocks_edit.setPlainText(MY_STOCKS_FILE.read_text())
+            tickers = _parse_ticker_list(MY_STOCKS_FILE.read_text())
+            self._specify_edit.setText(", ".join(tickers))
 
     def _save_my_stocks(self):
-        MY_STOCKS_FILE.write_text(self._my_stocks_edit.toPlainText())
+        MY_STOCKS_FILE.write_text(
+            "\n".join(_parse_ticker_list(self._specify_edit.text())) + "\n")
 
     def _flush_saves(self):
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._save_my_stocks()
-
-    def _get_my_stocks(self) -> list[str]:
-        raw = self._my_stocks_edit.toPlainText()
-        return [t.strip().upper() for t in raw.splitlines() if t.strip()]
 
     # ── startup cache loading ──────────────────────────────────────────────────
 
@@ -168,29 +220,57 @@ class StockScannerTab(QWidget):
         source_box = QGroupBox("Ticker Source")
         sh = QHBoxLayout(source_box)
         sh.setSpacing(16)
-        self._universe_src_btn = QRadioButton("Universe / Watchlist")
-        self._mine_src_btn     = QRadioButton("My Stocks")
+        self._universe_src_btn = QRadioButton("Universe")
+        self._import_src_btn   = QRadioButton("Import List")
+        self._specify_src_btn  = QRadioButton("Specify Stocks")
+        self._universe_src_btn.setToolTip("Scan the whole universe, filtered by "
+                                          "price range and RSI / BB%.")
+        self._import_src_btn.setToolTip("Scan exactly the tickers in a text file.")
+        self._specify_src_btn.setToolTip("Scan exactly the tickers you type below.")
         self._universe_src_btn.setChecked(True)
         self._source_group = QButtonGroup()
-        self._source_group.addButton(self._universe_src_btn, 0)
-        self._source_group.addButton(self._mine_src_btn,     1)
+        self._source_group.addButton(self._universe_src_btn, SRC_UNIVERSE)
+        self._source_group.addButton(self._import_src_btn,   SRC_IMPORT)
+        self._source_group.addButton(self._specify_src_btn,  SRC_SPECIFY)
         sh.addWidget(self._universe_src_btn)
-        sh.addWidget(self._mine_src_btn)
+        sh.addWidget(self._import_src_btn)
+        sh.addWidget(self._specify_src_btn)
         sh.addStretch()
         root.addWidget(source_box)
 
-        # ── My Stocks editor (hidden until its radio is selected) ─────────────
-        self._my_stocks_box = QGroupBox("My Stocks — one ticker per line")
-        ml = QVBoxLayout(self._my_stocks_box)
-        self._my_stocks_edit = QTextEdit()
-        self._my_stocks_edit.setPlaceholderText("AAPL\nMSFT\nTSLA")
-        self._my_stocks_edit.setFixedHeight(110)
-        self._my_stocks_edit.textChanged.connect(self._save_timer.start)
-        ml.addWidget(self._my_stocks_edit)
-        self._my_stocks_box.setVisible(False)
-        root.addWidget(self._my_stocks_box)
+        # ── Import List (hidden until its radio is selected) ──────────────────
+        self._import_box = QGroupBox("Import List — text file of tickers")
+        il = QHBoxLayout(self._import_box)
+        self._import_edit = QLineEdit()
+        self._import_edit.setPlaceholderText("path to a .txt file of tickers")
+        self._import_edit.textChanged.connect(self._refresh_import_count)
+        import_browse = QPushButton("Browse…")
+        import_browse.clicked.connect(self._browse_import_list)
+        self._import_count = QLabel("—")
+        self._import_count.setStyleSheet("color: grey;")
+        il.addWidget(self._import_edit, 1)
+        il.addWidget(import_browse)
+        il.addWidget(self._import_count)
+        self._import_box.setVisible(False)
+        root.addWidget(self._import_box)
 
-        self._universe_src_btn.toggled.connect(self._on_source_changed)
+        # ── Specify Stocks (hidden until its radio is selected) ───────────────
+        # One line, not a text area: a list of tickers is short, and a multi-line
+        # box costs vertical space the tables want.
+        self._specify_box = QGroupBox("Specify Stocks — separate with commas or spaces")
+        sl = QHBoxLayout(self._specify_box)
+        self._specify_edit = QLineEdit()
+        self._specify_edit.setPlaceholderText("AAPL, MSFT, TSLA")
+        self._specify_edit.textChanged.connect(self._save_timer.start)
+        self._specify_edit.textChanged.connect(self._refresh_specify_count)
+        self._specify_count = QLabel("—")
+        self._specify_count.setStyleSheet("color: grey;")
+        sl.addWidget(self._specify_edit, 1)
+        sl.addWidget(self._specify_count)
+        self._specify_box.setVisible(False)
+        root.addWidget(self._specify_box)
+
+        self._source_group.idToggled.connect(lambda *_: self._on_source_changed())
 
         # ── Parameters ────────────────────────────────────────────────────────
         params_box = QGroupBox("Parameters")
@@ -215,21 +295,6 @@ class StockScannerTab(QWidget):
         pf.addRow("BB% threshold (<):", self._bb_pct_threshold)
         pf.addRow("RSI period:",        self._rsi_period)
         pf.addRow("BB period:",         self._bb_period)
-
-        wl_row = QWidget()
-        wh = QHBoxLayout(wl_row)
-        wh.setContentsMargins(0, 0, 0, 0)
-        self._watchlist_edit = QLineEdit()
-        self._watchlist_edit.setPlaceholderText("optional — leave blank to scan all symbols")
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_watchlist)
-        clear_btn  = QPushButton("Clear")
-        clear_btn.clicked.connect(self._watchlist_edit.clear)
-        wh.addWidget(self._watchlist_edit, 1)
-        wh.addWidget(browse_btn)
-        wh.addWidget(clear_btn)
-        self._watchlist_row = wl_row
-        pf.addRow("Watchlist file:", wl_row)
 
         root.addWidget(params_box)
 
@@ -311,26 +376,71 @@ class StockScannerTab(QWidget):
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter, 1)
 
+        self._on_source_changed()
+
     # ── slots ─────────────────────────────────────────────────────────────────
 
-    def _on_source_changed(self, universe_checked: bool):
-        """Grey out what a my-stocks scan doesn't use, so the UI says what applies.
+    def _source_mode(self) -> int:
+        return self._source_group.checkedId()
 
-        A my-stocks scan reports every ticker on the list with its indicators, so
-        the price range and the RSI/BB% thresholds have nothing to reject — but
-        the periods still decide how those indicators are computed.
+    def _on_source_changed(self):
+        """Show the input the chosen source needs, grey out what it doesn't use.
+
+        An explicit list (imported or typed) reports every ticker on it with its
+        indicators rather than rejecting any, so the price range has nothing to
+        do — but the RSI/BB% thresholds still mark which rows qualify.
         """
-        self._my_stocks_box.setVisible(not universe_checked)
-        for w in (self._price_min, self._price_max, self._rsi_threshold,
-                  self._bb_pct_threshold, self._watchlist_row):
-            w.setEnabled(universe_checked)
+        mode = self._source_mode()
+        self._import_box.setVisible(mode == SRC_IMPORT)
+        self._specify_box.setVisible(mode == SRC_SPECIFY)
+        # The price range has nothing to reject on a list you chose deliberately.
+        # The RSI/BB% thresholds stay live: they no longer reject either, but
+        # they decide which rows are greyed out and which reach the options scan.
+        for w in (self._price_min, self._price_max):
+            w.setEnabled(mode == SRC_UNIVERSE)
 
-    def _browse_watchlist(self):
+    def _browse_import_list(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select watchlist", "", "Text files (*.txt);;All files (*)"
+            self, "Select ticker list", "", "Text files (*.txt);;All files (*)"
         )
         if path:
-            self._watchlist_edit.setText(path)
+            self._import_edit.setText(path)
+
+    def _read_import_list(self) -> list[str]:
+        """Tickers from the imported file, re-read at scan time.
+
+        Read on use rather than cached at browse time, so editing the file
+        doesn't need the path picking again.
+        """
+        path = self._import_edit.text().strip()
+        if not path:
+            return []
+        try:
+            return _parse_ticker_list(Path(path).read_text())
+        except OSError:
+            return []
+
+    def _refresh_import_count(self):
+        path = self._import_edit.text().strip()
+        if not path:
+            self._import_count.setText("—")
+            return
+        if not Path(path).exists():
+            self._import_count.setText("file not found")
+            return
+        self._import_count.setText(f"{len(self._read_import_list())} tickers")
+
+    def _refresh_specify_count(self):
+        n = len(_parse_ticker_list(self._specify_edit.text()))
+        self._specify_count.setText(f"{n} ticker{'' if n == 1 else 's'}")
+
+    def _get_symbols(self) -> list[str]:
+        """The explicit ticker list for the current source ([] for Universe)."""
+        if self._source_mode() == SRC_IMPORT:
+            return self._read_import_list()
+        if self._source_mode() == SRC_SPECIFY:
+            return _parse_ticker_list(self._specify_edit.text())
+        return []
 
     def _get_config(self) -> dict:
         config = {
@@ -341,8 +451,8 @@ class StockScannerTab(QWidget):
             "rsi_period":       int(self._rsi_period.text()),
             "bb_period":        int(self._bb_period.text()),
         }
-        if self._mine_src_btn.isChecked():
-            config["symbols"] = self._get_my_stocks()
+        if self._source_mode() != SRC_UNIVERSE:
+            config["symbols"] = self._get_symbols()
         return config
 
     def _begin_scan(self) -> dict | None:
@@ -358,8 +468,15 @@ class StockScannerTab(QWidget):
         return config
 
     def _run_scan(self):
-        if self._mine_src_btn.isChecked() and not self._get_my_stocks():
-            self._log.append("No tickers in My Stocks — add at least one ticker.")
+        mode = self._source_mode()
+        if mode != SRC_UNIVERSE and not self._get_symbols():
+            if mode == SRC_IMPORT:
+                path = self._import_edit.text().strip()
+                self._log.append(
+                    f"No tickers read from {path!r} — pick a text file of tickers."
+                    if path else "No file chosen — pick a text file of tickers.")
+            else:
+                self._log.append("No tickers specified — type at least one ticker.")
             return
         config = self._begin_scan()
         if config is None:
@@ -373,8 +490,7 @@ class StockScannerTab(QWidget):
         self._tech_bar.setValue(0)
         self._tech_plabel.setText("—")
 
-        watchlist = self._watchlist_edit.text().strip() or None
-        self._worker = StockScanWorker(config, watchlist)
+        self._worker = StockScanWorker(config)
         self._worker.log_msg.connect(self._log.append)
         self._worker.price_progress.connect(self._on_price_progress)
         self._worker.tech_progress.connect(self._on_tech_progress)
@@ -401,7 +517,8 @@ class StockScannerTab(QWidget):
         symbols = load_universe()
         if symbols is None:
             self._universe_label.setText(
-                "Universe: none saved — click Update Universe (or set a watchlist)")
+                "Universe: none saved — click Update Universe "
+                "(or scan an Import List / Specify Stocks list instead)")
             return
         try:
             updated = json.loads(Path(UNIVERSE_FILE).read_text()).get("updated", "?")

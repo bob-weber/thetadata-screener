@@ -149,9 +149,15 @@ class OptionsScannerTab(QWidget):
         candidates = cached.get("candidates", [])
         ts = cached.get("scanned_at") or cached.get("date", "unknown")
         if candidates:
-            self._candidates_label.setText(
-                f"{len(candidates)} candidates from Stock Scanner  |  last scan: {ts}"
-            )
+            # Explicit-list scans carry rows that were measured but missed the
+            # RSI/BB% thresholds; they're greyed out over there and skipped here,
+            # so the label counts what will actually be scanned.
+            eligible = sum(1 for c in candidates if c.get("passes", True))
+            skipped  = len(candidates) - eligible
+            text = f"{eligible} candidates from Stock Scanner"
+            if skipped:
+                text += f" ({skipped} below threshold, skipped)"
+            self._candidates_label.setText(f"{text}  |  last scan: {ts}")
         else:
             self._candidates_label.setText("Run the Stock Scanner first.")
 

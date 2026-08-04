@@ -136,6 +136,22 @@ class OptionsWorker(QThread):
         if not candidates:
             self.error.emit("Stock scan returned no candidates — run the Stock Scanner first.")
             return None
+        # Explicit-list scans report every ticker and mark those outside the
+        # RSI/BB% thresholds (greyed out in the Stock Scanner). They're reference
+        # rows, not candidates, so they never reach an option chain. A universe
+        # scan has already dropped its failures, so nothing here is marked.
+        graded = [c for c in candidates if c.get("passes", True)]
+        skipped = len(candidates) - len(graded)
+        if skipped:
+            self.log_msg.emit(
+                f"Skipped {skipped} symbol(s) outside the RSI / BB% thresholds.")
+        candidates = graded
+        if not candidates:
+            self.error.emit(
+                "No candidates met the RSI / BB% thresholds — widen them in the "
+                "Stock Scanner and re-scan.")
+            return None
+
         candidates = self._apply_reject(candidates, "candidate")
         if not candidates:
             self.error.emit("All stock-scan candidates are on the reject list.")

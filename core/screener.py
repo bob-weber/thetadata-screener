@@ -781,17 +781,16 @@ def _price_key(config: dict) -> dict:
 
 
 def _full_key(config: dict) -> dict:
-    key = {
+    # Thresholds belong in the key for every scan: a universe scan filters on
+    # them, and an explicit-list scan records pass/fail against them per row, so
+    # changing one changes the result either way.
+    return {
         **_price_key(config),
-        "rsi_period": config.get("rsi_period", 14),
-        "bb_period":  config.get("bb_period",  20),
+        "rsi_period":       config.get("rsi_period",       14),
+        "bb_period":        config.get("bb_period",        20),
+        "rsi_threshold":    config.get("rsi_threshold",    40.0),
+        "bb_pct_threshold": config.get("bb_pct_threshold", 33.0),
     }
-    if not _scan_symbols(config):
-        # Thresholds only shape a universe scan; a my-stocks scan reports every
-        # symbol whatever its RSI/BB%, so they're not part of its identity.
-        key["rsi_threshold"]    = config.get("rsi_threshold",    40.0)
-        key["bb_pct_threshold"] = config.get("bb_pct_threshold", 33.0)
-    return key
 
 
 def run_price_screen(
@@ -923,9 +922,13 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     the prior session's close. ``closes_list`` already excludes today's bar, so this
     never double-counts.
 
-    With ``apply_filters`` off (a my-stocks scan) the thresholds are measured but
-    never reject: the point is to see where each of your own symbols sits, so a
-    symbol too new to compute an indicator still comes back, with RSI/BB% blank.
+    With ``apply_filters`` off (an explicit ticker list) the thresholds are
+    measured but never reject: the point is to see where each of your own symbols
+    sits, so a symbol too new to compute an indicator still comes back, with
+    RSI/BB% blank. Every row then carries ``passes`` — whether it *would* have
+    survived the thresholds — so the GUI can grey the failures out and the
+    options scan can skip them. A symbol with no computable indicator can't be
+    confirmed as meeting them, so it fails.
     """
     live = price_lookup.get(sym)
     closes_list = list(closes_list)
@@ -936,7 +939,7 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         if apply_filters or live is None:
             return None
         return {"symbol": sym, "price": round(live, 2), "rsi": None,
-                "bb_pct": None, "hv": None}
+                "bb_pct": None, "hv": None, "passes": False}
     rsi = calc_rsi(closes, rsi_period)
     if apply_filters and rsi >= rsi_threshold:
         return None
@@ -950,6 +953,7 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         "rsi":    round(rsi, 1),
         "bb_pct": round(bb_pct, 1),
         "hv":     round(hv, 1) if hv is not None else None,
+        "passes": bool(rsi < rsi_threshold and bb_pct < bb_pct_threshold),
     }
 
 
