@@ -29,6 +29,42 @@ _SECTOR_SCORES: dict[str, tuple[int, str]] = {
                                   "(Iran-Israel conflict, OPEC policy, Russia sanctions)"),
 }
 
+# Tags that disqualify outright, whatever the chain looks like. These are the
+# strategy's "auto-disqualify" risks: binary or un-priceable, so no amount of
+# cushion or position sizing compensates. They come from durable-tags.json
+# rather than sector/industry, because sector doesn't identify them — a recent
+# IPO looks like any other name in its sector.
+_HARD_GATE_TAGS: dict[str, str] = {
+    "recent-ipo":
+        "Recent IPO (<12 months) — RSI/BB% compute on partial history, there is "
+        "no confirmed floor, and lockup expiry looms",
+    "biotech-binary":
+        "FDA/trial-catalyst risk — readouts gap the stock overnight regardless "
+        "of cushion",
+}
+
+# Tags that cap the risk tier at High without disqualifying: the position is
+# tradeable, it just can't be sized as anything better than the riskiest tier.
+_TIER_CAP_TAGS: dict[str, str] = {
+    "crypto-linked":
+        "Crypto-linked — the floor is an external asset's sentiment, not the "
+        "company's own fundamentals; size as a directional crypto bet",
+}
+
+# Hand-assigned tags for the IREN pattern: a core segment declining while a
+# newer one tries to replace it, funded by dilution. Neither is derivable from
+# yfinance (see analyze_symbol), so they are curated in durable-tags.json.
+_DECLINING_TAG = "core-revenue-declining"
+_DILUTION_TAG  = "active-dilution"
+
+# Risk tier → max allocation, from the strategy's sizing table.
+_TIER_ALLOCATION = {
+    "Low":    "35–40%",
+    "Medium": "25–30%",
+    "High":   "15–20%",
+}
+_TIER_ORDER = {"Low": 0, "Medium": 1, "High": 2}
+
 # Additional penalty when the industry sub-type is especially risky
 _INDUSTRY_EXTRA: dict[str, tuple[int, str]] = {
     "biotechnology":          (-20, "FDA/clinical-trial binary events — large overnight gaps likely"),
@@ -74,6 +110,159 @@ def tags_for(symbol: str) -> tuple[list[str], bool]:
     if key not in tags:
         return [], False
     return tags[key], True
+
+
+def _ttm_operating_income(qis) -> float | None:
+    """Trailing four quarters of operating income, or None if unavailable."""
+    try:
+        if qis is None or qis.empty or "Operating Income" not in qis.index:
+            return None
+        s = qis.loc["Operating Income"].dropna()[:4]
+        return float(s.sum()) if len(s) else None
+    except Exception:
+        return None
+
+
+def _profitability(info: dict, ttm_operating: float | None = None) -> tuple[str, bool, str]:
+    """``(state, growing, note)`` where state is profitable/unprofitable/unknown.
+
+    Operating income leads, because the bottom line lies. IREN's trailing EPS
+    reads +$0.77 on a one-off gain booked below the operating line, while its
+    TTM operating income is −$221M — the loss the strategy actually cares about.
+    Trailing EPS and net income are then checked as a backstop, either one
+    negative counting as unprofitable: yfinance disagrees with itself often
+    enough (MSTR reports profitMargins 0.0 alongside a −$31B net income) that no
+    single field can be trusted alone.
+
+    ``growing`` is revenue growth above zero, the closest available stand-in for
+    the strategy's "growing with a credible path". It does not distinguish a
+    real product-market fit from a one-off revenue bump.
+    """
+    eps = info.get("trailingEps")
+    net = info.get("netIncomeToCommon")
+    growth = info.get("revenueGrowth")
+    growing = bool(growth is not None and growth > 0)
+
+    losing, why = False, ""
+    if ttm_operating is not None and ttm_operating < 0:
+        losing = True
+        why = f"operating loss ${abs(ttm_operating)/1e6:,.0f}M TTM"
+    known = [v for v in (eps, net) if v is not None]
+    if any(v < 0 for v in known):
+        losing = True
+        why = why or "negative trailing EPS / net income"
+
+    if not losing:
+        if ttm_operating is None and not known:
+            return "unknown", growing, ""
+        return "profitable", growing, ""
+
+    note = f"Unprofitable ({why})"
+    if growth is not None:
+        note += (f", revenue growing {growth*100:.0f}%" if growing
+                 else f", revenue declining {growth*100:.0f}%")
+    return "unprofitable", growing, note + " — capped at High risk tier"
+
+
+def _bs_series(bs, row: str):
+    """A balance-sheet row as a newest-first series with gaps dropped."""
+    try:
+        if bs is None or bs.empty or row not in bs.index:
+            return None
+        s = bs.loc[row].dropna().sort_index(ascending=False)
+        return s if len(s) else None
+    except Exception:
+        return None
+
+
+def _external_funding(bs, market_cap: int | None) -> tuple[bool, bool, str]:
+    """``(diluting, levering, detail)`` — is the buildout funded by issuing paper?
+
+    Both routes are checked because they substitute for each other: IREN did
+    both, MSTR only diluted, CLSK only borrowed. Requiring both would miss two
+    of the three.
+
+    New debt is measured against market cap rather than against prior debt —
+    RBRK's debt grew 243% off a tiny base, which is 5% of its market cap and
+    means nothing. Dilution must also be *sustained* (rising in at least three
+    of the last four quarters): an ATM program drips quarter after quarter,
+    while a stock-funded acquisition lands in one step. Synopsys issued 23% in
+    the single quarter to 2025-07-31 and was flat either side; that shape is a
+    deal, not a funding problem.
+    """
+    shares = _bs_series(bs, "Ordinary Shares Number")
+    if shares is None or len(shares) < 2:
+        return False, False, ""
+
+    back     = min(4, len(shares) - 1)
+    base     = shares.iloc[back]
+    dilution = (shares.iloc[0] - base) / base if base else 0.0
+
+    # Consecutive quarter-on-quarter increases above 1% (noise floor for
+    # buybacks and stock comp netting out).
+    rising = sum(1 for a, b in zip(shares.iloc[:-1], shares.iloc[1:])
+                 if b and (a - b) / b > 0.01)
+    steady = rising >= 3
+
+    debt_added = 0.0
+    debt = _bs_series(bs, "Total Debt")
+    if debt is not None and len(debt) > 1 and market_cap:
+        d_back = min(4, len(debt) - 1)
+        debt_added = (debt.iloc[0] - debt.iloc[d_back]) / market_cap
+
+    diluting = dilution >= 0.20 and steady
+    levering = debt_added >= 0.15
+    if not (diluting or levering):
+        return False, False, ""
+
+    bits = []
+    if diluting:
+        bits.append(f"share count {dilution*100:+.0f}% over {back} quarters, "
+                    f"rising in {rising} of the last {len(shares)-1}")
+    if levering:
+        bits.append(f"net new debt worth {debt_added*100:.0f}% of market cap")
+    return diluting, levering, "; ".join(bits)
+
+
+def _risk_tier(score: int, tags: list[str], profit_state: str,
+               funded_by_paper: bool = False) -> tuple[str, str, list[str]]:
+    """``(tier, max_allocation, notes)`` for a symbol.
+
+    The base tier follows the graded score, since the score already weighs the
+    beta / market-cap / cushion inputs the strategy's tier table describes.
+    Crypto-linkage and unprofitability then *cap* the tier at High — they are
+    sizing inputs, not gates, so they never reject a candidate, they only stop
+    it being sized as anything safer.
+    """
+    tier = "Low" if score >= 85 else ("Medium" if score >= 70 else "High")
+    notes: list[str] = []
+
+    for tag, why in _TIER_CAP_TAGS.items():
+        if tag in tags:
+            if _TIER_ORDER[tier] < _TIER_ORDER["High"]:
+                notes.append(f"{why} (tier capped from {tier} to High)")
+            else:
+                notes.append(why)
+            tier = "High"
+
+    if profit_state == "unprofitable":
+        tier = "High"
+
+    allocation = _TIER_ALLOCATION[tier]
+
+    # The IREN pattern is a drift problem, not a variance problem — wider
+    # cushion doesn't compensate, so it sits at the bottom of High or passes.
+    # Dilution is measured (see _external_funding); the declining core segment
+    # needs a revenue split yfinance doesn't carry, so it stays hand-tagged.
+    diluting = funded_by_paper or _DILUTION_TAG in tags
+    if _DECLINING_TAG in tags and diluting:
+        tier = "High"
+        allocation = "15% or pass"
+        notes.append(
+            "Core segment declining while funded by issuing paper (IREN "
+            "pattern) — structural, not variance; bottom of the High range "
+            "or pass")
+    return tier, allocation, notes
 
 
 def _score_beta(beta: float | None) -> tuple[int, str]:
@@ -313,6 +502,16 @@ def apply_contract_adjustments(
     BB%, from the stock scan), and how tight the market is (bid-ask spread) on
     top of the symbol's fundamental score.
     """
+    # A hard-gated symbol stays rejected whatever the contract looks like —
+    # otherwise a generous chain would re-score it back above F.
+    if result.get("reject"):
+        return {
+            **result,
+            "iv": iv, "cushion_sigma": cushion_sigma, "iv_hv": iv_hv,
+            "rsi": rsi, "bb_pct": bb_pct, "spread_pct": spread_pct,
+            "open_interest": open_interest,
+        }
+
     if otm_pct is None:
         return result
 
@@ -345,10 +544,20 @@ def apply_contract_adjustments(
             note_list.append(note)
 
     new_score = max(0, min(100, score + total_adj))
+
+    # Re-tier on the contract-level score: the tier follows the grade, and the
+    # caps (crypto-linked, unprofitable) re-apply on top of it. The tier notes
+    # are already in note_list from the symbol pass, so they aren't re-added.
+    tier, allocation, _ = _risk_tier(new_score, result.get("tags") or [],
+                                     result.get("profitability", "unknown"),
+                                     bool(result.get("funded_by_paper")))
+
     return {
         **result,
         "score": new_score,
         "grade": _score_to_grade(new_score),
+        "risk_tier":      tier,
+        "max_allocation": allocation,
         "iv":            iv,
         "cushion_sigma": cushion_sigma,
         "iv_hv":         iv_hv,
@@ -451,9 +660,47 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
         except Exception:
             pass
 
+        # ── Profitability and external funding (sizing inputs, never gates) ─
+        # Two extra fetches per symbol. Each is guarded on its own: a missing
+        # statement degrades that one signal rather than failing the analysis,
+        # and _profitability falls back to the info fields it already has.
+        try:
+            ttm_operating = _ttm_operating_income(ticker.quarterly_income_stmt)
+        except Exception:
+            ttm_operating = None
+        try:
+            balance = ticker.quarterly_balance_sheet
+        except Exception:
+            balance = None
+
+        profit_state, _growing, profit_note = _profitability(info, ttm_operating)
+        if profit_note:
+            notes.append(profit_note)
+            flags.append("UNPROFITABLE")
+
+        diluting, levering, funding_note = _external_funding(balance, cap)
+        funded_by_paper = (diluting or levering) and profit_state == "unprofitable"
+        if funded_by_paper:
+            flags.append("DILUTING" if diluting else "LEVERING")
+            notes.append(f"Loss-making and funded by issuing paper — {funding_note}")
+
         # ── Clamp and grade ───────────────────────────────────────────────
         score = max(0, min(100, score))
         grade = _score_to_grade(score)
+
+        # ── Hard gates: binary risks no position size fixes ────────────────
+        reject_reasons = [why for tag, why in _HARD_GATE_TAGS.items() if tag in tags]
+        if reject_reasons:
+            score = 0
+            grade = "F"
+            flags.append("HARD REJECT")
+            notes.extend(reject_reasons)
+
+        tier, allocation, tier_notes = _risk_tier(score, tags, profit_state,
+                                                  funded_by_paper)
+        notes.extend(tier_notes)
+        if reject_reasons:
+            tier, allocation = "Reject", "0%"
 
         return {
             "symbol":             symbol,
@@ -462,6 +709,12 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "sector":             sector,
             "tags":               tags,
             "tags_researched":    tags_researched,
+            "profitability":      profit_state,
+            "funded_by_paper":    funded_by_paper,
+            "risk_tier":          tier,
+            "max_allocation":     allocation,
+            "reject":             bool(reject_reasons),
+            "reject_reason":      " • ".join(reject_reasons),
             "industry":           info.get("industry", ""),
             "beta":               round(beta, 2) if beta is not None else None,
             "mkt_cap_b":          round((cap or 0) / 1e9, 2) if cap else None,
@@ -481,6 +734,12 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "sector":             "Error",
             "tags":               tags,
             "tags_researched":    tags_researched,
+            "profitability":      "unknown",
+            "funded_by_paper":    False,
+            "risk_tier":          "High",
+            "max_allocation":     _TIER_ALLOCATION["High"],
+            "reject":             False,
+            "reject_reason":      "",
             "industry":           "",
             "beta":               None,
             "mkt_cap_b":          None,

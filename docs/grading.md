@@ -226,6 +226,85 @@ which quote much wider than index options; 15–20% is normal here.
 theoretical whatever the spread says, but a thin-yet-tight market is still
 tradeable, and the spread already captures most of it.
 
+## Hard gates and risk tier
+
+Two things sit outside the score, because the score is a single number and these
+aren't matters of degree.
+
+**Hard gates** disqualify outright: a `recent-ipo` or `biotech-binary` tag forces
+score 0, grade F, risk tier `Reject`, and the flag `HARD REJECT`. These are
+binary, un-priceable risks — no cushion or position size compensates — so the
+rejection is sticky: `apply_contract_adjustments()` returns early for a gated
+symbol, and a generous chain can't re-score it back above F. They're driven off
+`durable-tags.json` rather than sector, because sector doesn't identify them.
+
+The strategy's other auto-disqualifiers — short-attack patterns, securities
+litigation, foreign regulatory overhang, suspended guidance — aren't derivable
+from any field the screener fetches, and remain a judgment call at review time.
+
+**Risk tier** is a sizing output, not a quality one. The base tier follows the
+graded score (Low ≥ 85, Medium ≥ 70, High below), since the score already weighs
+the beta, market-cap and cushion inputs the sizing table describes. Two factors
+then *cap* the tier at High without rejecting anything:
+
+| Factor | Source | Effect |
+|---|---|---|
+| Crypto-linked | `crypto-linked` tag | Tier capped at High |
+| Unprofitable | TTM operating income, falling back to trailing EPS / net income | Tier capped at High |
+| Funded by issuing paper | share count and total debt, quarterly balance sheet | `DILUTING` / `LEVERING` flag |
+| IREN pattern | `core-revenue-declining` tag **and** funded-by-paper | Max allocation becomes "15% or pass" |
+
+### Profitability uses operating income, not the bottom line
+
+The bottom line lies. IREN's trailing EPS reads **+$0.77** on a one-off gain
+booked below the operating line in a single quarter; its TTM operating income is
+**−$221M**. Net income alone would have called it profitable and skipped every
+caution the strategy asks for. Operating income leads, with trailing EPS and net
+income as a backstop — either negative counts, because yfinance disagrees with
+itself often enough (MSTR reports `profitMargins` 0.0 next to a −$31B net
+income) that no single field can be trusted alone.
+
+### Funded by issuing paper
+
+Dilution and debt are alternative routes, not nested, so both are measured over
+a one-year lookback on the quarterly balance sheet:
+
+```
+diluting = share count +20% YoY AND rising in ≥3 of the last 4 quarters
+levering = net new debt ≥ 15% of market cap
+funded_by_paper = unprofitable AND (diluting OR levering)
+```
+
+Three deliberate choices, each forced by a real name:
+
+- **New debt is measured against market cap**, not against prior debt. RBRK's
+  debt grew 243% off a tiny base — 5% of its market cap, i.e. nothing.
+- **Dilution must be sustained.** Synopsys issued 23% of its shares in the
+  single quarter to 2025-07-31 and was flat either side — the shape of a
+  stock-funded acquisition, not an ATM programme. The three-of-four test
+  excludes it; IREN rose in four of four.
+- **OR, not AND.** IREN did both, MSTR only diluted, CLSK only borrowed.
+  Requiring both would miss two of the three.
+
+Gating on unprofitability keeps the flag off healthy companies in a capex build,
+which is otherwise the same cash-flow shape.
+
+Max allocation follows the tier: Low 35–40%, Medium 25–30%, High 15–20%.
+
+A name can therefore grade B and still be capped at High — MSTR does exactly
+that. That's the intent: profitability and crypto-linkage are sizing inputs, not
+gates, so they shrink the position rather than exclude it.
+
+**The remaining gap** is the declining core segment. Revenue by segment isn't in
+any yfinance field, so `core-revenue-declining` stays hand-assigned in
+`durable-tags.json`. Dilution is now measured, so a ticker carrying that one tag
+completes the IREN pattern on its own. `active-dilution` also still works as a
+manual tag, for overriding the measurement.
+
+Both signals cost one extra yfinance fetch per symbol (quarterly income
+statement and quarterly balance sheet), each guarded separately — a missing
+statement degrades that one signal rather than failing the analysis.
+
 **Tags** are displayed but not scored. They come from `durable-tags.json`, a
 hand-researched map of ticker → risk tags (`ai-capex-chips`,
 `commodity-geopolitical`, `rate-sensitive-growth`, …) naming what actually moves
