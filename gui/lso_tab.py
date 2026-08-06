@@ -18,12 +18,14 @@ from .chart_window import ChartWindow
 from . import column_help
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
-_COLS    = ["grade", "symbol", "stock_price", "strike", "premium", "otm_pct",
+_COLS    = ["grade", "symbol", "risk_tier", "max_allocation",
+            "stock_price", "strike", "premium", "otm_pct",
             "iv", "cushion_sigma", "iv_hv", "rsi", "bb_pct",
             "spread_pct", "open_interest", "capital",
             "sector", "tags", "beta", "mkt_cap_b",
             "earnings_date", "earnings_in_period", "flags", "notes"]
-_HEADERS = ["Grade", "Symbol", "Stock", "Strike", "Premium %", "OTM%",
+_HEADERS = ["Grade", "Symbol", "Risk Tier", "Max Alloc",
+            "Stock", "Strike", "Premium %", "OTM%",
             "IV%", "Cushion σ", "IV/HV", "RSI", "BB%",
             "Spread %", "OI", "Capital",
             "Sector", "Tags", "Beta", "Mkt Cap ($B)",
@@ -89,6 +91,22 @@ _HELP = {
     "sector":      "Sector from yfinance. Adjusts the base score — staples, "
                    "utilities and healthcare score up; biotech, crypto-adjacent "
                    "and speculative names score down.",
+    "risk_tier":   "Position-sizing tier, not a quality score.\n\n"
+                   "    Low ≥ 85    Medium ≥ 70    High below\n\n"
+                   "Crypto-linked or unprofitable names are capped at High "
+                   "however well they otherwise grade — those are sizing "
+                   "inputs, not gates, so they shrink the position rather than "
+                   "reject it.\n\n"
+                   "'Reject' means a hard gate fired (recent IPO, biotech "
+                   "binary) — a risk no position size fixes.",
+    "max_allocation":
+                   "Most of the collateral pool this contract should take, from "
+                   "the strategy's sizing table:\n\n"
+                   "    Low 35–40%    Medium 25–30%    High 15–20%\n\n"
+                   "'15% or pass' marks the IREN pattern — a core segment "
+                   "declining while funded by dilution, tagged by hand as "
+                   "core-revenue-declining + active-dilution. That's a "
+                   "structural problem cushion can't offset.",
     "tags":        "Durable risk tags for the underlying, from durable-tags.json "
                    "— what moves this name that a sector label doesn't capture "
                    "(AI-capex, rate-sensitive growth, commodity/geopolitical, "
@@ -115,6 +133,16 @@ _HELP = {
 
 _SYMBOL_COL = _COLS.index("symbol")
 _LINK_COLOR = "#58a6ff"  # light blue link, legible on the dark table background
+
+# Sizing tiers, worst last — sorting a table by tier should put what you can
+# size up at the top, not order it alphabetically.
+_TIER_SORT   = {"Low": 0, "Medium": 1, "High": 2, "Reject": 3}
+_TIER_COLORS = {
+    "Low":    ("#1a7a1a", "#e6ffe6"),
+    "Medium": ("#7a6a00", "#fffde6"),
+    "High":   ("#8a3300", "#fff0e6"),
+    "Reject": ("#8a0000", "#ffe6e6"),
+}
 
 _GRADE_COLORS = {
     "A": ("#1a7a1a", "#e6ffe6"),  # dark green text, light green bg
@@ -392,9 +420,11 @@ class LsoAnalysisTab(QWidget):
                 w.writerow(["Contracts", len(sorted_results)])
                 w.writerow([])
                 w.writerow([
-                    "Grade", "Symbol", "Stock", "Strike", "Premium Pct", "OTM Pct",
+                    "Grade", "Symbol", "Risk Tier", "Max Allocation",
+                    "Profitability", "Stock", "Strike", "Premium Pct", "OTM Pct",
                     "IV Pct", "Cushion Sigma", "IV/HV", "RSI", "BB Pct",
-                    "Spread Pct", "OI", "Capital", "Sector", "Tags", "Beta",
+                    "Spread Pct", "OI", "Capital",
+                    "Sector", "Tags", "Beta",
                     "Mkt Cap B", "Earnings Date", "Earnings In Period",
                     "Flags", "Notes",
                 ])
@@ -403,6 +433,9 @@ class LsoAnalysisTab(QWidget):
                     w.writerow([
                         r.get("grade", "?"),
                         r.get("symbol", ""),
+                        r.get("risk_tier", ""),
+                        r.get("max_allocation", ""),
+                        r.get("profitability", ""),
                         _n(r, "stock_price", ".2f"),
                         _n(r, "strike", ".2f"),
                         _n(r, "premium", ".2f"),
@@ -480,6 +513,15 @@ class LsoAnalysisTab(QWidget):
                     item = _SortItem(f"{float(val):.2f}", float(val))
                 elif key == "mkt_cap_b" and val is not None:
                     item = _SortItem(f"{float(val):.2f}", float(val))
+                elif key == "risk_tier":
+                    tier = str(val) if val else ""
+                    item = _SortItem(tier, _TIER_SORT.get(tier, 9))
+                    fg2, bg2 = _TIER_COLORS.get(tier, (None, None))
+                    if fg2:
+                        item.setForeground(QColor(fg2))
+                        item.setBackground(QColor(bg2))
+                    if tier == "Reject" and row.get("reject_reason"):
+                        item.setToolTip(row["reject_reason"])
                 elif key == "tags":
                     tags = val or []
                     if not row.get("tags_researched"):
