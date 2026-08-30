@@ -81,8 +81,7 @@
     "china-adr"
   ],
   "BLSH": [
-    "crypto-linked",
-    "recent-ipo"
+    "crypto-linked"
   ],
   "BP": [
     "commodity-supply-shock"
@@ -92,8 +91,7 @@
   ],
   "CART": [],
   "CBRS": [
-    "ai-sentiment-spillover",
-    "recent-ipo"
+    "ai-sentiment-spillover"
   ],
   "CC": [
     "commodity-industrial"
@@ -134,8 +132,7 @@
     "crypto-linked"
   ],
   "CRCL": [
-    "crypto-linked",
-    "recent-ipo"
+    "crypto-linked"
   ],
   "CRH": [],
   "CRM": [
@@ -182,16 +179,12 @@
   "EOG": [
     "commodity-supply-shock"
   ],
-  "EQPT": [
-    "recent-ipo"
-  ],
+  "EQPT": [],
   "FCX": [
     "commodity-industrial"
   ],
   "FDX": [],
-  "FIG": [
-    "recent-ipo"
-  ],
+  "FIG": [],
   "FLY": [
     "rate-sensitive-growth"
   ],
@@ -464,8 +457,7 @@
     "ai-sentiment-spillover"
   ],
   "SPCX": [
-    "rate-sensitive-growth",
-    "recent-ipo"
+    "rate-sensitive-growth"
   ],
   "STM": [
     "ai-capex-chips"
