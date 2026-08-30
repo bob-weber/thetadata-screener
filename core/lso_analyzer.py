@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yfinance as yf
@@ -12,6 +12,42 @@ import yfinance as yf
 DURABLE_TAGS_FILE = "durable-tags.json"
 
 _tags_cache: tuple[float, dict[str, list[str]]] | None = None
+
+# Litigation is deliberately NOT a durable tag. Durable tags describe what a
+# company *is* — a China ADR, a crypto proxy, an AI-capex name — and those hold
+# for years. A docket is a dated fact: cases are filed, dismissed, settled and
+# appealed, and an assessment written today is wrong within a quarter or two.
+# durable-tags.json has nowhere to record when a fact was established, so a
+# litigation entry kept there would rot silently while still gating a symbol.
+# This store carries the date and the source alongside the severity.
+LITIGATION_FILE = "litigation.json"
+
+_litigation_cache: tuple[float, dict[str, dict]] | None = None
+
+# How long an assessment is trusted. Docket facts move on filing events, so the
+# review cadence follows the quarterly report that discloses them.
+_LITIGATION_REVIEW_DAYS = 100
+
+# Four outcomes, only two of which act. `clear` and `review` exist so an
+# automated pass can record what it found without inventing a verdict: `clear`
+# is "checked, nothing broken out", `review` is "there is legal text here but
+# nothing decisive" — flagged for a human, deliberately not acted on, since
+# defaulting those to overhang would cap the tier on most large filers.
+_LITIGATION_SEVERITY: dict[str, str] = {
+    "clear":
+        "Checked against the latest filing — no broken-out legal matter",
+    "review":
+        "Automated review found legal text but nothing decisive — read the "
+        "latest 10-Q Part II Item 1 and set a severity by hand",
+    "existential":
+        "Litigation that threatens the business itself — a ruling can gap the "
+        "stock overnight, and the loss is not bounded by anything the chain "
+        "prices",
+    "overhang":
+        "Litigation overhang — a known case above the industry's background "
+        "rate; a cash cost and a lid on the multiple, not a threat to the "
+        "franchise; size it smaller rather than passing",
+}
 
 # Sector score adjustments and explanatory notes
 _SECTOR_SCORES: dict[str, tuple[int, str]] = {
@@ -35,13 +71,22 @@ _SECTOR_SCORES: dict[str, tuple[int, str]] = {
 # rather than sector/industry, because sector doesn't identify them — a recent
 # IPO looks like any other name in its sector.
 _HARD_GATE_TAGS: dict[str, str] = {
-    "recent-ipo":
-        "Recent IPO (<12 months) — RSI/BB% compute on partial history, there is "
-        "no confirmed floor, and lockup expiry looms",
     "biotech-binary":
         "FDA/trial-catalyst risk — readouts gap the stock overnight regardless "
         "of cushion",
 }
+
+# The IPO gate is derived, not tagged. "<12 months" is a fact with an expiry
+# date, and a hand-written tag has no way to reach it — four of the six tickers
+# once tagged `recent-ipo` had aged out while still being force-rejected. The
+# listing date rides along in the yfinance `info` already fetched, so the gate
+# computes its own age and stops firing on its own. The tag survives only as a
+# fallback for when that field is missing.
+_IPO_WINDOW_DAYS = 365
+_IPO_TAG         = "recent-ipo"
+_IPO_GATE_REASON = ("Recent IPO (<12 months) — RSI/BB% compute on partial "
+                    "history, there is no confirmed floor, and lockup expiry "
+                    "looms")
 
 # Tags that cap the risk tier at High without disqualifying: the position is
 # tradeable, it just can't be sized as anything better than the riskiest tier.
@@ -101,6 +146,118 @@ def load_durable_tags() -> dict[str, list[str]]:
     }
     _tags_cache = (mtime, tags)
     return tags
+
+
+def load_litigation() -> dict[str, dict]:
+    """Ticker → litigation entry from ``litigation.json`` (empty if unreadable).
+
+    Same mtime-cached read as the durable tags, so an entry edited mid-session
+    takes effect on the next analysis. An entry may be a bare severity string,
+    which is accepted but carries no date — and therefore counts as stale.
+    """
+    global _litigation_cache
+    path = Path(LITIGATION_FILE)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _litigation_cache = None
+        return {}
+    if _litigation_cache is not None and _litigation_cache[0] == mtime:
+        return _litigation_cache[1]
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        _litigation_cache = None
+        return {}
+    entries = {
+        str(sym).strip().upper(): ({"severity": val} if isinstance(val, str)
+                                   else dict(val or {}))
+        for sym, val in raw.items()
+    }
+    _litigation_cache = (mtime, entries)
+    return entries
+
+
+def litigation_for(symbol: str) -> dict | None:
+    """The litigation entry for a symbol, or None if it has none on file."""
+    return load_litigation().get((symbol or "").strip().upper())
+
+
+def _parse_iso(value) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _litigation_state(entry: dict | None, today: date | None = None) -> dict:
+    """``{severity, stale, review_by, reason}`` for one litigation entry.
+
+    Staleness never silently flips the verdict either way. An expired entry keeps
+    applying and is flagged instead, because the two failure modes are not
+    symmetric: a gate that wrongly stops firing can put you short puts into a
+    live disaster, while one that wrongly keeps firing only costs a trade. An
+    entry with no usable date is stale from the start — undated is unverified.
+    """
+    if not entry:
+        return {"severity": None, "stale": False, "review_by": None, "reason": ""}
+    today = today or date.today()
+
+    severity = str(entry.get("severity", "")).strip().lower()
+    unknown  = severity not in _LITIGATION_SEVERITY
+    if unknown:
+        # An unreadable severity is a data error, not a clean bill of health —
+        # but it is also not evidence of a case, so it lands on `review`:
+        # visible and unacted-on, rather than silently capping or silently
+        # clearing on a malformed entry.
+        severity = "review"
+
+    review_by = _parse_iso(entry.get("review_by"))
+    if review_by is None:
+        asof = _parse_iso(entry.get("asof"))
+        review_by = (asof + timedelta(days=_LITIGATION_REVIEW_DAYS)) if asof else None
+    stale = unknown or review_by is None or today > review_by
+
+    reason = _LITIGATION_SEVERITY[severity]
+    if entry.get("case"):
+        reason += f" [{entry['case']}]"
+    if entry.get("note"):
+        reason += f" — {entry['note']}"
+    return {"severity": severity, "stale": stale,
+            "review_by": review_by.isoformat() if review_by else None,
+            "reason": reason}
+
+
+def _ipo_gate_reason(info: dict, tags: list[str], today: date | None = None) -> str:
+    """Reason string if the symbol is inside the IPO window, else ``""``.
+
+    Derived from the listing date in ``info`` when it is there — that expires by
+    itself — and only falling back to the hand-written tag when it is not.
+    """
+    today = today or date.today()
+    # Read the unit off the field name rather than the magnitude. Sniffing by
+    # size gets it wrong for anything listed before ~1973: PEP's 1972 date is
+    # 76,253,400,000 ms, which is small enough to pass for a seconds value and
+    # lands in the year 4386 — reading as "listed in the future", i.e. gated.
+    # Both fields are also negative for pre-1970 listings (KO, 1962), so the
+    # epoch is offset explicitly instead of via date.fromtimestamp().
+    listed = None
+    for field, unit in (("firstTradeDateMilliseconds", "milliseconds"),
+                        ("firstTradeDateEpochUtc",     "seconds")):
+        raw = info.get(field)
+        if raw is None:
+            continue
+        try:
+            listed = (datetime(1970, 1, 1) + timedelta(**{unit: int(raw)})).date()
+            break
+        except Exception:
+            listed = None
+    if listed is None:
+        return _IPO_GATE_REASON if _IPO_TAG in tags else ""
+    age = (today - listed).days
+    if age > _IPO_WINDOW_DAYS:
+        return ""
+    return f"{_IPO_GATE_REASON} — listed {listed.isoformat()}, {age} days ago"
 
 
 def tags_for(symbol: str) -> tuple[list[str], bool]:
@@ -225,14 +382,15 @@ def _external_funding(bs, market_cap: int | None) -> tuple[bool, bool, str]:
 
 
 def _risk_tier(score: int, tags: list[str], profit_state: str,
-               funded_by_paper: bool = False) -> tuple[str, str, list[str]]:
+               funded_by_paper: bool = False,
+               litigation: dict | None = None) -> tuple[str, str, list[str]]:
     """``(tier, max_allocation, notes)`` for a symbol.
 
     The base tier follows the graded score, since the score already weighs the
     beta / market-cap / cushion inputs the strategy's tier table describes.
-    Crypto-linkage and unprofitability then *cap* the tier at High — they are
-    sizing inputs, not gates, so they never reject a candidate, they only stop
-    it being sized as anything safer.
+    Crypto-linkage, unprofitability and a litigation overhang then *cap* the
+    tier at High — they are sizing inputs, not gates, so they never reject a
+    candidate, they only stop it being sized as anything safer.
     """
     tier = "Low" if score >= 85 else ("Medium" if score >= 70 else "High")
     notes: list[str] = []
@@ -244,6 +402,14 @@ def _risk_tier(score: int, tags: list[str], profit_state: str,
             else:
                 notes.append(why)
             tier = "High"
+
+    if litigation and litigation.get("severity") == "overhang":  # `review`/`clear` never size
+        why = litigation["reason"]
+        if _TIER_ORDER[tier] < _TIER_ORDER["High"]:
+            notes.append(f"{why} (tier capped from {tier} to High)")
+        else:
+            notes.append(why)
+        tier = "High"
 
     if profit_state == "unprofitable":
         tier = "High"
@@ -546,11 +712,13 @@ def apply_contract_adjustments(
     new_score = max(0, min(100, score + total_adj))
 
     # Re-tier on the contract-level score: the tier follows the grade, and the
-    # caps (crypto-linked, unprofitable) re-apply on top of it. The tier notes
+    # caps (crypto-linked, unprofitable, litigation overhang) re-apply on top of
+    # it. The tier notes
     # are already in note_list from the symbol pass, so they aren't re-added.
     tier, allocation, _ = _risk_tier(new_score, result.get("tags") or [],
                                      result.get("profitability", "unknown"),
-                                     bool(result.get("funded_by_paper")))
+                                     bool(result.get("funded_by_paper")),
+                                     result.get("litigation"))
 
     return {
         **result,
@@ -576,8 +744,10 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
     flags  = []
     notes  = []
 
-    # Tags are local data, not market data — they survive a yfinance failure.
+    # Tags and the litigation entry are local data, not market data — they
+    # survive a yfinance failure, and the error path below honours them too.
     tags, tags_researched = tags_for(symbol)
+    litigation = _litigation_state(litigation_for(symbol))
 
     try:
         ticker = yf.Ticker(symbol)
@@ -690,6 +860,21 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
 
         # ── Hard gates: binary risks no position size fixes ────────────────
         reject_reasons = [why for tag, why in _HARD_GATE_TAGS.items() if tag in tags]
+        ipo_reason = _ipo_gate_reason(info, tags)
+        if ipo_reason:
+            reject_reasons.append(ipo_reason)
+        if litigation["severity"] == "existential":
+            reject_reasons.append(litigation["reason"])
+        if litigation["severity"] == "review":
+            flags.append("LITIGATION UNCLEAR")
+            notes.append(litigation["reason"])
+        if litigation["stale"]:
+            flags.append("LITIGATION REVIEW DUE")
+            notes.append(
+                "Litigation assessment is past its review date"
+                + (f" ({litigation['review_by']})" if litigation["review_by"]
+                   else " (undated)")
+                + " — it still applies, but re-read the latest 10-Q")
         if reject_reasons:
             score = 0
             grade = "F"
@@ -697,7 +882,7 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             notes.extend(reject_reasons)
 
         tier, allocation, tier_notes = _risk_tier(score, tags, profit_state,
-                                                  funded_by_paper)
+                                                  funded_by_paper, litigation)
         notes.extend(tier_notes)
         if reject_reasons:
             tier, allocation = "Reject", "0%"
@@ -715,6 +900,7 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "max_allocation":     allocation,
             "reject":             bool(reject_reasons),
             "reject_reason":      " • ".join(reject_reasons),
+            "litigation":         litigation,
             "industry":           info.get("industry", ""),
             "beta":               round(beta, 2) if beta is not None else None,
             "mkt_cap_b":          round((cap or 0) / 1e9, 2) if cap else None,
@@ -727,26 +913,37 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
     except Exception as e:
         if on_log:
             on_log(f"  {symbol}: data error — {e}")
+        # The market data is gone but the local data isn't: a symbol on file as
+        # existentially sued stays rejected, and an overhang still caps sizing.
+        err_reject = (litigation["reason"]
+                      if litigation["severity"] == "existential" else "")
+        err_flags  = ["DATA ERROR"]
+        if err_reject:
+            err_flags.append("HARD REJECT")
+        if litigation["stale"]:
+            err_flags.append("LITIGATION REVIEW DUE")
+        err_tier, err_alloc, _ = _risk_tier(50, tags, "unknown", False, litigation)
         return {
             "symbol":             symbol,
-            "grade":              "?",
-            "score":              50,
+            "grade":              "F" if err_reject else "?",
+            "score":              0 if err_reject else 50,
             "sector":             "Error",
             "tags":               tags,
             "tags_researched":    tags_researched,
             "profitability":      "unknown",
             "funded_by_paper":    False,
-            "risk_tier":          "High",
-            "max_allocation":     _TIER_ALLOCATION["High"],
-            "reject":             False,
-            "reject_reason":      "",
+            "risk_tier":          "Reject" if err_reject else err_tier,
+            "max_allocation":     "0%" if err_reject else err_alloc,
+            "reject":             bool(err_reject),
+            "reject_reason":      err_reject,
+            "litigation":         litigation,
             "industry":           "",
             "beta":               None,
             "mkt_cap_b":          None,
             "earnings_date":      "",
             "earnings_in_period": False,
-            "flags":              "DATA ERROR",
-            "notes":              str(e),
+            "flags":              " | ".join(err_flags),
+            "notes":              " • ".join([str(e)] + ([err_reject] if err_reject else [])),
         }
 
 
@@ -757,7 +954,21 @@ def analyze_symbols(
     on_progress=None,
     stop_flag=None,
     throttle: float = 0.3,
+    review_litigation: bool = True,
 ) -> list[dict]:
+    # Litigation status is only actionable for names you might actually write
+    # against, and it decays — so it is refreshed here, for exactly the symbols
+    # being analysed, rather than pre-computed across the universe. Entries
+    # inside their review window are reused, so a repeat analysis fetches
+    # nothing and a quarterly refresh happens by itself.
+    if review_litigation and symbols:
+        try:
+            from core import litigation_review
+            litigation_review.refresh(symbols, on_log=on_log, stop_flag=stop_flag)
+        except Exception as e:                # EDGAR is not required to grade
+            if on_log:
+                on_log(f"Litigation review unavailable ({e}) — using entries on file.")
+
     results = []
     total   = len(symbols)
     for i, sym in enumerate(symbols):

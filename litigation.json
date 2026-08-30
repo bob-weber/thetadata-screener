@@ -1,0 +1,65 @@
+{
+  "AAPL": {
+    "asof": "2026-08-29",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "broken-out legal heading",
+      "heading only \u2014 no caption or case-type signal"
+    ],
+    "filing": "10-Q 2026-07-31",
+    "note": "broken-out legal heading; heading only \u2014 no caption or case-type signal",
+    "review_by": "2026-12-07",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000020/aapl-20260627.htm"
+  },
+  "APP": {
+    "asof": "2026-08-29",
+    "auto": false,
+    "case": "Brownback v. AppLovin, N.D. Cal.",
+    "confirmed": true,
+    "note": "Securities class action (10b-5), class period 2024-11-07 to 2025-03-27; motion to dismiss fully briefed Feb 2026, ruling pending. No accrual; no SEC/DOJ matter and no restatement disclosed. Consolidated derivative suits stayed behind the MTD.",
+    "review_by": "2026-11-15",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/1751008/000175100826000059/app-20260630.htm"
+  },
+  "IREN": {
+    "asof": "2026-08-29",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "securities class action (10b-5)"
+    ],
+    "filing": "10-K 2026-08-27",
+    "note": "securities class action (10b-5)",
+    "review_by": "2026-12-07",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/1878848/000187884826000052/iren-20260630.htm"
+  },
+  "KO": {
+    "asof": "2026-08-29",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "named case caption"
+    ],
+    "filing": "10-Q 2026-07-29",
+    "note": "named case caption",
+    "review_by": "2026-12-07",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/21344/000162828026050503/ko-20260703.htm"
+  },
+  "NVDA": {
+    "asof": "2026-08-29",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "ordinary-course language only"
+    ],
+    "filing": "10-Q 2026-08-26",
+    "note": "ordinary-course language only",
+    "review_by": "2026-12-07",
+    "severity": "clear",
+    "source": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm"
+  }
+}

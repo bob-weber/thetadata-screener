@@ -231,16 +231,32 @@ tradeable, and the spread already captures most of it.
 Two things sit outside the score, because the score is a single number and these
 aren't matters of degree.
 
-**Hard gates** disqualify outright: a `recent-ipo` or `biotech-binary` tag forces
-score 0, grade F, risk tier `Reject`, and the flag `HARD REJECT`. These are
+**Hard gates** disqualify outright: score 0, grade F, risk tier `Reject`, and the
+flag `HARD REJECT`. Three things trigger one — a `biotech-binary` tag, a listing
+inside the IPO window, or an `existential` entry in `litigation.json`. These are
 binary, un-priceable risks — no cushion or position size compensates — so the
 rejection is sticky: `apply_contract_adjustments()` returns early for a gated
 symbol, and a generous chain can't re-score it back above F. They're driven off
 `durable-tags.json` rather than sector, because sector doesn't identify them.
 
-The strategy's other auto-disqualifiers — short-attack patterns, securities
-litigation, foreign regulatory overhang, suspended guidance — aren't derivable
-from any field the screener fetches, and remain a judgment call at review time.
+Securities litigation is one of the strategy's auto-disqualifiers, and it lives
+in its own store rather than in the durable tags — see
+[Litigation is dated, not durable](#litigation-is-dated-not-durable). An
+`existential` entry gates; an `overhang` entry caps the tier. Neither is
+*derived* — no field the screener fetches mentions a lawsuit — so both are
+hand-assigned, and the judgment behind them is in
+[Deciding whether litigation counts](#deciding-whether-litigation-counts).
+The remaining auto-disqualifiers — short-attack patterns, foreign regulatory
+overhang, suspended guidance — still have nowhere to live and remain a judgment
+call at review time.
+
+**The IPO gate is derived, not tagged.** "Listed under 12 months" is a fact with
+an expiry date, and a hand-written tag has no way to reach it. Six tickers once
+carried a `recent-ipo` tag; by the time it was checked, CRCL, FIG and BLSH had
+aged past the window and were still being force-rejected on it, silently. The
+listing date rides along in the yfinance `info` the analyzer already fetches, so
+`_ipo_gate_reason()` computes the age itself and the gate stops firing on its
+own. The tag remains only as a fallback for when that field is missing.
 
 **Risk tier** is a sizing output, not a quality one. The base tier follows the
 graded score (Low ≥ 85, Medium ≥ 70, High below), since the score already weighs
@@ -250,6 +266,7 @@ then *cap* the tier at High without rejecting anything:
 | Factor | Source | Effect |
 |---|---|---|
 | Crypto-linked | `crypto-linked` tag | Tier capped at High |
+| Litigation overhang | `overhang` in `litigation.json` | Tier capped at High |
 | Unprofitable | TTM operating income, falling back to trailing EPS / net income | Tier capped at High |
 | Funded by issuing paper | share count and total debt, quarterly balance sheet | `DILUTING` / `LEVERING` flag |
 | IREN pattern | `core-revenue-declining` tag **and** funded-by-paper | Max allocation becomes "15% or pass" |
@@ -305,15 +322,196 @@ Both signals cost one extra yfinance fetch per symbol (quarterly income
 statement and quarterly balance sheet), each guarded separately — a missing
 statement degrades that one signal rather than failing the analysis.
 
-**Tags** are displayed but not scored. They come from `durable-tags.json`, a
+**Tags** are mostly displayed rather than scored. Four act: `biotech-binary`
+gates, `crypto-linked` caps the tier, and `core-revenue-declining` with
+`active-dilution` set the IREN allocation. `recent-ipo` acts only as a fallback
+when the listing date is missing. Every other tag is read by you, not by the
+score. They come from `durable-tags.json`, a
 hand-researched map of ticker → risk tags (`ai-capex-chips`,
 `commodity-geopolitical`, `rate-sensitive-growth`, …) naming what actually moves
 a name when the sector label doesn't. Nothing in the grade uses them: the grade
-judges one contract in isolation, while tags are for reading *across* the
+judges one contract in isolation, while the rest are for reading *across* the
 table — four A-grade contracts sharing `ai-capex-chips` are one bet on one
 factor, which no per-contract score can see. A ticker mapped to `[]` has been
 researched and carries no durable tag; a ticker absent from the file shows
 **UNTAGGED** and is listed in the status line and log so it can be added.
+
+### Litigation is dated, not durable
+
+Litigation does not live in `durable-tags.json`, and the distinction is the whole
+point. A durable tag describes what a company *is* — a China ADR, a crypto proxy,
+an AI-capex name — and that holds for years. A docket is a *dated fact*: cases are
+filed, dismissed, settled and appealed, and an assessment written today is stale
+within a quarter or two. `durable-tags.json` has nowhere to record when a fact was
+established, so a litigation entry kept there would rot in place while still
+gating a symbol. That is not hypothetical — it is exactly what happened to
+`recent-ipo`, the one other time-boxed fact that was stored as a tag.
+
+So litigation gets its own store, `litigation.json`, keyed by ticker:
+
+```json
+{
+  "APP": {
+    "severity":  "overhang",
+    "asof":      "2026-08-29",
+    "review_by": "2026-11-15",
+    "case":      "Brownback v. AppLovin, N.D. Cal.",
+    "note":      "10b-5 class action; MTD fully briefed Feb 2026, ruling pending",
+    "source":    "https://www.sec.gov/Archives/edgar/data/1751008/.../app-20260630.htm"
+  }
+}
+```
+
+`severity` is one of four, and only two of them act:
+
+| Severity | Effect |
+|---|---|
+| `existential` | Hard gate — score 0, grade F, tier `Reject` |
+| `overhang` | Tier capped at High |
+| `review` | No effect on grade or sizing; flags `LITIGATION UNCLEAR` |
+| `clear` | No effect — records that the filing was checked and nothing was broken out |
+
+`review` and `clear` exist so the automated pass can record what it found without
+inventing a verdict.
+`asof` and `review_by` carry the shelf life: `review_by` is explicit when you set
+it, otherwise `asof` plus 100 days, which lands on the next quarterly report —
+the filing that actually moves these facts. `case`, `note` and `source` are
+provenance, so a future reader can check the finding instead of trusting it.
+
+**A stale entry keeps applying, and says so.** Past `review_by`, the verdict does
+not change; the symbol gains a `LITIGATION REVIEW DUE` flag and a note naming the
+date. The two failure modes are not symmetric — a gate that wrongly stops firing
+can put you short puts into a live disaster, while one that wrongly keeps firing
+only costs you a trade — so staleness is surfaced, never silently resolved in
+either direction. An entry with no usable date is stale from the start: undated
+is unverified. An unreadable `severity` degrades to `overhang` and is flagged,
+because a malformed entry is a data error, not a clean bill of health.
+
+Because the entries are local data rather than market data, they survive a
+yfinance failure: a symbol on file as existentially sued stays rejected even when
+its `analyze_symbol()` call errors out.
+
+#### The review runs itself, for candidates only
+
+`core/litigation_review.py` refreshes the store at the top of `analyze_symbols()`
+— so LSO Analysis checks the filings for exactly the symbols it is grading. It is
+deliberately **not** a universe sweep. Litigation status is only actionable for a
+name you might write against, and it decays; pre-computing it across thousands of
+symbols would mean maintaining a large file of judgments that are stale by the
+time any of them matters. If a symbol becomes a candidate later, it gets read
+then, and the answer is current.
+
+`litigation.json` is what makes that cheap: only entries that are missing or past
+`review_by` are fetched, so a repeat analysis costs nothing and the quarterly
+refresh happens on its own. Roughly two EDGAR requests per symbol per quarter,
+paced under SEC's 10 req/s limit.
+
+Per symbol it reads the newest 10-Q or 10-K, extracts Part II Item 1 / Item 3
+**plus the contingencies-note windows** — a 10-Q's Item 1 is usually one line
+pointing at the notes, so classifying on Item 1 alone reads a live case as
+boilerplate — and matches the rubric's mechanical tests:
+
+| Signal | Verdict |
+|---|---|
+| Securities class action **and** regulator/restatement language | `existential` |
+| Securities class action, derivative suit, or a named case caption | `overhang` |
+| A broken-out heading only (`Antitrust Matters`, `Patent Litigation`) | `review` |
+| Substantial legal text, nothing decisive | `review` |
+| Ordinary-course language only | `clear` |
+
+A standing antitrust or patent heading is baseline for mega-cap tech and pharma,
+not deviation from it, so it is explicitly **not** enough to size a position
+down — it goes to `review` for a human read. On a twelve-name sample the pass
+acted on six and handed five back; AAPL, MSFT, MRK and GOOGL all landed in
+`review` on heading-only evidence, which is the correct answer.
+
+**Confirm-to-clear.** Machine entries are marked `auto: true` and carry their
+`evidence`, `confidence` and the filing they came from. Setting `confirmed: true`
+on an entry protects it: a later automated pass may still *raise* the severity —
+that direction is safe — but can never downgrade or clear a human verdict. What
+it found is recorded alongside as `auto_severity` instead, so a parsing miss
+cannot quietly un-gate a name you rejected on purpose.
+
+### Deciding whether litigation counts
+
+Litigation is not a binary the way an FDA readout is, and *presence* of it is not
+a signal at all. Large pharma, autos, banks and insurers carry hundreds of open
+matters at any time; a screener that tagged every company with an active lawsuit
+would tag half the market and tell you nothing. The tag is for **deviation from
+that industry's own baseline**, not for the existence of a docket.
+
+Four questions decide it, in order. A headline is not enough to answer any of
+them — all four are answered from the company's filings. The automated pass
+answers questions 1 and, partly, 2; questions 3 and 4 are why `review` exists
+and why a severity is worth confirming by hand.
+
+**1. Does the company itself name it?** 10-K Item 3 *Legal Proceedings*, 10-Q Part
+II Item 1, and the contingencies footnote. Routine matters get one boilerplate
+paragraph: ordinary course, no material adverse effect expected. A matter that
+gets its own named subsection with a case caption is management telling you this
+one is different. This is the cheapest filter and it does most of the work — if a
+company with a big legal footprint hasn't broken a case out, it's baseline.
+
+**2. Is there a number, and how big is it against market cap?** The contingencies
+footnote carries the accrued reserve and, often, a "reasonably possible loss in
+excess of amounts accrued" range. Take the top of that range over market cap:
+
+| Exposure | Read |
+|---|---|
+| Under ~2%, fully accrued | Baseline — no tag |
+| ~2–10%, or accrued with a wide range | `litigation-overhang` |
+| Over ~10–15%, or exceeds cash plus a year of operating income | `litigation-existential` |
+
+Treat "cannot reasonably be estimated" on a case management *has* broken out as
+a red flag, not as a neutral. It means the tail isn't bounded, which is exactly
+the condition a cushion can't price.
+
+**3. Does it threaten the revenue line, or only cost money?** This is the question
+that separates the two tags most reliably, and it can override the arithmetic
+above. An injunction, a forced divestiture, a licence or approval at risk, or a
+remedy that rewrites how the product reaches customers is *structural* — tag it
+existential even when the damages look affordable, because the loss isn't the
+payment. A pure damages claim is a cash cost against a known balance sheet:
+overhang.
+
+**4. Is there a scheduled binary date, and does it land inside your expiration?**
+A trial date, a verdict, an appellate ruling, a regulator's decision deadline. An
+overnight gap on a ruling is the risk the wheel structurally cannot cushion —
+the same reason earnings inside the contract's life is flagged. A date inside the
+expiration promotes `litigation-overhang` to `litigation-existential` for that
+expiration, even if it would otherwise only cap the tier.
+
+**The credibility overlay.** A securities class action filed after a sharp drop,
+alongside an SEC or DOJ investigation, a restatement, or an auditor change, is
+not really a litigation question — it's the short-attack pattern the strategy
+already auto-disqualifies. Tag it existential regardless of the dollar figures.
+The risk there is the accounting, which means every other input on this page is
+suspect too.
+
+**What stays untagged.** Ordinary product liability for an automaker or a drug
+maker. Patent disputes between operating companies over non-core products. NPE
+suits. Routine wage-hour and employment class actions. Ordinary-course regulatory
+examinations at a bank or insurer. And settled mass torts already on a fixed
+payment schedule — the number is known and financed, which makes it an earnings
+drag that the profitability and cash-flow factors already see.
+
+**Sources**, all free and all primary:
+
+- **SEC EDGAR full-text search** (`efts.sec.gov/LATEST/search-index?q=`) — then
+  read the filing: 10-K Item 3, 10-Q Part II Item 1, 8-K Items 8.01 and 7.01.
+- **The contingencies footnote** in the 10-K/10-Q — where the accrual and the
+  loss range actually live. Item 3 often just cross-references it.
+- **Stanford Securities Class Action Clearinghouse** — securities suits by
+  ticker, with docket status.
+
+**Re-check on each 10-Q**, and treat an 8-K on a docket event as a trigger to
+re-read. That cadence is what `review_by` encodes, and why an entry past it is
+flagged rather than trusted. Litigation resolves: a settled case should be removed
+from `litigation.json`, not left to gate a symbol forever.
+
+**An entry is not a fetched fact.** None of this is in the screener — no field it
+requests mentions a lawsuit, and nothing verifies these entries. A ticker absent
+from `litigation.json` means *not researched*, not *no litigation*.
 
 ## Where the numbers come from
 
