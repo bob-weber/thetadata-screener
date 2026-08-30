@@ -385,15 +385,13 @@ def _fetch_edgar_symbols(on_log=None) -> list[str]:
 
     df = df[df["exchange"].isin(VALID_EXCHANGES)].copy()
     df["ticker"] = df["ticker"].str.upper().str.strip()
-    # Single-char suffixes W/R denote warrants/rights at any length.
-    # U denotes SPAC units only when appended to a 4-char base (5+ chars total);
-    # shorter tickers like LULU/ROKU are legitimate standalone symbols.
-    df = df[
-        ~df["ticker"].str.endswith("W") &
-        ~df["ticker"].str.endswith("R") &
-        ~(df["ticker"].str.endswith("U") & (df["ticker"].str.len() >= 5)) &
-        ~df["ticker"].str.contains(r"[\^~\+]", regex=True)
-    ]
+    # Nothing here infers a security type from the ticker string. Nasdaq's
+    # 5th-letter convention (…W warrant, …R rights, …U unit) reads the same as
+    # the last letter of a real 4-char name — AEHR, PLTR, SNOW, DOW — and every
+    # length/suffix rule that tried to separate the two cost hundreds of real
+    # tickers. The type is a fact Schwab reports per symbol, so the filtering
+    # happens in _resolve_priceable() against the quote, not against the string.
+    df = df[~df["ticker"].str.contains(r"[\^~\+]", regex=True)]
     df = df[~df["name"].apply(_is_fund)]
     df = df.drop_duplicates(subset="ticker")
     symbols = sorted(df["ticker"].tolist())
@@ -402,16 +400,49 @@ def _fetch_edgar_symbols(on_log=None) -> list[str]:
     return symbols
 
 
+# Schwab assetSubType → why the symbol is out of scope for a wheel screener.
+# COE (common), ADR, ETF, CEF and ETN are kept; the fund-name filter upstream
+# already removes most funds by name.
+_EXCLUDED_SUBTYPES = {
+    "WAR": "warrant",
+    "RGT": "rights",
+    "UIT": "unit",
+    "PRF": "preferred",
+}
+
+
+def _quote_reject_kind(row: dict) -> str | None:
+    """None if a quote row is a symbol worth scanning, else why it is excluded.
+
+    Presence in a quote response proves nothing: Schwab prices warrants, rights,
+    units and preferreds happily and reports assetMainType EQUITY for all of
+    them. The security type is in ``assetSubType``, and whether the symbol has a
+    listed chain at all is in ``reference.optionable`` — the question this
+    screener actually cares about, since a symbol with no chain cannot produce a
+    contract in Pass 3. Both fields ride along in the batch already fetched.
+    """
+    sub = row.get("assetSubType") or ""
+    if sub in _EXCLUDED_SUBTYPES:
+        return _EXCLUDED_SUBTYPES[sub]
+    if not (row.get("reference") or {}).get("optionable"):
+        return "not-optionable"
+    return None
+
+
 def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progress=None,
-                       chunk: int = 250) -> dict:
-    """Map each EDGAR ticker Schwab can price to its Schwab symbol.
+                       chunk: int = 250) -> tuple[dict, dict]:
+    """Map each EDGAR ticker Schwab prices *and* we can wheel to its Schwab symbol.
 
     Direct hits map to themselves. Dual-class names lost to the EDGAR '-'/'.'
     vs Schwab '/' separator (BRK-B → BRK/B) are recovered with a normalized
-    retry, and stored under their Schwab form. Returns {edgar: schwab}.
+    retry, and stored under their Schwab form. Returns
+    ``({edgar: schwab}, {edgar: reject_kind})``; the second maps the symbols
+    Schwab priced but ``_quote_reject_kind()`` ruled out, so the dropped-file
+    breakdown can name a real reason instead of guessing from the suffix.
     """
     from core import schwab_client
     resolved: dict[str, str] = {}
+    rejected: dict[str, str] = {}
     missing: list[str] = []
     total = len(edgar_symbols)
     for i in range(0, total, chunk):
@@ -420,7 +451,15 @@ def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progres
             data = schwab_client.quotes(client, batch)
             # Recognized symbols are top-level keys; unknowns are in errors.invalidSymbols.
             for s in batch:
-                (resolved.__setitem__(s, s) if s in data else missing.append(s))
+                row = data.get(s)
+                if row is None:
+                    missing.append(s)
+                    continue
+                kind = _quote_reject_kind(row)
+                if kind:
+                    rejected[s] = kind
+                else:
+                    resolved[s] = s
         except Exception:
             for s in batch:      # on a request error, keep the batch rather than drop it
                 resolved[s] = s
@@ -437,18 +476,29 @@ def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progres
         except Exception:
             continue
         for edgar_sym, schwab_sym in alt.items():
-            if schwab_sym in data:
+            row = data.get(schwab_sym)
+            if row is None:
+                continue
+            kind = _quote_reject_kind(row)
+            if kind:
+                rejected[edgar_sym] = kind
+            else:
                 resolved[edgar_sym] = schwab_sym
 
     if on_log:
         recovered = sum(1 for e, s in resolved.items() if e != s)
         extra = f" ({recovered} dual-class recovered)" if recovered else ""
-        on_log(f"Priceable in Schwab: {len(resolved)}/{total}{extra}")
-    return resolved
+        on_log(f"Scannable in Schwab: {len(resolved)}/{total}{extra}; "
+               f"{len(rejected)} priced but excluded by type/optionability")
+    return resolved, rejected
 
 
 def _classify_dropped(sym: str) -> str:
-    """Bucket a dropped EDGAR ticker by its suffix after a -/./ separator.
+    """Bucket an *unpriced* EDGAR ticker by its suffix after a -/./ separator.
+
+    Only for symbols Schwab returned no quote for, where there is no reported
+    type to go on. Anything Schwab did price is classified from its quote by
+    ``_quote_reject_kind()`` instead.
 
     class_share names (e.g. BRK-B) are the ones likely lost only to the EDGAR
     '-' vs Schwab '/' format difference; the rest are genuinely out of scope.
@@ -469,11 +519,21 @@ def _classify_dropped(sym: str) -> str:
 
 
 def _record_dropped(dropped: list[str], on_log=None,
-                    dropped_file: str | Path = DROPPED_FILE) -> None:
-    """Persist the dropped tickers + a breakdown so exclusions are inspectable."""
+                    dropped_file: str | Path = DROPPED_FILE,
+                    reasons: dict | None = None) -> None:
+    """Persist the dropped tickers + a breakdown so exclusions are inspectable.
+
+    ``reasons`` carries the reject kind Schwab's own quote reported; symbols
+    absent from it were never priced and fall back to the suffix classifier.
+    """
     from collections import Counter
-    kinds = Counter(_classify_dropped(s) for s in dropped)
-    class_shares = sorted(s for s in dropped if _classify_dropped(s) == "class_share")
+    reasons = reasons or {}
+
+    def kind_of(sym: str) -> str:
+        return reasons.get(sym) or _classify_dropped(sym)
+
+    kinds = Counter(kind_of(s) for s in dropped)
+    class_shares = sorted(s for s in dropped if kind_of(s) == "class_share")
     Path(dropped_file).write_text(json.dumps({
         "updated":      date.today().isoformat(),
         "count":        len(dropped),
@@ -483,18 +543,19 @@ def _record_dropped(dropped: list[str], on_log=None,
     }, indent=2))
     if on_log:
         eg = ", ".join(class_shares[:3])
+        # Summarise straight from the counter: the kinds now come from Schwab,
+        # so a hand-written list of them would rot the next time one is added.
+        summary = ", ".join(f"{cnt} {kind}" for kind, cnt in kinds.most_common())
         on_log(
-            f"Dropped {len(dropped)}: {len(class_shares)} dual-class"
-            f"{f' (e.g. {eg})' if eg else ''}, {kinds.get('preferred', 0)} preferred, "
-            f"{kinds.get('warrant', 0)} warrant, {kinds.get('rights', 0)} rights, "
-            f"{kinds.get('unlisted', 0)} unlisted — see {dropped_file}"
+            f"Dropped {len(dropped)}: {summary}"
+            f"{f' — dual-class e.g. {eg}' if eg else ''} — see {dropped_file}"
         )
 
 
 def build_universe(on_log=None, on_progress=None,
                    universe_file: str | Path = UNIVERSE_FILE,
                    validate: bool = True) -> dict:
-    """Fetch the EDGAR universe, drop names Schwab can't price, and persist it.
+    """Fetch the EDGAR universe, keep what Schwab prices and lists options on.
 
     Returns the saved dict ``{updated, source, count, symbols}``. When Schwab is
     unavailable (no cached token), saves the unvalidated EDGAR list instead of
@@ -516,10 +577,10 @@ def build_universe(on_log=None, on_progress=None,
             if on_log:
                 on_log(f"Schwab unavailable ({e}) — saving unvalidated EDGAR list")
         if client is not None:
-            resolved = _resolve_priceable(client, edgar, on_log, on_progress)
+            resolved, rejected = _resolve_priceable(client, edgar, on_log, on_progress)
             symbols  = sorted(resolved.values())   # Schwab symbols (recovered forms included)
-            source   = "SEC EDGAR + Schwab priceable"
-            _record_dropped(sorted(set(edgar) - set(resolved)), on_log)
+            source   = "SEC EDGAR + Schwab optionable"
+            _record_dropped(sorted(set(edgar) - set(resolved)), on_log, reasons=rejected)
 
     data = {
         "updated": date.today().isoformat(),
@@ -532,6 +593,14 @@ def build_universe(on_log=None, on_progress=None,
     # universe on the next options scan (listings change rarely, but a universe
     # rebuild is the natural point to refresh them).
     Path(WEEKLIES_CACHE_FILE).unlink(missing_ok=True)
+    # Drop the scan caches too. Their keys cover the date and the scan
+    # parameters but not the universe, so a screen run earlier the same day
+    # would be reused verbatim and the symbols just added would stay invisible
+    # until tomorrow. These are the default filenames the passes write.
+    # The per-symbol history store is deliberately kept: those closes are still
+    # good, and refetching them costs a request each.
+    for stale_cache in ("price_screen_cache.json", "tech_candidates_cache.json"):
+        Path(stale_cache).unlink(missing_ok=True)
     if on_log:
         on_log(f"Universe saved: {len(symbols)} tickers → {universe_file}")
     return data
