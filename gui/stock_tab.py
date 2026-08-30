@@ -12,6 +12,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 
 from . import column_help
+from .collapsible import CollapsibleGroupBox
 from .workers import StockScanWorker, UniverseWorker
 
 PRICE_CACHE      = "price_screen_cache.json"
@@ -217,8 +218,8 @@ class StockScannerTab(QWidget):
         root.setSpacing(6)
 
         # ── Ticker source ─────────────────────────────────────────────────────
-        source_box = QGroupBox("Ticker Source")
-        sh = QHBoxLayout(source_box)
+        source_box = self._source_box = CollapsibleGroupBox("Ticker Source")
+        sh = QHBoxLayout(source_box.content())
         sh.setSpacing(16)
         self._universe_src_btn = QRadioButton("Universe")
         self._import_src_btn   = QRadioButton("Import List")
@@ -273,8 +274,8 @@ class StockScannerTab(QWidget):
         self._source_group.idToggled.connect(lambda *_: self._on_source_changed())
 
         # ── Parameters ────────────────────────────────────────────────────────
-        params_box = QGroupBox("Parameters")
-        pf = QFormLayout(params_box)
+        params_box = self._params_box = CollapsibleGroupBox("Parameters")
+        pf = QFormLayout(params_box.content())
         pf.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         price_row = QWidget()
@@ -287,8 +288,11 @@ class StockScannerTab(QWidget):
         ph.addWidget(self._price_max)
         pf.addRow("Price range ($):", price_row)
 
-        self._rsi_threshold    = QLineEdit("40.0")
-        self._bb_pct_threshold = QLineEdit("33.0")
+        # A wider net than the old 40 / 33: these now pick which symbols get an
+        # option chain fetched at all, and the Options Scanner's Strike BB%
+        # makes the real call on where the strike sits.
+        self._rsi_threshold    = QLineEdit("45.0")
+        self._bb_pct_threshold = QLineEdit("60.0")
         self._rsi_period       = QLineEdit("14")
         self._bb_period        = QLineEdit("20")
         pf.addRow("RSI threshold (<):", self._rsi_threshold)
@@ -328,8 +332,8 @@ class StockScannerTab(QWidget):
         root.addLayout(btn_row)
 
         # ── Progress ──────────────────────────────────────────────────────────
-        prog_box = QGroupBox("Progress")
-        pl = QFormLayout(prog_box)
+        prog_box = self._prog_box = CollapsibleGroupBox("Progress")
+        pl = QFormLayout(prog_box.content())
         self._price_bar   = QProgressBar()
         self._price_plabel = QLabel("—")
         self._tech_bar    = QProgressBar()
@@ -344,13 +348,17 @@ class StockScannerTab(QWidget):
 
         # ── Splitter: log + two result tables ───────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter = splitter
 
-        log_box = QGroupBox("Log")
-        ll = QVBoxLayout(log_box)
+        self._log_box = CollapsibleGroupBox("Log")
+        ll = QVBoxLayout(self._log_box.content())
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         ll.addWidget(self._log)
-        splitter.addWidget(log_box)
+        splitter.addWidget(self._log_box)
+        # A splitter keeps a pane's size even when its contents are hidden, so
+        # collapsing the log has to hand the space over explicitly.
+        self._log_box.expanded_changed.connect(self._resize_for_log)
 
         results_split = QSplitter(Qt.Orientation.Horizontal)
 
@@ -379,6 +387,18 @@ class StockScannerTab(QWidget):
         self._on_source_changed()
 
     # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _resize_for_log(self, expanded: bool):
+        """Give the result tables the log's space when the log is collapsed."""
+        sizes = self._splitter.sizes()
+        total = sum(sizes) or self._splitter.height()
+        if not total:
+            return
+        if expanded:
+            self._splitter.setSizes([total // 3, total - total // 3])
+        else:
+            header = self._log_box.sizeHint().height()
+            self._splitter.setSizes([header, max(total - header, 0)])
 
     def _source_mode(self) -> int:
         return self._source_group.checkedId()

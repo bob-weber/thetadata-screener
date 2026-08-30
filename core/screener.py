@@ -136,14 +136,36 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def _wilder_smooth(values: pd.Series, period: int) -> pd.Series:
+    """Wilder's smoothed average: SMA of the first `period` values, then recursive.
+
+    Seeding matters more than it looks. ``ewm(alpha=1/period, adjust=False)`` seeds
+    the average with the *single* first value, which still carries ``(1-1/period)**n``
+    of the weight n bars later — ~10% at bar 33 for a 14-period average. On the short
+    history Pass 2 used to fetch that moved RSI by several points and pushed symbols
+    across the screen's threshold; Wilder's own SMA seed converges far faster.
+    """
+    dense = values.dropna()
+    if len(dense) < period:
+        return pd.Series(np.nan, index=values.index)
+    arr = dense.to_numpy(dtype=float)
+    out = np.full(len(arr), np.nan)
+    avg = arr[:period].mean()
+    out[period - 1] = avg
+    for i in range(period, len(arr)):
+        avg = (avg * (period - 1) + arr[i]) / period
+        out[i] = avg
+    return pd.Series(out, index=dense.index).reindex(values.index)
+
+
 def calc_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
     """Wilder's RSI as a full series (NaN until `period` bars have accumulated)."""
     delta    = closes.diff()
-    gain     = delta.clip(lower=0)
-    loss     = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    avg_gain = _wilder_smooth(delta.clip(lower=0),    period)
+    avg_loss = _wilder_smooth((-delta).clip(lower=0), period)
+    # avg_loss == 0 with gains present divides to +inf, which lands on RSI 100 —
+    # correct by definition. A dead-flat window leaves both at 0 and RSI undefined.
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
@@ -159,13 +181,35 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> float:
     return float(calc_rsi_series(closes.dropna(), period).iloc[-1])
 
 
-def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> float:
-    _, upper, lower = calc_bb_bands(closes, period, std_mult)
-    price = closes.iloc[-1]
-    u, l  = upper.iloc[-1], lower.iloc[-1]
-    if (u - l) == 0:
+def bb_pct_at(value: float, upper: float, lower: float) -> float:
+    """Where ``value`` sits in a Bollinger band: 0% = lower band, 100% = upper.
+
+    Applied to the last close it's the stock's BB%. Applied to a strike it says
+    where that strike sits on the same band — which is what the options pass
+    tests, since a short put is assigned at the strike, not at today's price.
+    Below 0 means the point is under the lower band: a breakdown for a price,
+    but cushion for a strike.
+    """
+    if (upper - lower) == 0:
         return 50.0
-    return float((price - l) / (u - l) * 100)
+    return float((value - lower) / (upper - lower) * 100)
+
+
+def calc_bb_edges(closes: pd.Series, period: int = 20,
+                  std_mult: float = 2.0) -> tuple[float, float] | None:
+    """Latest (upper, lower) Bollinger band values, or None if not computable."""
+    _, upper, lower = calc_bb_bands(closes, period, std_mult)
+    u, l = upper.iloc[-1], lower.iloc[-1]
+    if pd.isna(u) or pd.isna(l):
+        return None
+    return float(u), float(l)
+
+
+def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> float:
+    edges = calc_bb_edges(closes, period, std_mult)
+    if edges is None:
+        return 50.0
+    return bb_pct_at(float(closes.iloc[-1]), *edges)
 
 
 def calc_hv(closes: pd.Series, period: int = 20) -> float | None:
@@ -512,9 +556,22 @@ def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None
 # re-adjustments. Keyed per symbol, so it survives price-range/threshold changes.
 HISTORY_STORE_FILE = "history_store_cache.json"
 
+# Calendar days of daily history fetched for Pass 2 (~124 trading bars). The
+# indicators need very different amounts: BB% and HV are windowed, so 20 bars fully
+# determine them, but Wilder's RSI is recursive and only converges after several
+# multiples of its period. At the 45 days this used to fetch (~33 bars) RSI read
+# high by a median of 2 points across the universe and roughly 12% of symbols fell
+# on the wrong side of the threshold. This costs no extra API calls — the same
+# one-per-symbol request just returns more candles.
+HISTORY_DAYS = 180
+
 
 def _load_history_store(path: str | Path = HISTORY_STORE_FILE) -> dict:
-    """Load the per-symbol close store as {symbol: {"last": iso_date, "closes": [...]}}."""
+    """Load the store as {symbol: {"last": iso_date, "days": int, "closes": [...]}}.
+
+    ``days`` records the lookback the entry was fetched with, so widening
+    :data:`HISTORY_DAYS` re-fetches short entries instead of reusing them.
+    """
     p = Path(path)
     if not p.exists():
         return {}
@@ -788,8 +845,8 @@ def _full_key(config: dict) -> dict:
         **_price_key(config),
         "rsi_period":       config.get("rsi_period",       14),
         "bb_period":        config.get("bb_period",        20),
-        "rsi_threshold":    config.get("rsi_threshold",    40.0),
-        "bb_pct_threshold": config.get("bb_pct_threshold", 33.0),
+        "rsi_threshold":    config.get("rsi_threshold",    45.0),
+        "bb_pct_threshold": config.get("bb_pct_threshold", 60.0),
     }
 
 
@@ -939,11 +996,24 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         if apply_filters or live is None:
             return None
         return {"symbol": sym, "price": round(live, 2), "rsi": None,
-                "bb_pct": None, "hv": None, "passes": False}
+                "bb_pct": None, "bb_upper": None, "bb_lower": None,
+                "hv": None, "passes": False}
     rsi = calc_rsi(closes, rsi_period)
+    # A dead-flat window leaves RSI undefined. NaN compares False against every
+    # threshold, so without this it would neither reject nor set `passes` — and a
+    # universe scan would carry a blank-RSI row that its callers assume passed.
+    if not np.isfinite(rsi):
+        if apply_filters or live is None:
+            return None
+        return {"symbol": sym, "price": round(live, 2), "rsi": None,
+                "bb_pct": None, "bb_upper": None, "bb_lower": None,
+                "hv": None, "passes": False}
     if apply_filters and rsi >= rsi_threshold:
         return None
-    bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
+    # The band edges travel with the row, not just the price's position on it:
+    # the options pass re-reads them to place each strike on the same band.
+    edges  = calc_bb_edges(closes, bb_period, bb_std_mult)
+    bb_pct = (bb_pct_at(float(closes.iloc[-1]), *edges) if edges else 50.0)
     if apply_filters and bb_pct >= bb_pct_threshold:
         return None
     hv = calc_hv(closes)
@@ -952,6 +1022,8 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         "price":  round(live if live is not None else float(closes.iloc[-1]), 2),
         "rsi":    round(rsi, 1),
         "bb_pct": round(bb_pct, 1),
+        "bb_upper": round(edges[0], 2) if edges else None,
+        "bb_lower": round(edges[1], 2) if edges else None,
         "hv":     round(hv, 1) if hv is not None else None,
         "passes": bool(rsi < rsi_threshold and bb_pct < bb_pct_threshold),
     }
@@ -968,7 +1040,7 @@ def run_technical_filter(
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
     use_cache: bool = True,
 ) -> list[dict]:
-    """Pass 2 — get 45-day history for the price-qualified list and apply RSI/BB%.
+    """Pass 2 — get daily history for the price-qualified list and apply RSI/BB%.
 
     Writes ``tech_candidates_cache.json`` and returns
     ``[{"symbol", "price", "rsi", "bb_pct"}, …]``. Takes the price-screened list
@@ -978,9 +1050,10 @@ def run_technical_filter(
 
     Daily history is served from a persistent per-symbol store
     (:data:`HISTORY_STORE_FILE`): symbols already current through the last
-    completed session are reused with no fetch; the rest are fetched in full and
-    the store is updated. ``use_cache=False`` forces a full refetch of every
-    symbol (still updating the store).
+    completed session *and* stored with at least :data:`HISTORY_DAYS` of lookback
+    are reused with no fetch; the rest are fetched in full and the store is
+    updated. ``use_cache=False`` forces a full refetch of every symbol (still
+    updating the store).
 
     On a my-stocks scan (``config["symbols"]``) the indicators are computed and
     reported for every symbol rather than used to reject any.
@@ -988,11 +1061,11 @@ def run_technical_filter(
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
     bb_std_mult      = config.get("bb_std_mult",       2.0)
-    rsi_threshold    = config.get("rsi_threshold",    40.0)
-    bb_pct_threshold = config.get("bb_pct_threshold", 33.0)
+    rsi_threshold    = config.get("rsi_threshold",    45.0)
+    bb_pct_threshold = config.get("bb_pct_threshold", 60.0)
 
     today      = date.today()
-    hist_start = today - timedelta(days=45)
+    hist_start = today - timedelta(days=HISTORY_DAYS)
 
     full_key  = _full_key(config)
 
@@ -1030,7 +1103,10 @@ def run_technical_filter(
     stale: list[str]       = []
     for sym in symbols:
         entry = store.get(sym)
-        if use_cache and entry and entry.get("last") == last_session_str and entry.get("closes"):
+        # A shorter lookback than we now want is as stale as an out-of-date one:
+        # the closes are current but there aren't enough of them for RSI to settle.
+        if (use_cache and entry and entry.get("last") == last_session_str
+                and entry.get("closes") and entry.get("days", 0) >= HISTORY_DAYS):
             fresh[sym] = entry["closes"]
         else:
             stale.append(sym)
@@ -1116,7 +1192,8 @@ def run_technical_filter(
         if len(closes) >= bb_period + 1:
             histories[sym] = closes
             if last_date:
-                store[sym] = {"last": last_date, "closes": closes}
+                store[sym] = {"last": last_date, "days": HISTORY_DAYS,
+                              "closes": closes}
     _save_history_store(store, store_path)
 
     if on_log:
@@ -1205,6 +1282,24 @@ def run_options_filter(
     side             = config.get("side",             "sell") # "sell" or "buy"
     weeklies_only    = config.get("weeklies_only",    False)
     price_col        = "bid" if side == "sell" else "ask"
+
+    # Strike-level Bollinger test. The stock scan's BB% gate picks which symbols
+    # get a chain fetched at all; this decides which *strikes* on that chain are
+    # worth selling, which is the position you actually take on. The comparison
+    # flips with the right: a put wants its strike low on the band (under the
+    # lower band is cushion, not a breakdown), a call wants it high.
+    strike_bb_filter = config.get("strike_bb_filter", False)
+    strike_bb_pct    = config.get("strike_bb_pct",    33.0)
+    bandless_syms    = []
+
+    # Minimum open interest. On a cheap underlying the premium % rule stops
+    # being monotonic once the bid hits the $0.01 tick: premium ÷ strike climbs
+    # again as the strike shrinks, so a 2¢ bid on a $3 strike reads as 0.67% and
+    # clears a 0.6% floor that the $9 strike (also 2¢) misses. Those strikes have
+    # no market behind them — RUN's $3 put quoted 0.02/0.09 with zero OI — and
+    # open interest is what separates them from a real quote. A missing OI counts
+    # as zero: unknown depth is exactly the case this is here to catch.
+    oi_min = config.get("oi_min", 1)
 
     today = date.today()
 
@@ -1344,8 +1439,14 @@ def run_options_filter(
         else:
             expirations = [e for e in available if dte_min <= (e - today).days <= dte_max]
 
-        # Realized vol of the underlying, from the stock scan's own closes.
+        # Realized vol and Bollinger edges of the underlying, from the stock
+        # scan's own closes. A cache written before the edges were carried
+        # through has neither, so every strike keeps a blank BB% and the filter
+        # stands down for that symbol rather than silently rejecting it.
         sym_hv = row.get("hv")
+        bb_u, bb_l = row.get("bb_upper"), row.get("bb_lower")
+        if bb_u is None or bb_l is None:
+            bandless_syms.append(sym)
         sym_iv_recorded = False
         for exp in expirations:
             full_chain = chains[exp]
@@ -1383,14 +1484,41 @@ def run_options_filter(
             in_range = chain[
                 (chain["premium_pct"] >= premium_pct_min) &
                 (chain["premium_pct"] <= premium_pct_max)
-            ]
+            ].copy()
+
+            # Where each strike sits on the underlying's Bollinger band.
+            if bb_u is not None and bb_l is not None:
+                in_range["strike_bb_pct"] = [
+                    None if pd.isna(s) else round(bb_pct_at(float(s), bb_u, bb_l), 1)
+                    for s in in_range["strike"]
+                ]
+            else:
+                in_range["strike_bb_pct"] = None
+
+            n_premium = len(in_range)
+            bb_note   = ""
+            if strike_bb_filter and bb_u is not None and bb_l is not None:
+                vals = pd.to_numeric(in_range["strike_bb_pct"], errors="coerce")
+                keep = (vals <= strike_bb_pct if right == "P"
+                        else vals >= strike_bb_pct)
+                in_range = in_range[keep.fillna(False)]
+                op      = "≤" if right == "P" else "≥"
+                bb_note = (f", {len(in_range)} with strike BB% "
+                           f"{op} {strike_bb_pct:.0f}")
+
+            oi_note = ""
+            if oi_min > 0:
+                oi = pd.to_numeric(in_range.get("open_interest"), errors="coerce")
+                in_range = in_range[oi.fillna(0) >= oi_min]
+                oi_note  = f", {len(in_range)} with OI ≥ {oi_min}"
             if on_log:
                 on_log(
                     f"  {sym}: {len(chain)} strikes, "
-                    f"{len(in_range)} in premium range "
+                    f"{n_premium} in premium range "
                     f"({premium_pct_min*100:.1f}%–{premium_pct_max*100:.1f}%)"
+                    f"{bb_note}{oi_note}"
                 )
-            chain = in_range.copy()
+            chain = in_range
             if chain.empty:
                 continue
 
@@ -1415,6 +1543,12 @@ def run_options_filter(
                 cushion_sigma = (round(otm_pct / sigma_pct, 2)
                                  if sigma_pct and otm_pct is not None else None)
 
+                # Back to a plain float: the column is numpy-typed, and the
+                # results are written to the cache as JSON.
+                strike_bb = opt.get("strike_bb_pct")
+                strike_bb = (None if strike_bb is None or pd.isna(strike_bb)
+                             else round(float(strike_bb), 1))
+
                 results.append({
                     "symbol":     sym,
                     "expiration": exp.strftime("%Y-%m-%d"),
@@ -1436,6 +1570,10 @@ def run_options_filter(
                     # LSO grade can both see where the underlying sits.
                     "rsi":           row.get("rsi"),
                     "bb_pct":        row.get("bb_pct"),
+                    # Where the strike sits on the same band the stock's BB% is
+                    # read from — a separate field, since the two read in
+                    # opposite directions and the LSO grade scores the stock's.
+                    "strike_bb_pct": strike_bb,
                     # What it costs to get back out. A position is only as
                     # rollable as its market is tight — on a deep-ITM strike the
                     # spread routinely exceeds the whole extrinsic value, so the
@@ -1444,6 +1582,13 @@ def run_options_filter(
                     "open_interest": (int(opt["open_interest"])
                                       if opt.get("open_interest") is not None else None),
                 })
+
+    if on_log and bandless_syms:
+        on_log(f"  No Bollinger edges for {len(bandless_syms)} symbol(s) — "
+               f"{', '.join(sorted(set(bandless_syms)))}. Their strike BB% is "
+               "blank" + (" and the strike BB% filter was not applied to them"
+                          if strike_bb_filter else "") +
+               "; re-run the Stock Scanner to refresh the candidates cache.")
 
     # Say it out loud. A missing IV blanks three columns and stands the primary
     # risk gate down, so it shouldn't be something you notice by spotting a gap.

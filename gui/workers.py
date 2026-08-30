@@ -119,6 +119,9 @@ class OptionsWorker(QThread):
             "side":            c.get("side", "sell"),
             "premium_pct_min": c.get("premium_pct_min"),
             "premium_pct_max": c.get("premium_pct_max"),
+            "strike_bb_filter": c.get("strike_bb_filter", False),
+            "strike_bb_pct":    c.get("strike_bb_pct"),
+            "oi_min":           c.get("oi_min", 0),
         }
         return key
 
