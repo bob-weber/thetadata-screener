@@ -2,14 +2,22 @@
   "AA": [
     "commodity-industrial"
   ],
+  "AAL": [
+    "travel-leisure"
+  ],
   "AAOI": [
-    "ai-sentiment-spillover",
-    "rate-sensitive-growth"
+    "ai-capex-optical"
   ],
   "AAPL": [
     "mega-cap-bellwether"
   ],
+  "ABVX": [
+    "biotech-binary"
+  ],
   "ACI": [],
+  "ACMR": [
+    "ai-capex-chips"
+  ],
   "ADI": [
     "ai-capex-chips"
   ],
@@ -29,11 +37,21 @@
   "AKAM": [
     "ai-sentiment-spillover"
   ],
+  "ALAB": [
+    "ai-capex-chips",
+    "ai-sentiment-spillover"
+  ],
   "ALB": [
     "commodity-industrial"
   ],
   "ALGN": [],
+  "AMBA": [
+    "ai-capex-chips"
+  ],
   "AMD": [
+    "ai-capex-chips"
+  ],
+  "AMKR": [
     "ai-capex-chips"
   ],
   "AMPX": [
@@ -60,15 +78,27 @@
   "ASTS": [
     "rate-sensitive-growth"
   ],
+  "AVAV": [
+    "defense-aerospace"
+  ],
   "AVGO": [
     "ai-capex-chips"
+  ],
+  "AXP": [
+    "rate-sensitive-financials"
   ],
   "AXTI": [
     "ai-sentiment-spillover",
     "rate-sensitive-growth"
   ],
+  "BA": [
+    "defense-aerospace"
+  ],
   "BABA": [
     "china-adr"
+  ],
+  "BAC": [
+    "rate-sensitive-financials"
   ],
   "BE": [
     "ai-sentiment-spillover",
@@ -80,14 +110,23 @@
   "BIDU": [
     "china-adr"
   ],
+  "BILI": [
+    "china-adr"
+  ],
   "BLSH": [
     "crypto-linked"
   ],
   "BP": [
     "commodity-supply-shock"
   ],
+  "BROS": [
+    "rate-sensitive-growth"
+  ],
   "BTU": [
     "commodity-industrial"
+  ],
+  "BURL": [
+    "tariff-import-consumer"
   ],
   "CART": [],
   "CBRS": [
@@ -99,6 +138,9 @@
   "CCJ": [
     "ai-capex-power",
     "commodity-supply-shock"
+  ],
+  "CCL": [
+    "travel-leisure"
   ],
   "CDE": [
     "precious-metals"
@@ -115,12 +157,21 @@
   "CIEN": [
     "ai-sentiment-spillover"
   ],
+  "CIFR": [
+    "crypto-linked"
+  ],
+  "CLS": [
+    "ai-capex-chips"
+  ],
   "CLSK": [
     "crypto-linked"
   ],
   "CNC": [],
   "CNQ": [
     "commodity-supply-shock"
+  ],
+  "COHR": [
+    "ai-capex-optical"
   ],
   "COIN": [
     "crypto-linked"
@@ -134,6 +185,9 @@
   "CRCL": [
     "crypto-linked"
   ],
+  "CRDO": [
+    "ai-capex-optical"
+  ],
   "CRH": [],
   "CRM": [
     "ai-sentiment-spillover"
@@ -144,11 +198,17 @@
   "CRWV": [
     "ai-capex-cloud-pureplay"
   ],
+  "CSIQ": [
+    "solar-policy"
+  ],
   "CVNA": [
     "rate-sensitive-growth"
   ],
   "CVX": [
     "commodity-supply-shock"
+  ],
+  "DAL": [
+    "travel-leisure"
   ],
   "DAVE": [
     "rate-sensitive-growth"
@@ -161,6 +221,9 @@
   ],
   "DKNG": [
     "rate-sensitive-growth"
+  ],
+  "DKS": [
+    "tariff-import-consumer"
   ],
   "DOCN": [
     "ai-sentiment-spillover"
@@ -185,13 +248,28 @@
   ],
   "FDX": [],
   "FIG": [],
+  "FIS": [
+    "rate-sensitive-financials"
+  ],
   "FLY": [
     "rate-sensitive-growth"
+  ],
+  "FSLR": [
+    "solar-policy"
+  ],
+  "FTAI": [
+    "defense-aerospace"
   ],
   "GAP": [
     "tariff-import-consumer"
   ],
   "GDDY": [],
+  "GE": [
+    "defense-aerospace"
+  ],
+  "GLW": [
+    "ai-capex-optical"
+  ],
   "GLXY": [
     "crypto-linked"
   ],
@@ -225,11 +303,17 @@
   "HUT": [
     "crypto-linked"
   ],
+  "HWM": [
+    "defense-aerospace"
+  ],
   "IBM": [
     "ai-sentiment-spillover"
   ],
   "ICE": [
     "rate-sensitive-financials"
+  ],
+  "INOD": [
+    "ai-sentiment-spillover"
   ],
   "INTC": [
     "ai-capex-chips"
@@ -243,6 +327,9 @@
     "crypto-linked"
   ],
   "ISRG": [],
+  "JBL": [
+    "ai-capex-chips"
+  ],
   "JD": [
     "china-adr"
   ],
@@ -251,6 +338,9 @@
   ],
   "KLAC": [
     "ai-capex-chips"
+  ],
+  "KSS": [
+    "tariff-import-consumer"
   ],
   "KTOS": [
     "defense-aerospace"
@@ -267,6 +357,9 @@
   "LMND": [
     "rate-sensitive-growth"
   ],
+  "LQDA": [
+    "biotech-binary"
+  ],
   "LRCX": [
     "ai-capex-chips"
   ],
@@ -279,7 +372,14 @@
   "LUV": [
     "travel-leisure"
   ],
+  "LVS": [
+    "china-adr",
+    "travel-leisure"
+  ],
   "LYV": [],
+  "M": [
+    "tariff-import-consumer"
+  ],
   "MARA": [
     "crypto-linked"
   ],
@@ -315,6 +415,9 @@
   "NCLH": [
     "travel-leisure"
   ],
+  "NEE": [
+    "ai-capex-power"
+  ],
   "NEM": [
     "precious-metals"
   ],
@@ -339,6 +442,9 @@
     "ai-capex-chips",
     "mega-cap-bellwether"
   ],
+  "NVO": [
+    "biotech-binary"
+  ],
   "NVTS": [
     "ai-capex-chips",
     "rate-sensitive-growth"
@@ -351,14 +457,24 @@
   "ON": [
     "ai-capex-chips"
   ],
+  "ONON": [
+    "rate-sensitive-growth",
+    "tariff-import-consumer"
+  ],
   "ORCL": [
     "ai-capex-software"
+  ],
+  "OUST": [
+    "rate-sensitive-growth"
   ],
   "OXY": [
     "commodity-supply-shock"
   ],
   "PAAS": [
     "precious-metals"
+  ],
+  "PCG": [
+    "ai-capex-power"
   ],
   "PDD": [
     "china-adr"
@@ -372,7 +488,13 @@
     "ai-sentiment-spillover",
     "rate-sensitive-growth"
   ],
+  "PNC": [
+    "rate-sensitive-financials"
+  ],
   "PPG": [],
+  "PYPL": [
+    "rate-sensitive-financials"
+  ],
   "QBTS": [
     "ai-sentiment-spillover",
     "rate-sensitive-growth"
@@ -388,6 +510,9 @@
     "rate-sensitive-growth"
   ],
   "RBRK": [],
+  "RCL": [
+    "travel-leisure"
+  ],
   "RDDT": [
     "ai-sentiment-spillover",
     "rate-sensitive-growth"
@@ -411,6 +536,9 @@
   ],
   "RKT": [
     "rate-sensitive-growth"
+  ],
+  "ROST": [
+    "tariff-import-consumer"
   ],
   "RUN": [
     "rate-sensitive-growth",
@@ -450,6 +578,9 @@
   "SNPS": [
     "ai-capex-software"
   ],
+  "SO": [
+    "ai-capex-power"
+  ],
   "SOFI": [
     "rate-sensitive-growth"
   ],
@@ -479,10 +610,19 @@
   "TEM": [
     "biotech-binary"
   ],
+  "TER": [
+    "ai-capex-chips"
+  ],
+  "TJX": [
+    "tariff-import-consumer"
+  ],
   "TLN": [
     "ai-capex-power"
   ],
   "TMUS": [],
+  "TSEM": [
+    "ai-capex-chips"
+  ],
   "TSLA": [
     "ai-sentiment-spillover",
     "rate-sensitive-growth"
@@ -526,9 +666,15 @@
   "VRT": [
     "ai-capex-power"
   ],
+  "VST": [
+    "ai-capex-power"
+  ],
   "VZ": [],
   "WBD": [
     "merger-arb"
+  ],
+  "WFC": [
+    "rate-sensitive-financials"
   ],
   "WOLF": [
     "rate-sensitive-growth"
@@ -536,8 +682,15 @@
   "WPM": [
     "precious-metals"
   ],
+  "WRBY": [
+    "tariff-import-consumer"
+  ],
   "WULF": [
     "crypto-linked"
+  ],
+  "WYNN": [
+    "china-adr",
+    "travel-leisure"
   ],
   "XOM": [
     "commodity-supply-shock"
