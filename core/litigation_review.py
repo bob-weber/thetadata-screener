@@ -26,7 +26,7 @@ from pathlib import Path
 import requests
 
 from core.lso_analyzer import (LITIGATION_FILE, _LITIGATION_REVIEW_DAYS,
-                               _litigation_state, load_litigation)
+                               _litigation_state, _money_value, load_litigation)
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 CIK_CACHE_FILE  = "edgar_cik_cache.json"     # matches *_cache.json in .gitignore
@@ -46,22 +46,219 @@ _CAPTION_RE   = re.compile(
 _NAMED_HEADING_RE = re.compile(
     r"Securities Litigation|Shareholder Derivative|Antitrust (Litigation|Matters)"
     r"|Government Investigation|Patent Litigation|Opioid|Talc", re.I)
+# "putative class action" on its own says nothing about the claim: LUV's is a
+# wage-and-hour case, and pairing that with the credibility overlay hard-gated
+# the symbol to grade F. Only a securities-flavoured class action belongs here.
 _SECURITIES_RE = re.compile(
-    r"10\(b\)|10b-5|putative class action|securities class action", re.I)
+    r"10\(b\)|10b-5|securities class action"
+    r"|putative (securities )?class action(?=[^.]{0,200}?"
+    r"(securities|Exchange Act|shareholder|stockholder|investor))"
+    r"|(securities|Exchange Act|shareholder|stockholder|investor)"
+    r"[^.]{0,200}?putative class action", re.I)
 _DERIVATIVE_RE = re.compile(r"derivative (complaint|action|suit)", re.I)
-# The credibility overlay. Searched only inside the legal-proceedings section:
-# "restatement" and "material weakness" appear as risk-factor and auditor
+# The credibility overlay: is the *accounting* under question, or merely the
+# conduct? Only the first is the short-attack pattern, where the risk is that
+# every other input on the page is wrong too. Searched inside the legal corpus
+# only — "restatement" and "material weakness" are risk-factor and auditor
 # boilerplate in almost every filing, so a whole-document search is meaningless.
-_CREDIBILITY_RE = re.compile(
-    r"subpoena|civil investigative demand|formal order of investigation"
-    r"|wells notice|restatement of (our|the) (previously issued )?financial"
-    r"|identified a material weakness", re.I)
+#
+# Two tiers, because the words do not separate cleanly on their own. A
+# restatement says the books were wrong; a subpoena says somebody wants
+# documents, and every kind of litigation produces those. PayPal graded F on
+# "Civil Investigative Demand" alone — an FTC question about merchant
+# onboarding, in a filing with no restatement, no material weakness and no SEC
+# or DOJ matter anywhere in it.
+
+# Tier 1 — the books themselves. Each is either an SEC enforcement term of art
+# or a direct statement that the financials cannot be relied on. No corroboration
+# needed: nobody writes these about an ordinary commercial dispute.
+_ACCOUNTING_RE = re.compile(
+    r"restatement of (our|the) (previously issued )?financial"
+    r"|restated? (our|the) (previously issued )?(consolidated )?financial"
+    r"|non-?reliance on (our|the|previously|its)"
+    r"|identified a material weakness"
+    r"|material weakness(es)? in (our|the) internal control"
+    r"|wells notice|formal order of (private )?investigation"
+    r"|accounting irregularit|audit committee('s)? (internal )?investigation"
+    r"|(resignation|dismissal) of (our|the) (independent )?"
+    r"(registered public )?account", re.I)
+
+# Tier 2 — an investigative demand, which is a credibility signal only when a
+# disclosure regulator is asking *about the numbers*. The authority alone is not
+# enough: the SEC and the DOJ investigate a great deal that has nothing to do
+# with the books, and on a ten-filing sample every single demand-based hit was
+# one of those — FCPA exposure (BSX), routine healthcare investigations (CVS), a
+# False Claims Act cybersecurity case (LUNR), the HB6 bribery scandal (VST),
+# anti-money-laundering in money transfer (WMT). Real, none of them a reason to
+# distrust the financial statements. So the subject matter has to be named too.
+# Uppercase-only for the abbreviations: a case-insensitive \bSEC\b also matches
+# "Sec. 10(b)".
+_DEMAND_RE = re.compile(
+    r"subpoena|civil investigative demand|formal investigation"
+    r"|investigative demand", re.I)
+_ACCOUNTING_AUTHORITY_RE = re.compile(
+    r"Securities and Exchange Commission|(?-i:\bSEC\b)|Department of Justice"
+    r"|(?-i:\bDOJ\b)|U\.?S\.? Attorney|grand jury"
+    r"|Public Company Accounting Oversight|(?-i:\bPCAOB\b)", re.I)
+# What the demand has to be about. Deliberately not bare "financial statements":
+# "NOTES TO CONDENSED CONSOLIDATED FINANCIAL STATEMENTS" is a page header that
+# lands in the corpus at every page break, so it would match almost anywhere.
+_ACCOUNTING_SUBJECT_RE = re.compile(
+    r"revenue recognition|financial reporting|internal control|disclosure control"
+    r"|accounting (practice|treatment|polic|irregular|error|method)"
+    r"|restat|material (misstatement|weakness)|non-?GAAP|audit committee"
+    r"|improperly (recognized|recorded|accounted|stated)"
+    r"|books and records provision|earnings (misstat|manipulat)", re.I)
+
+# Conduct and competition regulators. A demand from one of these is about how the
+# business behaves, not about whether its numbers are real.
+_CONDUCT_AUTHORITY_RE = re.compile(
+    r"Federal Trade Commission|(?-i:\bFTC\b)"
+    r"|Consumer Financial Protection|(?-i:\bCFPB\b)"
+    r"|Federal Cartel Office|(?-i:\bFCO\b)"
+    r"|Financial Conduct Authority|(?-i:\bFCA\b)"
+    r"|Attorneys? General|(?-i:\bAGs?\b)"
+    r"|Competition (and Markets )?Authority|(?-i:\bCMA\b)"
+    r"|European Commission|Environmental Protection|(?-i:\bEPA\b)"
+    r"|Food and Drug|(?-i:\bFDA\b)|Occupational Safety"
+    r"|Equal Employment|Department of Labor|state regulators?", re.I)
+
+
+def _credibility_evidence(section: str, window: int = 400) -> str | None:
+    """The accounting-integrity signal in ``section``, or None for conduct only.
+
+    A tier-1 phrase stands alone. A demand has to clear three tests: a disclosure
+    regulator is named, the *nearest* named authority is that one rather than a
+    conduct regulator (filers group their regulatory matters into one paragraph,
+    so an SEC mention three matters away must not launder an FTC demand), and the
+    accounting is what is being asked about. All three, because any two of them
+    are satisfied by an ordinary FCPA or False Claims Act matter.
+    """
+    m = _ACCOUNTING_RE.search(section)
+    if m:
+        return " ".join(m.group(0).split()).lower()
+
+    for m in _DEMAND_RE.finditer(section):
+        lo = max(0, m.start() - window)
+        near = section[lo:m.end() + window]
+        here = m.start() - lo
+        acct = min((abs(a.start() - here) for a in
+                    _ACCOUNTING_AUTHORITY_RE.finditer(near)), default=None)
+        if acct is None:
+            continue
+        cond = min((abs(c.start() - here) for c in
+                    _CONDUCT_AUTHORITY_RE.finditer(near)), default=None)
+        if cond is not None and cond <= acct:
+            continue
+        subject = _ACCOUNTING_SUBJECT_RE.search(near)
+        if not subject:
+            continue
+        return (f"{' '.join(m.group(0).split()).lower()} from a disclosure "
+                f"regulator, re: {' '.join(subject.group(0).split()).lower()}")
+    return None
 _UNBOUNDED_RE = re.compile(
     r"cannot (reasonably )?(be )?estimate|unable to estimate", re.I)
 _ORDINARY_RE  = re.compile(r"ordinary course", re.I)
+# A government matter that carries no case caption. "Ordinary course" is not a
+# clean bill of health when one of these is also on the page: nearly every Item 1
+# opens with "in the ordinary course of business, we are involved in various
+# pending and threatened litigation matters", so the phrase alone cleared LUNR
+# while a DOJ False Claims Act investigative demand sat 30k characters below it —
+# a real matter, and one no caption test can see, since the government does not
+# sue under a caption the filer prints.
+_GOVT_MATTER_RE = re.compile(
+    r"civil investigative demand|qui tam|False Claims Act"
+    r"|formal investigation|grand jury|Wells notice|subpoena"
+    r"|deferred prosecution|consent decree"
+    r"|(investigation|inquiry) by the (SEC|DOJ|FTC|CFPB|Department|Securities)",
+    re.I)
 
 # A section this short carries no named matter — it is the boilerplate sentence.
 _BOILERPLATE_CHARS = 700
+
+# Structural and hypothetical uses of the same words. The charter's exclusive-
+# forum clause names "any derivative action" without one existing; a cash-flow
+# hedge note is full of "derivative counterparties"; Risk Factors warns about
+# suits that have not been filed.
+_HYPOTHETICAL_RE = re.compile(
+    r"may\s+(be|become)\s+(the\s+)?(target|subject)"
+    r"|have\s+been\s+subject\s+to\s+securities"
+    r"|exclusive\s+forum|forum\s+for\s+.{0,40}derivative"
+    r"|derivative\s+counterpart", re.I)
+
+
+def _hit_in_live_context(rx, section: str, window: int = 500) -> bool:
+    """True if ``rx`` matches somewhere that isn't hypothetical boilerplate."""
+    return any(not _HYPOTHETICAL_RE.search(
+                   section[max(0, m.start() - window):m.end() + window])
+               for m in rx.finditer(section))
+
+
+_MONEY = r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:million|billion)?"
+
+# The amount has to be grammatically attached to the liability, not merely near
+# it. A window-based match reads Apple's balance sheet as a legal accrual: a
+# financial table puts "Accrued compensation" a few characters from a dozen
+# figures, and "accrued" is also how every filer labels payroll. These patterns
+# only fire on prose a filer writes about a case.
+_EXPOSURE_RES = [re.compile(pat, re.I) for pat in (
+    # "we accrued $150 million", "recorded a charge of $2 million"
+    r"(?:accrued|accrual of|reserved|reserve of"
+    r"|recorded\s+(?:a\s+)?(?:charge|liability|reserve|provision)\s+of)"
+    r"\s+(?:approximately\s+|an\s+aggregate\s+of\s+)?" + _MONEY,
+    # "judgment of $114 million", "reducing the damages amount to $114 million"
+    r"(?:judgment|verdict|damages|penalt\w+|fines?|award|settlement)"
+    r"\s+(?:amount\s+)?(?:of|to|totalling|totaling|in the amount of)"
+    r"\s+(?:approximately\s+)?" + _MONEY,
+    # "a $114 million judgment", "$25 million settlement"
+    _MONEY + r"\s+(?:judgment|verdict|settlement|penalty|fine|award)",
+    # "agreed to pay $30 million to settle"
+    r"(?:agreed\s+to\s+pay|paid)\s+(?:approximately\s+)?" + _MONEY +
+    r"\s+(?:to\s+settle|in\s+settlement|in\s+damages|in\s+penalties)",
+    # "the jury returned a verdict … with a lump sum amount of $152 million"
+    r"(?:jury|court|arbitrator)\s+[^.]{0,100}?"
+    r"(?:awarded|returned\s+a\s+verdict|entered\s+judgment)[^.]{0,80}?" + _MONEY,
+)]
+
+# Filers accrue for plenty that is not a legal matter, in the same words:
+# Teradyne's "product warranty accrual of $25.7 million" is not exposure.
+_NON_LEGAL_ACCRUAL_RE = re.compile(
+    r"warrant(y|ies)|vacation|payroll|compensation|bonus|restructuring"
+    r"|rebate|sales? return|deferred revenue|income tax|interest expense"
+    r"|dividend|lease|pension", re.I)
+# And an amount can run the other way: BYND's $11.0 million settlement was
+# "due and payable to us". A recovery is not an overhang.
+_INBOUND_RE = re.compile(
+    r"payable to us|to us within|we received|received \$|in our favou?r"
+    r"|receivable|recovery of|awarded to us|paid to us|in favou?r of the Company",
+    re.I)
+
+def quantified_exposure(section: str) -> str | None:
+    """The largest legal dollar figure stated in the note, or None.
+
+    A booked or entered amount is the filer's own quantification of a matter —
+    the one signal a case caption can never carry. PANW's three captions read
+    like a docket of resolved nuisance suits; one of them is a $114 million
+    judgment with $150 million accrued against it.
+    """
+    best, best_val = None, 0.0
+    for rx in _EXPOSURE_RES:
+        for m in rx.finditer(section):
+            if _HYPOTHETICAL_RE.search(m.group(0)):
+                continue
+            before = section[max(0, m.start() - 90):m.start() + 40]
+            if _NON_LEGAL_ACCRUAL_RE.search(before):
+                continue
+            around = section[max(0, m.start() - 150):m.end() + 200]
+            if _INBOUND_RE.search(around):
+                continue
+            money = re.search(_MONEY, m.group(0), re.I)
+            if not money:
+                continue
+            value = _money_value(money.group(0))
+            if value > best_val:
+                best, best_val = " ".join(money.group(0).split()), value
+    return best
 
 
 def _get(url: str, timeout: int = 60) -> requests.Response:
@@ -113,24 +310,52 @@ def _latest_filing(cik: int) -> tuple[str, str, str] | None:
     return best
 
 
+# A contents row lists several items in a row with their page numbers ("Item 1.
+# Legal Proceedings 43 Item 1A. Risk Factors 43 Item 2. …"). The *page numbers*
+# are the signature, not the item markers: counting bare "Item N" reads a real
+# one-line Item 1 as a contents row, because a short section is immediately
+# followed by the Item 1A / Item 2 / Item 3 headings that come after it. That
+# misfire emptied AAP's corpus entirely and cut CLS, TXN and M down to their
+# first sentence.
+_CONTENTS_ROW_RE = re.compile(r"\d+\s+Item\s+\d", re.I)
+
+
+def _is_contents_stub(section: str) -> bool:
+    return len(_CONTENTS_ROW_RE.findall(section[:600])) >= 2
+
+
 def extract_legal_section(txt: str, form: str) -> str:
     """The Legal Proceedings section, skipping the table-of-contents match.
 
     A 10-Q carries it at Part II Item 1, a 10-K at Item 3. Both names also occur
     in the contents listing near the top, so the *last* match that is followed by
     real prose is the section itself.
+
+    Taking the *longest* match did the opposite of what it looks like: the
+    contents row is the one with no end anchor near it, so it always ran the full
+    8k fallback (or down to the real Item 1A tens of thousands of characters
+    below) and always won. PANW's "legal section" was the contents page plus the
+    balance sheet; WRBY's was 46% of the whole 10-Q.
+
+    The end anchor accepts a bare ``RISK FACTORS`` heading as well as ``Item 1A``.
+    Filers that write the heading without the item number left the search with
+    nothing to stop at, so the 8k fallback ran on into the risk factors — which is
+    how CBRS's "legal section" ended up carrying a risk-factor bullet about
+    material weaknesses in internal control.
     """
     if form == "10-K":
         start_re, end_re = r"ITEM\s*3\.?\s*[—–-]?\s*LEGAL PROCEEDINGS", r"ITEM\s*4\.?"
     else:
-        start_re, end_re = r"ITEM\s*1\.?\s*[—–-]?\s*LEGAL PROCEEDINGS", r"ITEM\s*1A\.?"
+        start_re = r"ITEM\s*1\.?\s*[—–-]?\s*LEGAL PROCEEDINGS"
+        end_re   = r"ITEM\s*1A\.?|RISK FACTORS"
     best = ""
     for m in re.finditer(start_re, txt, re.I):
         tail = txt[m.start():m.start() + 60000]
         e = re.search(end_re, tail[40:], re.I)
         section = tail[:e.start() + 40] if e else tail[:8000]
-        if len(section) > len(best):
-            best = section
+        if _is_contents_stub(section):
+            continue
+        best = section
     return best.strip()
 
 
@@ -139,20 +364,58 @@ _NOTE_ANCHOR_RE = re.compile(
     r"|Legal Matters", re.I)
 
 
+# Risk Factors is hypothetical by construction — "we may be the target of
+# securities class action litigation" is a warning, not a docket — so nothing in
+# it is evidence of a live matter. Blanked before anchoring rather than filtered
+# after, since the note windows would otherwise reach into it.
+_RF_START = re.compile(r"ITEM\s*1A\.?\s*[—–-]?\s*RISK FACTORS", re.I)
+_RF_END   = re.compile(r"ITEM\s*(1B|2)\.?", re.I)
+
+
+def _mask_risk_factors(txt: str) -> str:
+    """Blank the Risk Factors section — the last one that isn't a contents row.
+
+    Same reasoning as extract_legal_section: an earlier "Item 1A" is a contents
+    row or a cross-reference, and masking from there swallows the real legal
+    note. Masking every match ate 140k characters of Honeywell's 10-Q, Flexjet
+    v. Honeywell included. A missing end anchor means the span is unknown, so
+    nothing is masked — losing a real matter is the more expensive mistake.
+    """
+    start = None
+    for m in _RF_START.finditer(txt):
+        if not _is_contents_stub(txt[m.start():m.start() + 400000]):
+            start = m.start()
+    if start is None:
+        return txt
+    e = _RF_END.search(txt[start + 40:start + 400000])
+    if e is None:
+        return txt
+    span = e.start() + 40
+    return txt[:start] + (" " * span) + txt[start + span:]
+
+
 def extract_legal_corpus(txt: str, form: str) -> str:
-    """Item 1/Item 3 plus the contingencies note windows.
+    """Item 1/Item 3 plus the contingencies note windows, less Risk Factors.
 
     A 10-Q's Item 1 is often one line pointing at the notes ("see Note 12"), so
     classifying on Item 1 alone reads a live case as boilerplate. The note text
     is where the captions and the accrual actually are.
     """
-    parts = [extract_legal_section(txt, form)]
-    for m in _NOTE_ANCHOR_RE.finditer(txt):
-        parts.append(txt[m.start():m.start() + 4000])
+    masked = _mask_risk_factors(txt)
+    parts = [extract_legal_section(masked, form)]
+    for m in _NOTE_ANCHOR_RE.finditer(masked):
+        window = masked[m.start():m.start() + 4000]
+        # The same contents-row guard extract_legal_section uses. An anchor can
+        # land on the contents listing just as easily, and the window then runs
+        # 4k characters through whatever front matter follows it — CRWV's
+        # forward-looking-statements list, and its material-weakness bullet.
+        if _is_contents_stub(window):
+            continue
+        parts.append(window)
     seen, out = set(), []
     for part in parts:
         key = part[:120]
-        if part and key not in seen:
+        if part.strip() and key not in seen:
             seen.add(key)
             out.append(part)
     return "\n".join(out)
@@ -162,14 +425,22 @@ def classify(section: str) -> dict:
     """Propose a severity from one Legal Proceedings section, with evidence."""
     ev: list[str] = []
     if not section:
-        return {"severity": None, "confidence": "low", "evidence": ["no section found"]}
+        return {"severity": None, "confidence": "low",
+                "evidence": ["no section found"], "exposure": None,
+                "exposure_only": False}
 
-    caption     = bool(_CAPTION_RE.search(section))
+    caption     = _hit_in_live_context(_CAPTION_RE, section)
     heading     = bool(_NAMED_HEADING_RE.search(section))
-    securities  = bool(_SECURITIES_RE.search(section))
-    derivative  = bool(_DERIVATIVE_RE.search(section))
-    credibility = bool(_CREDIBILITY_RE.search(section))
+    securities  = _hit_in_live_context(_SECURITIES_RE, section)
+    derivative  = _hit_in_live_context(_DERIVATIVE_RE, section)
+    credibility = _credibility_evidence(section)
+    govt        = bool(_GOVT_MATTER_RE.search(section))
     unbounded   = bool(_UNBOUNDED_RE.search(section))
+    exposure    = quantified_exposure(section)
+    # Whether the amount is the only thing holding this entry up. A caption or a
+    # class action stands on its own; a bare accrual has to clear a materiality
+    # bar first, and only the consumer knows the market cap to measure it against.
+    exposure_only = bool(exposure) and not (securities or derivative or caption)
 
     if caption:
         ev.append("named case caption")
@@ -180,13 +451,19 @@ def classify(section: str) -> dict:
     if derivative:
         ev.append("shareholder derivative suit")
     if credibility:
-        ev.append("regulator/restatement language")
+        ev.append(f"accounting integrity in question ({credibility})")
     if unbounded:
         ev.append("loss not estimable")
+    if govt:
+        ev.append("government investigation on file")
+    if exposure:
+        ev.append(f"quantified exposure ({exposure})")
 
     if securities and credibility:
         # The short-attack pattern: the risk is the accounting, not the case.
-        return {"severity": "existential", "confidence": "medium", "evidence": ev}
+        # `credibility` is deliberately narrow — see _credibility_evidence.
+        return {"severity": "existential", "confidence": "medium",
+                "evidence": ev, "exposure": exposure, "exposure_only": False}
 
     # Presence of litigation is not the signal — every large filer has a docket,
     # and a standing "Antitrust Matters" or "Patent Litigation" heading is
@@ -194,21 +471,29 @@ def classify(section: str) -> dict:
     # on its own is not enough to size a position down: only a specific case
     # caption, a securities class action or a derivative suit acts. A heading
     # with nothing behind it goes to `review` for a human read.
-    if securities or derivative or caption:
+    # A booked or entered dollar figure acts on its own: the filer has conceded
+    # both that the matter is real and roughly what it costs.
+    if securities or derivative or caption or exposure:
         return {"severity": "overhang",
-                "confidence": "medium" if (securities or caption) else "low",
-                "evidence": ev}
+                "confidence": "medium" if (securities or caption or exposure)
+                              else "low",
+                "evidence": ev, "exposure": exposure,
+                "exposure_only": exposure_only}
     if heading:
         return {"severity": "review", "confidence": "low",
-                "evidence": ev + ["heading only — no caption or case-type signal"]}
-    if len(section) <= _BOILERPLATE_CHARS or _ORDINARY_RE.search(section):
+                "evidence": ev + ["heading only — no caption or case-type signal"],
+                "exposure": exposure, "exposure_only": False}
+    if not govt and (len(section) <= _BOILERPLATE_CHARS
+                     or _ORDINARY_RE.search(section)):
         return {"severity": "clear", "confidence": "medium",
-                "evidence": ev + ["ordinary-course language only"]}
+                "evidence": ev + ["ordinary-course language only"],
+                "exposure": exposure, "exposure_only": False}
     # Substantial legal text with nothing decisive in it. Refusing to guess is
     # the point: defaulting to overhang here would cap the tier on most of the
     # S&P, and defaulting to clear would hide a real matter behind bad parsing.
     return {"severity": "review", "confidence": "low",
-            "evidence": ev + ["legal text present but no decisive signal"]}
+            "evidence": ev + ["legal text present but no decisive signal"],
+            "exposure": exposure, "exposure_only": False}
 
 
 def review_symbol(symbol: str, cik_map: dict[str, int] | None = None) -> dict | None:
@@ -234,9 +519,26 @@ def review_symbol(symbol: str, cik_map: dict[str, int] | None = None) -> dict | 
         "filing":    f"{form} {filed}",
         "source":    url,
     }
+    if verdict.get("exposure"):
+        # Kept on the entry, not just in the note: it is the one field that says
+        # how big the matter is, and the reason a caption alone never could.
+        entry["exposure"] = verdict["exposure"]
+    if verdict.get("exposure_only"):
+        # The overhang rests on the amount alone, so it is only worth capping a
+        # position for if the amount is material against the company's size —
+        # a test `_risk_tier()` applies, since the market cap lives there.
+        entry["exposure_only"] = True
     if verdict["severity"]:
         entry["severity"] = verdict["severity"]
         entry["note"] = "; ".join(verdict["evidence"])
+    elif verdict["evidence"] == ["no section found"]:
+        # Nothing could be extracted at all — that is a parsing failure, not a
+        # clean filing. ADI and HD are large filers that certainly have legal
+        # proceedings; recording them `clear` says the opposite of what happened.
+        # `review` flags LITIGATION UNCLEAR without touching grade or sizing.
+        entry["severity"] = "review"
+        entry["note"] = ("no legal section could be extracted from this filing — "
+                         "read Part II Item 1 by hand")
     else:
         # Recorded rather than omitted: "checked, nothing found" is a result, and
         # it stops the symbol being re-fetched on every analysis for 100 days.

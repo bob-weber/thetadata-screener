@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -42,7 +43,7 @@ _LITIGATION_SEVERITY: dict[str, str] = {
     "existential":
         "Litigation that threatens the business itself — a ruling can gap the "
         "stock overnight, and the loss is not bounded by anything the chain "
-        "prices",
+        "prices; read it before writing anything against this name",
     "overhang":
         "Litigation overhang — a known case above the industry's background "
         "rate; a cash cost and a lid on the multiple, not a threat to the "
@@ -109,6 +110,37 @@ _TIER_ALLOCATION = {
     "High":   "15–20%",
 }
 _TIER_ORDER = {"Low": 0, "Medium": 1, "High": 2}
+
+# An overhang resting on a dollar figure alone has to clear this fraction of
+# market cap before it caps a position. A quantified amount is the filer's own
+# statement that a matter is real, but not that it matters: AXP books a $12.5m
+# accrual at 0.006% of cap, three orders of magnitude below the $971m Boeing
+# carries at 0.58%. An absolute floor gets this backwards, since dollar size and
+# materiality run in different directions — ALGN's $31.8m is a quarter of RCL's
+# $130m and half again as material, 0.28% of an $11b company against 0.18% of a
+# $71b one. A caption, a class action or a derivative suit still act on their
+# own; this bar applies only when the amount is all there is.
+_EXPOSURE_MATERIAL_PCT = 0.0025
+
+_MONEY_SCALE = {"billion": 1_000_000_000, "million": 1_000_000, "": 1}
+
+
+def _money_value(text: str) -> float:
+    """Dollars from a stated figure ("$1.2 million" → 1200000.0), 0.0 if unread.
+
+    Lives here rather than in ``litigation_review`` because the materiality test
+    below is its only consumer that needs a number; the review module imports it
+    back, which is the direction the dependency already runs.
+    """
+    m = re.search(r"\$\s?([\d,]*(?:\.\d+)?)\s*(million|billion)?", text, re.I)
+    if not m or not m.group(1).strip(","):
+        return 0.0
+    try:
+        amount = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0.0
+    return amount * _MONEY_SCALE[(m.group(2) or "").lower()]
+
 
 # Additional penalty when the industry sub-type is especially risky
 _INDUSTRY_EXTRA: dict[str, tuple[int, str]] = {
@@ -200,7 +232,8 @@ def _litigation_state(entry: dict | None, today: date | None = None) -> dict:
     entry with no usable date is stale from the start — undated is unverified.
     """
     if not entry:
-        return {"severity": None, "stale": False, "review_by": None, "reason": ""}
+        return {"severity": None, "stale": False, "review_by": None,
+                "reason": "", "exposure": None, "exposure_only": False}
     today = today or date.today()
 
     severity = str(entry.get("severity", "")).strip().lower()
@@ -225,7 +258,11 @@ def _litigation_state(entry: dict | None, today: date | None = None) -> dict:
         reason += f" — {entry['note']}"
     return {"severity": severity, "stale": stale,
             "review_by": review_by.isoformat() if review_by else None,
-            "reason": reason}
+            "reason": reason,
+            # Passed through for the materiality test in _risk_tier, which is
+            # where the market cap to measure the amount against is known.
+            "exposure": entry.get("exposure"),
+            "exposure_only": bool(entry.get("exposure_only"))}
 
 
 def _ipo_gate_reason(info: dict, tags: list[str], today: date | None = None) -> str:
@@ -381,16 +418,41 @@ def _external_funding(bs, market_cap: int | None) -> tuple[bool, bool, str]:
     return diluting, levering, "; ".join(bits)
 
 
+def _immaterial_exposure(litigation: dict, market_cap: float | None) -> str | None:
+    """Why an exposure-only overhang isn't capping the tier, or None if it is.
+
+    Only entries flagged ``exposure_only`` are eligible: the amount is the whole
+    case for the overhang, so if it is immaterial there is nothing left. An
+    unknown cap or an unparseable figure means the test can't be run, and an
+    untested overhang keeps applying — the asymmetry the litigation store is
+    built on, where a cap that wrongly fires costs a trade and one that wrongly
+    stands down costs a position.
+    """
+    if not litigation.get("exposure_only") or not market_cap:
+        return None
+    exposure = litigation.get("exposure") or ""
+    value = _money_value(exposure)
+    if not value or value >= market_cap * _EXPOSURE_MATERIAL_PCT:
+        return None
+    return (f"Litigation overhang rests on a quantified {exposure.strip()} alone, "
+            f"{value / market_cap:.3%} of market cap — below the "
+            f"{_EXPOSURE_MATERIAL_PCT:.3%} materiality bar, so it is recorded "
+            f"but does not cap sizing")
+
+
 def _risk_tier(score: int, tags: list[str], profit_state: str,
                funded_by_paper: bool = False,
-               litigation: dict | None = None) -> tuple[str, str, list[str]]:
+               litigation: dict | None = None,
+               market_cap: float | None = None) -> tuple[str, str, list[str]]:
     """``(tier, max_allocation, notes)`` for a symbol.
 
     The base tier follows the graded score, since the score already weighs the
     beta / market-cap / cushion inputs the strategy's tier table describes.
-    Crypto-linkage, unprofitability and a litigation overhang then *cap* the
-    tier at High — they are sizing inputs, not gates, so they never reject a
-    candidate, they only stop it being sized as anything safer.
+    Crypto-linkage, unprofitability and litigation then *cap* the tier at High —
+    they are sizing inputs, not gates, so they never reject a candidate, they
+    only stop it being sized as anything safer. ``review`` and ``clear`` don't
+    size at all; ``existential`` caps like ``overhang`` rather than harder,
+    because it is a flag for you to read, not a verdict the analyzer acts on.
     """
     tier = "Low" if score >= 85 else ("Medium" if score >= 70 else "High")
     notes: list[str] = []
@@ -403,13 +465,17 @@ def _risk_tier(score: int, tags: list[str], profit_state: str,
                 notes.append(why)
             tier = "High"
 
-    if litigation and litigation.get("severity") == "overhang":  # `review`/`clear` never size
-        why = litigation["reason"]
-        if _TIER_ORDER[tier] < _TIER_ORDER["High"]:
-            notes.append(f"{why} (tier capped from {tier} to High)")
+    if litigation and litigation.get("severity") in ("overhang", "existential"):
+        immaterial = _immaterial_exposure(litigation, market_cap)
+        if immaterial:
+            notes.append(immaterial)
         else:
-            notes.append(why)
-        tier = "High"
+            why = litigation["reason"]
+            if _TIER_ORDER[tier] < _TIER_ORDER["High"]:
+                notes.append(f"{why} (tier capped from {tier} to High)")
+            else:
+                notes.append(why)
+            tier = "High"
 
     if profit_state == "unprofitable":
         tier = "High"
@@ -715,10 +781,12 @@ def apply_contract_adjustments(
     # caps (crypto-linked, unprofitable, litigation overhang) re-apply on top of
     # it. The tier notes
     # are already in note_list from the symbol pass, so they aren't re-added.
+    cap_b = result.get("mkt_cap_b")
     tier, allocation, _ = _risk_tier(new_score, result.get("tags") or [],
                                      result.get("profitability", "unknown"),
                                      bool(result.get("funded_by_paper")),
-                                     result.get("litigation"))
+                                     result.get("litigation"),
+                                     cap_b * 1e9 if cap_b else None)
 
     return {
         **result,
@@ -863,8 +931,20 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
         ipo_reason = _ipo_gate_reason(info, tags)
         if ipo_reason:
             reject_reasons.append(ipo_reason)
+        # Litigation never rejects — it flags. A hard gate is self-defeating
+        # for a risk you intend to read case by case: `Reject` zeroes the score
+        # and apply_contract_adjustments() returns early, so the name never
+        # reaches you with a workable contract and the review never happens.
+        # The severities also come from a regex over one filing, and a machine
+        # verdict is not a fact: PYPL graded F on "Civil Investigative Demand",
+        # routine language for any consumer-finance filer. So the flag rides
+        # into the LSO table and the CSV export, the tier cap sizes the name
+        # down, and the decision stays yours.
         if litigation["severity"] == "existential":
-            reject_reasons.append(litigation["reason"])
+            flags.append("LITIGATION SEVERE")
+            notes.append(litigation["reason"])
+        if litigation["severity"] == "overhang":
+            flags.append("LITIGATION OVERHANG")
         if litigation["severity"] == "review":
             flags.append("LITIGATION UNCLEAR")
             notes.append(litigation["reason"])
@@ -882,7 +962,7 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             notes.extend(reject_reasons)
 
         tier, allocation, tier_notes = _risk_tier(score, tags, profit_state,
-                                                  funded_by_paper, litigation)
+                                                  funded_by_paper, litigation, cap)
         notes.extend(tier_notes)
         if reject_reasons:
             tier, allocation = "Reject", "0%"
@@ -913,29 +993,34 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
     except Exception as e:
         if on_log:
             on_log(f"  {symbol}: data error — {e}")
-        # The market data is gone but the local data isn't: a symbol on file as
-        # existentially sued stays rejected, and an overhang still caps sizing.
-        err_reject = (litigation["reason"]
-                      if litigation["severity"] == "existential" else "")
-        err_flags  = ["DATA ERROR"]
-        if err_reject:
-            err_flags.append("HARD REJECT")
+        # The market data is gone but the local data isn't, so the litigation
+        # flags and the tier cap still apply — they just never reject here
+        # either.
+        err_flags = ["DATA ERROR"]
+        if litigation["severity"] == "existential":
+            err_flags.append("LITIGATION SEVERE")
+        if litigation["severity"] == "overhang":
+            err_flags.append("LITIGATION OVERHANG")
+        if litigation["severity"] == "review":
+            err_flags.append("LITIGATION UNCLEAR")
         if litigation["stale"]:
             err_flags.append("LITIGATION REVIEW DUE")
+        # No market cap on this path — yfinance is what failed — so an
+        # exposure-only overhang goes untested and keeps capping.
         err_tier, err_alloc, _ = _risk_tier(50, tags, "unknown", False, litigation)
         return {
             "symbol":             symbol,
-            "grade":              "F" if err_reject else "?",
-            "score":              0 if err_reject else 50,
+            "grade":              "?",
+            "score":              50,
             "sector":             "Error",
             "tags":               tags,
             "tags_researched":    tags_researched,
             "profitability":      "unknown",
             "funded_by_paper":    False,
-            "risk_tier":          "Reject" if err_reject else err_tier,
-            "max_allocation":     "0%" if err_reject else err_alloc,
-            "reject":             bool(err_reject),
-            "reject_reason":      err_reject,
+            "risk_tier":          err_tier,
+            "max_allocation":     err_alloc,
+            "reject":             False,
+            "reject_reason":      "",
             "litigation":         litigation,
             "industry":           "",
             "beta":               None,
@@ -943,7 +1028,11 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "earnings_date":      "",
             "earnings_in_period": False,
             "flags":              " | ".join(err_flags),
-            "notes":              " • ".join([str(e)] + ([err_reject] if err_reject else [])),
+            # The litigation reason is local data and survives the failure —
+            # it is the whole point of keeping the flags on this path.
+            "notes":              " • ".join(
+                [str(e)] + ([litigation["reason"]] if litigation["severity"]
+                            in ("existential", "overhang", "review") else [])),
         }
 
 
