@@ -11,8 +11,8 @@ import pandas as pd
 import numpy as np
 
 
-def _us_market_holidays(year: int) -> set[date]:
-    """Return NYSE/Nasdaq market holidays for the given year."""
+def _us_market_holidays(year: int) -> dict[date, str]:
+    """Return NYSE/Nasdaq market holidays for the given year, date → name."""
     def nth_weekday(y, m, wd, n):
         first = date(y, m, 1)
         delta = (wd - first.weekday()) % 7
@@ -41,17 +41,31 @@ def _us_market_holidays(year: int) -> set[date]:
     good_friday = date(year, month, day) - timedelta(days=2)
 
     return {
-        observed(date(year, 1, 1)),          # New Year's Day
-        nth_weekday(year, 1, 0, 3),          # MLK Day        (3rd Mon Jan)
-        nth_weekday(year, 2, 0, 3),          # Presidents Day (3rd Mon Feb)
-        good_friday,                          # Good Friday
-        last_monday(year, 5),                 # Memorial Day   (last Mon May)
-        observed(date(year, 6, 19)),          # Juneteenth
-        observed(date(year, 7, 4)),           # Independence Day
-        nth_weekday(year, 9, 0, 1),          # Labor Day      (1st Mon Sep)
-        nth_weekday(year, 11, 3, 4),         # Thanksgiving   (4th Thu Nov)
-        observed(date(year, 12, 25)),         # Christmas
+        observed(date(year, 1, 1)):   "New Year's Day",
+        nth_weekday(year, 1, 0, 3):   "MLK Day",            # 3rd Mon Jan
+        nth_weekday(year, 2, 0, 3):   "Presidents Day",     # 3rd Mon Feb
+        good_friday:                  "Good Friday",
+        last_monday(year, 5):         "Memorial Day",       # last Mon May
+        observed(date(year, 6, 19)):  "Juneteenth",
+        observed(date(year, 7, 4)):   "Independence Day",
+        nth_weekday(year, 9, 0, 1):   "Labor Day",          # 1st Mon Sep
+        nth_weekday(year, 11, 3, 4):  "Thanksgiving",       # 4th Thu Nov
+        observed(date(year, 12, 25)): "Christmas",
     }
+
+
+def _weekday_holiday_name(d: date) -> str | None:
+    """The holiday closing the market on ``d``, or None (weekends included).
+
+    Weekends are deliberately excluded. A Saturday or Sunday scan gets full
+    greeks from Schwab — it keeps serving the last session's analytics through a
+    weekend — so "the market is closed" is not the thing that predicts missing
+    IV. A weekday holiday is: Schwab appears to roll to a new trading day and
+    reset the greeks for a session that never opens.
+    """
+    if d.weekday() >= 5:
+        return None
+    return (_us_market_holidays(d.year) | _us_market_holidays(d.year - 1)).get(d)
 
 
 def _last_trading_day(ref: date) -> date:
@@ -136,14 +150,36 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def _wilder_smooth(values: pd.Series, period: int) -> pd.Series:
+    """Wilder's smoothed average: SMA of the first `period` values, then recursive.
+
+    Seeding matters more than it looks. ``ewm(alpha=1/period, adjust=False)`` seeds
+    the average with the *single* first value, which still carries ``(1-1/period)**n``
+    of the weight n bars later — ~10% at bar 33 for a 14-period average. On the short
+    history Pass 2 used to fetch that moved RSI by several points and pushed symbols
+    across the screen's threshold; Wilder's own SMA seed converges far faster.
+    """
+    dense = values.dropna()
+    if len(dense) < period:
+        return pd.Series(np.nan, index=values.index)
+    arr = dense.to_numpy(dtype=float)
+    out = np.full(len(arr), np.nan)
+    avg = arr[:period].mean()
+    out[period - 1] = avg
+    for i in range(period, len(arr)):
+        avg = (avg * (period - 1) + arr[i]) / period
+        out[i] = avg
+    return pd.Series(out, index=dense.index).reindex(values.index)
+
+
 def calc_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
     """Wilder's RSI as a full series (NaN until `period` bars have accumulated)."""
     delta    = closes.diff()
-    gain     = delta.clip(lower=0)
-    loss     = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    avg_gain = _wilder_smooth(delta.clip(lower=0),    period)
+    avg_loss = _wilder_smooth((-delta).clip(lower=0), period)
+    # avg_loss == 0 with gains present divides to +inf, which lands on RSI 100 —
+    # correct by definition. A dead-flat window leaves both at 0 and RSI undefined.
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
@@ -159,13 +195,35 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> float:
     return float(calc_rsi_series(closes.dropna(), period).iloc[-1])
 
 
-def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> float:
-    _, upper, lower = calc_bb_bands(closes, period, std_mult)
-    price = closes.iloc[-1]
-    u, l  = upper.iloc[-1], lower.iloc[-1]
-    if (u - l) == 0:
+def bb_pct_at(value: float, upper: float, lower: float) -> float:
+    """Where ``value`` sits in a Bollinger band: 0% = lower band, 100% = upper.
+
+    Applied to the last close it's the stock's BB%. Applied to a strike it says
+    where that strike sits on the same band — which is what the options pass
+    tests, since a short put is assigned at the strike, not at today's price.
+    Below 0 means the point is under the lower band: a breakdown for a price,
+    but cushion for a strike.
+    """
+    if (upper - lower) == 0:
         return 50.0
-    return float((price - l) / (u - l) * 100)
+    return float((value - lower) / (upper - lower) * 100)
+
+
+def calc_bb_edges(closes: pd.Series, period: int = 20,
+                  std_mult: float = 2.0) -> tuple[float, float] | None:
+    """Latest (upper, lower) Bollinger band values, or None if not computable."""
+    _, upper, lower = calc_bb_bands(closes, period, std_mult)
+    u, l = upper.iloc[-1], lower.iloc[-1]
+    if pd.isna(u) or pd.isna(l):
+        return None
+    return float(u), float(l)
+
+
+def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> float:
+    edges = calc_bb_edges(closes, period, std_mult)
+    if edges is None:
+        return 50.0
+    return bb_pct_at(float(closes.iloc[-1]), *edges)
 
 
 def calc_hv(closes: pd.Series, period: int = 20) -> float | None:
@@ -341,15 +399,13 @@ def _fetch_edgar_symbols(on_log=None) -> list[str]:
 
     df = df[df["exchange"].isin(VALID_EXCHANGES)].copy()
     df["ticker"] = df["ticker"].str.upper().str.strip()
-    # Single-char suffixes W/R denote warrants/rights at any length.
-    # U denotes SPAC units only when appended to a 4-char base (5+ chars total);
-    # shorter tickers like LULU/ROKU are legitimate standalone symbols.
-    df = df[
-        ~df["ticker"].str.endswith("W") &
-        ~df["ticker"].str.endswith("R") &
-        ~(df["ticker"].str.endswith("U") & (df["ticker"].str.len() >= 5)) &
-        ~df["ticker"].str.contains(r"[\^~\+]", regex=True)
-    ]
+    # Nothing here infers a security type from the ticker string. Nasdaq's
+    # 5th-letter convention (…W warrant, …R rights, …U unit) reads the same as
+    # the last letter of a real 4-char name — AEHR, PLTR, SNOW, DOW — and every
+    # length/suffix rule that tried to separate the two cost hundreds of real
+    # tickers. The type is a fact Schwab reports per symbol, so the filtering
+    # happens in _resolve_priceable() against the quote, not against the string.
+    df = df[~df["ticker"].str.contains(r"[\^~\+]", regex=True)]
     df = df[~df["name"].apply(_is_fund)]
     df = df.drop_duplicates(subset="ticker")
     symbols = sorted(df["ticker"].tolist())
@@ -358,16 +414,49 @@ def _fetch_edgar_symbols(on_log=None) -> list[str]:
     return symbols
 
 
+# Schwab assetSubType → why the symbol is out of scope for a wheel screener.
+# COE (common), ADR, ETF, CEF and ETN are kept; the fund-name filter upstream
+# already removes most funds by name.
+_EXCLUDED_SUBTYPES = {
+    "WAR": "warrant",
+    "RGT": "rights",
+    "UIT": "unit",
+    "PRF": "preferred",
+}
+
+
+def _quote_reject_kind(row: dict) -> str | None:
+    """None if a quote row is a symbol worth scanning, else why it is excluded.
+
+    Presence in a quote response proves nothing: Schwab prices warrants, rights,
+    units and preferreds happily and reports assetMainType EQUITY for all of
+    them. The security type is in ``assetSubType``, and whether the symbol has a
+    listed chain at all is in ``reference.optionable`` — the question this
+    screener actually cares about, since a symbol with no chain cannot produce a
+    contract in Pass 3. Both fields ride along in the batch already fetched.
+    """
+    sub = row.get("assetSubType") or ""
+    if sub in _EXCLUDED_SUBTYPES:
+        return _EXCLUDED_SUBTYPES[sub]
+    if not (row.get("reference") or {}).get("optionable"):
+        return "not-optionable"
+    return None
+
+
 def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progress=None,
-                       chunk: int = 250) -> dict:
-    """Map each EDGAR ticker Schwab can price to its Schwab symbol.
+                       chunk: int = 250) -> tuple[dict, dict]:
+    """Map each EDGAR ticker Schwab prices *and* we can wheel to its Schwab symbol.
 
     Direct hits map to themselves. Dual-class names lost to the EDGAR '-'/'.'
     vs Schwab '/' separator (BRK-B → BRK/B) are recovered with a normalized
-    retry, and stored under their Schwab form. Returns {edgar: schwab}.
+    retry, and stored under their Schwab form. Returns
+    ``({edgar: schwab}, {edgar: reject_kind})``; the second maps the symbols
+    Schwab priced but ``_quote_reject_kind()`` ruled out, so the dropped-file
+    breakdown can name a real reason instead of guessing from the suffix.
     """
     from core import schwab_client
     resolved: dict[str, str] = {}
+    rejected: dict[str, str] = {}
     missing: list[str] = []
     total = len(edgar_symbols)
     for i in range(0, total, chunk):
@@ -376,7 +465,15 @@ def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progres
             data = schwab_client.quotes(client, batch)
             # Recognized symbols are top-level keys; unknowns are in errors.invalidSymbols.
             for s in batch:
-                (resolved.__setitem__(s, s) if s in data else missing.append(s))
+                row = data.get(s)
+                if row is None:
+                    missing.append(s)
+                    continue
+                kind = _quote_reject_kind(row)
+                if kind:
+                    rejected[s] = kind
+                else:
+                    resolved[s] = s
         except Exception:
             for s in batch:      # on a request error, keep the batch rather than drop it
                 resolved[s] = s
@@ -393,18 +490,29 @@ def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progres
         except Exception:
             continue
         for edgar_sym, schwab_sym in alt.items():
-            if schwab_sym in data:
+            row = data.get(schwab_sym)
+            if row is None:
+                continue
+            kind = _quote_reject_kind(row)
+            if kind:
+                rejected[edgar_sym] = kind
+            else:
                 resolved[edgar_sym] = schwab_sym
 
     if on_log:
         recovered = sum(1 for e, s in resolved.items() if e != s)
         extra = f" ({recovered} dual-class recovered)" if recovered else ""
-        on_log(f"Priceable in Schwab: {len(resolved)}/{total}{extra}")
-    return resolved
+        on_log(f"Scannable in Schwab: {len(resolved)}/{total}{extra}; "
+               f"{len(rejected)} priced but excluded by type/optionability")
+    return resolved, rejected
 
 
 def _classify_dropped(sym: str) -> str:
-    """Bucket a dropped EDGAR ticker by its suffix after a -/./ separator.
+    """Bucket an *unpriced* EDGAR ticker by its suffix after a -/./ separator.
+
+    Only for symbols Schwab returned no quote for, where there is no reported
+    type to go on. Anything Schwab did price is classified from its quote by
+    ``_quote_reject_kind()`` instead.
 
     class_share names (e.g. BRK-B) are the ones likely lost only to the EDGAR
     '-' vs Schwab '/' format difference; the rest are genuinely out of scope.
@@ -425,11 +533,21 @@ def _classify_dropped(sym: str) -> str:
 
 
 def _record_dropped(dropped: list[str], on_log=None,
-                    dropped_file: str | Path = DROPPED_FILE) -> None:
-    """Persist the dropped tickers + a breakdown so exclusions are inspectable."""
+                    dropped_file: str | Path = DROPPED_FILE,
+                    reasons: dict | None = None) -> None:
+    """Persist the dropped tickers + a breakdown so exclusions are inspectable.
+
+    ``reasons`` carries the reject kind Schwab's own quote reported; symbols
+    absent from it were never priced and fall back to the suffix classifier.
+    """
     from collections import Counter
-    kinds = Counter(_classify_dropped(s) for s in dropped)
-    class_shares = sorted(s for s in dropped if _classify_dropped(s) == "class_share")
+    reasons = reasons or {}
+
+    def kind_of(sym: str) -> str:
+        return reasons.get(sym) or _classify_dropped(sym)
+
+    kinds = Counter(kind_of(s) for s in dropped)
+    class_shares = sorted(s for s in dropped if kind_of(s) == "class_share")
     Path(dropped_file).write_text(json.dumps({
         "updated":      date.today().isoformat(),
         "count":        len(dropped),
@@ -439,18 +557,19 @@ def _record_dropped(dropped: list[str], on_log=None,
     }, indent=2))
     if on_log:
         eg = ", ".join(class_shares[:3])
+        # Summarise straight from the counter: the kinds now come from Schwab,
+        # so a hand-written list of them would rot the next time one is added.
+        summary = ", ".join(f"{cnt} {kind}" for kind, cnt in kinds.most_common())
         on_log(
-            f"Dropped {len(dropped)}: {len(class_shares)} dual-class"
-            f"{f' (e.g. {eg})' if eg else ''}, {kinds.get('preferred', 0)} preferred, "
-            f"{kinds.get('warrant', 0)} warrant, {kinds.get('rights', 0)} rights, "
-            f"{kinds.get('unlisted', 0)} unlisted — see {dropped_file}"
+            f"Dropped {len(dropped)}: {summary}"
+            f"{f' — dual-class e.g. {eg}' if eg else ''} — see {dropped_file}"
         )
 
 
 def build_universe(on_log=None, on_progress=None,
                    universe_file: str | Path = UNIVERSE_FILE,
                    validate: bool = True) -> dict:
-    """Fetch the EDGAR universe, drop names Schwab can't price, and persist it.
+    """Fetch the EDGAR universe, keep what Schwab prices and lists options on.
 
     Returns the saved dict ``{updated, source, count, symbols}``. When Schwab is
     unavailable (no cached token), saves the unvalidated EDGAR list instead of
@@ -472,10 +591,10 @@ def build_universe(on_log=None, on_progress=None,
             if on_log:
                 on_log(f"Schwab unavailable ({e}) — saving unvalidated EDGAR list")
         if client is not None:
-            resolved = _resolve_priceable(client, edgar, on_log, on_progress)
+            resolved, rejected = _resolve_priceable(client, edgar, on_log, on_progress)
             symbols  = sorted(resolved.values())   # Schwab symbols (recovered forms included)
-            source   = "SEC EDGAR + Schwab priceable"
-            _record_dropped(sorted(set(edgar) - set(resolved)), on_log)
+            source   = "SEC EDGAR + Schwab optionable"
+            _record_dropped(sorted(set(edgar) - set(resolved)), on_log, reasons=rejected)
 
     data = {
         "updated": date.today().isoformat(),
@@ -488,6 +607,14 @@ def build_universe(on_log=None, on_progress=None,
     # universe on the next options scan (listings change rarely, but a universe
     # rebuild is the natural point to refresh them).
     Path(WEEKLIES_CACHE_FILE).unlink(missing_ok=True)
+    # Drop the scan caches too. Their keys cover the date and the scan
+    # parameters but not the universe, so a screen run earlier the same day
+    # would be reused verbatim and the symbols just added would stay invisible
+    # until tomorrow. These are the default filenames the passes write.
+    # The per-symbol history store is deliberately kept: those closes are still
+    # good, and refetching them costs a request each.
+    for stale_cache in ("price_screen_cache.json", "tech_candidates_cache.json"):
+        Path(stale_cache).unlink(missing_ok=True)
     if on_log:
         on_log(f"Universe saved: {len(symbols)} tickers → {universe_file}")
     return data
@@ -512,9 +639,22 @@ def load_universe(universe_file: str | Path = UNIVERSE_FILE) -> list[str] | None
 # re-adjustments. Keyed per symbol, so it survives price-range/threshold changes.
 HISTORY_STORE_FILE = "history_store_cache.json"
 
+# Calendar days of daily history fetched for Pass 2 (~124 trading bars). The
+# indicators need very different amounts: BB% and HV are windowed, so 20 bars fully
+# determine them, but Wilder's RSI is recursive and only converges after several
+# multiples of its period. At the 45 days this used to fetch (~33 bars) RSI read
+# high by a median of 2 points across the universe and roughly 12% of symbols fell
+# on the wrong side of the threshold. This costs no extra API calls — the same
+# one-per-symbol request just returns more candles.
+HISTORY_DAYS = 180
+
 
 def _load_history_store(path: str | Path = HISTORY_STORE_FILE) -> dict:
-    """Load the per-symbol close store as {symbol: {"last": iso_date, "closes": [...]}}."""
+    """Load the store as {symbol: {"last": iso_date, "days": int, "closes": [...]}}.
+
+    ``days`` records the lookback the entry was fetched with, so widening
+    :data:`HISTORY_DAYS` re-fetches short entries instead of reusing them.
+    """
     p = Path(path)
     if not p.exists():
         return {}
@@ -781,17 +921,16 @@ def _price_key(config: dict) -> dict:
 
 
 def _full_key(config: dict) -> dict:
-    key = {
+    # Thresholds belong in the key for every scan: a universe scan filters on
+    # them, and an explicit-list scan records pass/fail against them per row, so
+    # changing one changes the result either way.
+    return {
         **_price_key(config),
-        "rsi_period": config.get("rsi_period", 14),
-        "bb_period":  config.get("bb_period",  20),
+        "rsi_period":       config.get("rsi_period",       14),
+        "bb_period":        config.get("bb_period",        20),
+        "rsi_threshold":    config.get("rsi_threshold",    45.0),
+        "bb_pct_threshold": config.get("bb_pct_threshold", 60.0),
     }
-    if not _scan_symbols(config):
-        # Thresholds only shape a universe scan; a my-stocks scan reports every
-        # symbol whatever its RSI/BB%, so they're not part of its identity.
-        key["rsi_threshold"]    = config.get("rsi_threshold",    40.0)
-        key["bb_pct_threshold"] = config.get("bb_pct_threshold", 33.0)
-    return key
 
 
 def run_price_screen(
@@ -914,8 +1053,8 @@ def run_price_screen(
 
 def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period,
                         bb_std_mult, rsi_threshold, bb_pct_threshold,
-                        append_live=True, apply_filters=True) -> dict | None:
-    """Apply the RSI/BB% filter to one close series; return a candidate row or None.
+                        append_live=True) -> dict | None:
+    """Measure RSI/BB% for one close series; return a row (None if unpriced).
 
     ``closes_list`` holds daily closes *through yesterday*. When ``append_live`` is
     set (a live trading session), the symbol's current quote from ``price_lookup``
@@ -923,9 +1062,15 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     the prior session's close. ``closes_list`` already excludes today's bar, so this
     never double-counts.
 
-    With ``apply_filters`` off (a my-stocks scan) the thresholds are measured but
-    never reject: the point is to see where each of your own symbols sits, so a
-    symbol too new to compute an indicator still comes back, with RSI/BB% blank.
+    The thresholds are measured but never reject. Every row carries ``passes`` —
+    whether it *would* have survived them — so the GUI can show the whole
+    price-screened list with each symbol's RSI and BB% beside it, grey the
+    failures, and let the options scan skip them. Rejecting here instead threw
+    away the only answer to "why didn't this one make it?", and it threw it away
+    before BB% was even computed: the old filter returned on a failing RSI, so a
+    symbol excluded on RSI had no BB% to show. A symbol too new to compute an
+    indicator still comes back, with RSI/BB% blank; it cannot be confirmed as
+    meeting the thresholds, so it fails.
     """
     live = price_lookup.get(sym)
     closes_list = list(closes_list)
@@ -933,23 +1078,35 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         closes_list.append(live)
     closes = pd.Series(closes_list, dtype=float)
     if len(closes) < bb_period + 2:
-        if apply_filters or live is None:
+        if live is None:
             return None
         return {"symbol": sym, "price": round(live, 2), "rsi": None,
-                "bb_pct": None, "hv": None}
+                "bb_pct": None, "bb_upper": None, "bb_lower": None,
+                "hv": None, "passes": False}
     rsi = calc_rsi(closes, rsi_period)
-    if apply_filters and rsi >= rsi_threshold:
-        return None
-    bb_pct = calc_bb_pct(closes, bb_period, bb_std_mult)
-    if apply_filters and bb_pct >= bb_pct_threshold:
-        return None
+    # A dead-flat window leaves RSI undefined. NaN compares False against every
+    # threshold, so without this it would neither reject nor set `passes` — and a
+    # universe scan would carry a blank-RSI row that its callers assume passed.
+    if not np.isfinite(rsi):
+        if live is None:
+            return None
+        return {"symbol": sym, "price": round(live, 2), "rsi": None,
+                "bb_pct": None, "bb_upper": None, "bb_lower": None,
+                "hv": None, "passes": False}
+    # The band edges travel with the row, not just the price's position on it:
+    # the options pass re-reads them to place each strike on the same band.
+    edges  = calc_bb_edges(closes, bb_period, bb_std_mult)
+    bb_pct = (bb_pct_at(float(closes.iloc[-1]), *edges) if edges else 50.0)
     hv = calc_hv(closes)
     return {
         "symbol": sym,
         "price":  round(live if live is not None else float(closes.iloc[-1]), 2),
         "rsi":    round(rsi, 1),
         "bb_pct": round(bb_pct, 1),
+        "bb_upper": round(edges[0], 2) if edges else None,
+        "bb_lower": round(edges[1], 2) if edges else None,
         "hv":     round(hv, 1) if hv is not None else None,
+        "passes": bool(rsi < rsi_threshold and bb_pct < bb_pct_threshold),
     }
 
 
@@ -964,7 +1121,7 @@ def run_technical_filter(
     candidates_cache_file: str | Path = "tech_candidates_cache.json",
     use_cache: bool = True,
 ) -> list[dict]:
-    """Pass 2 — get 45-day history for the price-qualified list and apply RSI/BB%.
+    """Pass 2 — get daily history for the price-qualified list and apply RSI/BB%.
 
     Writes ``tech_candidates_cache.json`` and returns
     ``[{"symbol", "price", "rsi", "bb_pct"}, …]``. Takes the price-screened list
@@ -974,21 +1131,25 @@ def run_technical_filter(
 
     Daily history is served from a persistent per-symbol store
     (:data:`HISTORY_STORE_FILE`): symbols already current through the last
-    completed session are reused with no fetch; the rest are fetched in full and
-    the store is updated. ``use_cache=False`` forces a full refetch of every
-    symbol (still updating the store).
+    completed session *and* stored with at least :data:`HISTORY_DAYS` of lookback
+    are reused with no fetch; the rest are fetched in full and the store is
+    updated. ``use_cache=False`` forces a full refetch of every symbol (still
+    updating the store).
 
-    On a my-stocks scan (``config["symbols"]``) the indicators are computed and
-    reported for every symbol rather than used to reject any.
+    Every price-screened symbol is returned, whether or not it met the
+    thresholds, each row carrying ``passes``. A universe scan used to drop its
+    failures, which meant the only record of *why* a symbol missed the cut was
+    discarded along with it. Callers filter on ``passes``: the Options Scanner
+    skips the failures, and the Stock Scanner greys them.
     """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
     bb_std_mult      = config.get("bb_std_mult",       2.0)
-    rsi_threshold    = config.get("rsi_threshold",    40.0)
-    bb_pct_threshold = config.get("bb_pct_threshold", 33.0)
+    rsi_threshold    = config.get("rsi_threshold",    45.0)
+    bb_pct_threshold = config.get("bb_pct_threshold", 60.0)
 
     today      = date.today()
-    hist_start = today - timedelta(days=45)
+    hist_start = today - timedelta(days=HISTORY_DAYS)
 
     full_key  = _full_key(config)
 
@@ -1009,7 +1170,6 @@ def run_technical_filter(
         rsi_period=rsi_period, bb_period=bb_period, bb_std_mult=bb_std_mult,
         rsi_threshold=rsi_threshold, bb_pct_threshold=bb_pct_threshold,
         append_live=is_trading_today,
-        apply_filters=not _scan_symbols(config),
     )
 
     # ── Per-symbol history store: reuse what's current, fetch only the rest ────
@@ -1026,7 +1186,10 @@ def run_technical_filter(
     stale: list[str]       = []
     for sym in symbols:
         entry = store.get(sym)
-        if use_cache and entry and entry.get("last") == last_session_str and entry.get("closes"):
+        # A shorter lookback than we now want is as stale as an out-of-date one:
+        # the closes are current but there aren't enough of them for RSI to settle.
+        if (use_cache and entry and entry.get("last") == last_session_str
+                and entry.get("closes") and entry.get("days", 0) >= HISTORY_DAYS):
             fresh[sym] = entry["closes"]
         else:
             stale.append(sym)
@@ -1112,7 +1275,8 @@ def run_technical_filter(
         if len(closes) >= bb_period + 1:
             histories[sym] = closes
             if last_date:
-                store[sym] = {"last": last_date, "closes": closes}
+                store[sym] = {"last": last_date, "days": HISTORY_DAYS,
+                              "closes": closes}
     _save_history_store(store, store_path)
 
     if on_log:
@@ -1128,8 +1292,10 @@ def run_technical_filter(
         if cand is not None:
             tech_candidates.append(cand)
 
+    n_pass = sum(1 for c in tech_candidates if c.get("passes"))
     if on_log:
-        on_log(f"Technical filter done — {len(tech_candidates)} candidates.")
+        on_log(f"Technical filter done — {n_pass} of {len(tech_candidates)} "
+               f"symbols met the RSI / BB% thresholds.")
 
     Path(candidates_cache_file).write_text(json.dumps({
         **full_key,
@@ -1201,6 +1367,24 @@ def run_options_filter(
     side             = config.get("side",             "sell") # "sell" or "buy"
     weeklies_only    = config.get("weeklies_only",    False)
     price_col        = "bid" if side == "sell" else "ask"
+
+    # Strike-level Bollinger test. The stock scan's BB% gate picks which symbols
+    # get a chain fetched at all; this decides which *strikes* on that chain are
+    # worth selling, which is the position you actually take on. The comparison
+    # flips with the right: a put wants its strike low on the band (under the
+    # lower band is cushion, not a breakdown), a call wants it high.
+    strike_bb_filter = config.get("strike_bb_filter", False)
+    strike_bb_pct    = config.get("strike_bb_pct",    33.0)
+    bandless_syms    = []
+
+    # Minimum open interest. On a cheap underlying the premium % rule stops
+    # being monotonic once the bid hits the $0.01 tick: premium ÷ strike climbs
+    # again as the strike shrinks, so a 2¢ bid on a $3 strike reads as 0.67% and
+    # clears a 0.6% floor that the $9 strike (also 2¢) misses. Those strikes have
+    # no market behind them — RUN's $3 put quoted 0.02/0.09 with zero OI — and
+    # open interest is what separates them from a real quote. A missing OI counts
+    # as zero: unknown depth is exactly the case this is here to catch.
+    oi_min = config.get("oi_min", 1)
 
     today = date.today()
 
@@ -1283,6 +1467,21 @@ def run_options_filter(
             _atm_iv(df, px) is not None for df in chains.values())
 
     retry = sorted(s for s, ch in fetched.items() if ch and not _has_usable_iv(s, ch))
+    if retry and not any(_has_usable_iv(s, ch) for s, ch in fetched.items() if ch):
+        # Not one symbol in the whole run came back with an IV, so this is not
+        # the clustering the retry was written for — refetching every chain
+        # would double the API calls to recover nothing.
+        holiday = _weekday_holiday_name(today)
+        if on_log:
+            on_log(
+                f"  No usable IV on any of {len(retry)} symbols"
+                + (f" — the market is closed today ({holiday}) and Schwab "
+                   f"returns -999 in every greek field."
+                   if holiday else
+                   " — Schwab is returning -999 across the board.")
+                + " IV, σ-cushion and IV/HV will be blank for this scan; "
+                  "HV is unaffected. Skipping the retry pass.")
+        retry = []
     if retry:
         if on_log:
             on_log(f"  {len(retry)} symbol(s) came back with no usable IV "
@@ -1340,8 +1539,14 @@ def run_options_filter(
         else:
             expirations = [e for e in available if dte_min <= (e - today).days <= dte_max]
 
-        # Realized vol of the underlying, from the stock scan's own closes.
+        # Realized vol and Bollinger edges of the underlying, from the stock
+        # scan's own closes. A cache written before the edges were carried
+        # through has neither, so every strike keeps a blank BB% and the filter
+        # stands down for that symbol rather than silently rejecting it.
         sym_hv = row.get("hv")
+        bb_u, bb_l = row.get("bb_upper"), row.get("bb_lower")
+        if bb_u is None or bb_l is None:
+            bandless_syms.append(sym)
         sym_iv_recorded = False
         for exp in expirations:
             full_chain = chains[exp]
@@ -1379,14 +1584,41 @@ def run_options_filter(
             in_range = chain[
                 (chain["premium_pct"] >= premium_pct_min) &
                 (chain["premium_pct"] <= premium_pct_max)
-            ]
+            ].copy()
+
+            # Where each strike sits on the underlying's Bollinger band.
+            if bb_u is not None and bb_l is not None:
+                in_range["strike_bb_pct"] = [
+                    None if pd.isna(s) else round(bb_pct_at(float(s), bb_u, bb_l), 1)
+                    for s in in_range["strike"]
+                ]
+            else:
+                in_range["strike_bb_pct"] = None
+
+            n_premium = len(in_range)
+            bb_note   = ""
+            if strike_bb_filter and bb_u is not None and bb_l is not None:
+                vals = pd.to_numeric(in_range["strike_bb_pct"], errors="coerce")
+                keep = (vals <= strike_bb_pct if right == "P"
+                        else vals >= strike_bb_pct)
+                in_range = in_range[keep.fillna(False)]
+                op      = "≤" if right == "P" else "≥"
+                bb_note = (f", {len(in_range)} with strike BB% "
+                           f"{op} {strike_bb_pct:.0f}")
+
+            oi_note = ""
+            if oi_min > 0:
+                oi = pd.to_numeric(in_range.get("open_interest"), errors="coerce")
+                in_range = in_range[oi.fillna(0) >= oi_min]
+                oi_note  = f", {len(in_range)} with OI ≥ {oi_min}"
             if on_log:
                 on_log(
                     f"  {sym}: {len(chain)} strikes, "
-                    f"{len(in_range)} in premium range "
+                    f"{n_premium} in premium range "
                     f"({premium_pct_min*100:.1f}%–{premium_pct_max*100:.1f}%)"
+                    f"{bb_note}{oi_note}"
                 )
-            chain = in_range.copy()
+            chain = in_range
             if chain.empty:
                 continue
 
@@ -1411,6 +1643,12 @@ def run_options_filter(
                 cushion_sigma = (round(otm_pct / sigma_pct, 2)
                                  if sigma_pct and otm_pct is not None else None)
 
+                # Back to a plain float: the column is numpy-typed, and the
+                # results are written to the cache as JSON.
+                strike_bb = opt.get("strike_bb_pct")
+                strike_bb = (None if strike_bb is None or pd.isna(strike_bb)
+                             else round(float(strike_bb), 1))
+
                 results.append({
                     "symbol":     sym,
                     "expiration": exp.strftime("%Y-%m-%d"),
@@ -1432,6 +1670,10 @@ def run_options_filter(
                     # LSO grade can both see where the underlying sits.
                     "rsi":           row.get("rsi"),
                     "bb_pct":        row.get("bb_pct"),
+                    # Where the strike sits on the same band the stock's BB% is
+                    # read from — a separate field, since the two read in
+                    # opposite directions and the LSO grade scores the stock's.
+                    "strike_bb_pct": strike_bb,
                     # What it costs to get back out. A position is only as
                     # rollable as its market is tight — on a deep-ITM strike the
                     # spread routinely exceeds the whole extrinsic value, so the
@@ -1440,6 +1682,13 @@ def run_options_filter(
                     "open_interest": (int(opt["open_interest"])
                                       if opt.get("open_interest") is not None else None),
                 })
+
+    if on_log and bandless_syms:
+        on_log(f"  No Bollinger edges for {len(bandless_syms)} symbol(s) — "
+               f"{', '.join(sorted(set(bandless_syms)))}. Their strike BB% is "
+               "blank" + (" and the strike BB% filter was not applied to them"
+                          if strike_bb_filter else "") +
+               "; re-run the Stock Scanner to refresh the candidates cache.")
 
     # Say it out loud. A missing IV blanks three columns and stands the primary
     # risk gate down, so it shouldn't be something you notice by spotting a gap.

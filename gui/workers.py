@@ -119,6 +119,9 @@ class OptionsWorker(QThread):
             "side":            c.get("side", "sell"),
             "premium_pct_min": c.get("premium_pct_min"),
             "premium_pct_max": c.get("premium_pct_max"),
+            "strike_bb_filter": c.get("strike_bb_filter", False),
+            "strike_bb_pct":    c.get("strike_bb_pct"),
+            "oi_min":           c.get("oi_min", 0),
         }
         return key
 
@@ -136,6 +139,22 @@ class OptionsWorker(QThread):
         if not candidates:
             self.error.emit("Stock scan returned no candidates — run the Stock Scanner first.")
             return None
+        # Explicit-list scans report every ticker and mark those outside the
+        # RSI/BB% thresholds (greyed out in the Stock Scanner). They're reference
+        # rows, not candidates, so they never reach an option chain. A universe
+        # scan has already dropped its failures, so nothing here is marked.
+        graded = [c for c in candidates if c.get("passes", True)]
+        skipped = len(candidates) - len(graded)
+        if skipped:
+            self.log_msg.emit(
+                f"Skipped {skipped} symbol(s) outside the RSI / BB% thresholds.")
+        candidates = graded
+        if not candidates:
+            self.error.emit(
+                "No candidates met the RSI / BB% thresholds — widen them in the "
+                "Stock Scanner and re-scan.")
+            return None
+
         candidates = self._apply_reject(candidates, "candidate")
         if not candidates:
             self.error.emit("All stock-scan candidates are on the reject list.")
@@ -185,7 +204,11 @@ class OptionsWorker(QThread):
 class LsoWorker(QThread):
     log_msg    = pyqtSignal(str)
     progress   = pyqtSignal(int, int)
-    finished   = pyqtSignal(list)
+    # (contracts, summary). The summary carries what was dropped: a stopped run
+    # returns analysis rows only for the symbols it reached, and the merge below
+    # silently discards the rest. Without the count, a truncated table is
+    # indistinguishable from a complete one — which is how QBTS went missing.
+    finished   = pyqtSignal(list, dict)
     error      = pyqtSignal(str)
 
     def __init__(self):
@@ -252,11 +275,13 @@ class LsoWorker(QThread):
         sym_analysis = {r["symbol"]: r for r in analysis}
 
         merged = []
+        skipped_symbols: set[str] = set()
         for contract in results:
             sym        = contract["symbol"]
             strike     = contract.get("strike")
             stock_price = price_lookup.get(sym)
             if sym not in sym_analysis:
+                skipped_symbols.add(sym)
                 continue
             if strike is not None and stock_price is not None:
                 otm_pct = round((stock_price - strike) / stock_price * 100, 2)
@@ -289,4 +314,17 @@ class LsoWorker(QThread):
                 "capital":     round(strike * 100) if strike is not None else None,
             })
 
-        self.finished.emit(merged)
+        summary = {
+            "cached":          len(results),
+            "analyzed":        len(merged),
+            "skipped":         len(results) - len(merged),
+            "skipped_symbols": sorted(skipped_symbols),
+            "stopped":         self._stop,
+        }
+        if summary["skipped"]:
+            self.log_msg.emit(
+                f"{summary['skipped']} contract(s) skipped — no analysis for "
+                f"{len(skipped_symbols)} symbol(s): "
+                f"{', '.join(summary['skipped_symbols'])}"
+                + (" (run stopped before reaching them)" if self._stop else ""))
+        self.finished.emit(merged, summary)

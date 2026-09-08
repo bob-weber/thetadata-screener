@@ -106,6 +106,9 @@ class PortfolioWindow(QMainWindow):
 
         # ── Shared top bar ────────────────────────────────────────────────────
         import_btn   = QPushButton("Import TOS CSV…")
+        export_btn   = QPushButton("Export for Chat…")
+        export_btn.setToolTip("Write live positions and tag exposure to a CSV "
+                              "file, ready to upload to a chat.")
         clear_btn    = QPushButton("Clear Account")
         account_lbl  = QLabel("Account:")
         account_lbl.setStyleSheet("font-weight: bold;")
@@ -140,6 +143,7 @@ class PortfolioWindow(QMainWindow):
         self._date_to.dateChanged.connect(self._emit_range)
 
         import_btn.clicked.connect(self._positions_tab.import_csv)
+        export_btn.clicked.connect(self._positions_tab.export_for_chat)
         clear_btn.clicked.connect(self._clear_account)
 
         self._positions_tab.status_changed.connect(status_lbl.setText)
@@ -147,6 +151,7 @@ class PortfolioWindow(QMainWindow):
 
         bar = QHBoxLayout()
         bar.addWidget(import_btn)
+        bar.addWidget(export_btn)
         bar.addWidget(clear_btn)
         bar.addSpacing(12)
         bar.addWidget(QLabel("Range:"))
