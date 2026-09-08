@@ -1053,8 +1053,8 @@ def run_price_screen(
 
 def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period,
                         bb_std_mult, rsi_threshold, bb_pct_threshold,
-                        append_live=True, apply_filters=True) -> dict | None:
-    """Apply the RSI/BB% filter to one close series; return a candidate row or None.
+                        append_live=True) -> dict | None:
+    """Measure RSI/BB% for one close series; return a row (None if unpriced).
 
     ``closes_list`` holds daily closes *through yesterday*. When ``append_live`` is
     set (a live trading session), the symbol's current quote from ``price_lookup``
@@ -1062,13 +1062,15 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     the prior session's close. ``closes_list`` already excludes today's bar, so this
     never double-counts.
 
-    With ``apply_filters`` off (an explicit ticker list) the thresholds are
-    measured but never reject: the point is to see where each of your own symbols
-    sits, so a symbol too new to compute an indicator still comes back, with
-    RSI/BB% blank. Every row then carries ``passes`` — whether it *would* have
-    survived the thresholds — so the GUI can grey the failures out and the
-    options scan can skip them. A symbol with no computable indicator can't be
-    confirmed as meeting them, so it fails.
+    The thresholds are measured but never reject. Every row carries ``passes`` —
+    whether it *would* have survived them — so the GUI can show the whole
+    price-screened list with each symbol's RSI and BB% beside it, grey the
+    failures, and let the options scan skip them. Rejecting here instead threw
+    away the only answer to "why didn't this one make it?", and it threw it away
+    before BB% was even computed: the old filter returned on a failing RSI, so a
+    symbol excluded on RSI had no BB% to show. A symbol too new to compute an
+    indicator still comes back, with RSI/BB% blank; it cannot be confirmed as
+    meeting the thresholds, so it fails.
     """
     live = price_lookup.get(sym)
     closes_list = list(closes_list)
@@ -1076,7 +1078,7 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
         closes_list.append(live)
     closes = pd.Series(closes_list, dtype=float)
     if len(closes) < bb_period + 2:
-        if apply_filters or live is None:
+        if live is None:
             return None
         return {"symbol": sym, "price": round(live, 2), "rsi": None,
                 "bb_pct": None, "bb_upper": None, "bb_lower": None,
@@ -1086,19 +1088,15 @@ def _evaluate_candidate(sym, closes_list, price_lookup, *, rsi_period, bb_period
     # threshold, so without this it would neither reject nor set `passes` — and a
     # universe scan would carry a blank-RSI row that its callers assume passed.
     if not np.isfinite(rsi):
-        if apply_filters or live is None:
+        if live is None:
             return None
         return {"symbol": sym, "price": round(live, 2), "rsi": None,
                 "bb_pct": None, "bb_upper": None, "bb_lower": None,
                 "hv": None, "passes": False}
-    if apply_filters and rsi >= rsi_threshold:
-        return None
     # The band edges travel with the row, not just the price's position on it:
     # the options pass re-reads them to place each strike on the same band.
     edges  = calc_bb_edges(closes, bb_period, bb_std_mult)
     bb_pct = (bb_pct_at(float(closes.iloc[-1]), *edges) if edges else 50.0)
-    if apply_filters and bb_pct >= bb_pct_threshold:
-        return None
     hv = calc_hv(closes)
     return {
         "symbol": sym,
@@ -1138,8 +1136,11 @@ def run_technical_filter(
     updated. ``use_cache=False`` forces a full refetch of every symbol (still
     updating the store).
 
-    On a my-stocks scan (``config["symbols"]``) the indicators are computed and
-    reported for every symbol rather than used to reject any.
+    Every price-screened symbol is returned, whether or not it met the
+    thresholds, each row carrying ``passes``. A universe scan used to drop its
+    failures, which meant the only record of *why* a symbol missed the cut was
+    discarded along with it. Callers filter on ``passes``: the Options Scanner
+    skips the failures, and the Stock Scanner greys them.
     """
     rsi_period       = config.get("rsi_period",       14)
     bb_period        = config.get("bb_period",        20)
@@ -1169,7 +1170,6 @@ def run_technical_filter(
         rsi_period=rsi_period, bb_period=bb_period, bb_std_mult=bb_std_mult,
         rsi_threshold=rsi_threshold, bb_pct_threshold=bb_pct_threshold,
         append_live=is_trading_today,
-        apply_filters=not _scan_symbols(config),
     )
 
     # ── Per-symbol history store: reuse what's current, fetch only the rest ────
@@ -1292,8 +1292,10 @@ def run_technical_filter(
         if cand is not None:
             tech_candidates.append(cand)
 
+    n_pass = sum(1 for c in tech_candidates if c.get("passes"))
     if on_log:
-        on_log(f"Technical filter done — {len(tech_candidates)} candidates.")
+        on_log(f"Technical filter done — {n_pass} of {len(tech_candidates)} "
+               f"symbols met the RSI / BB% thresholds.")
 
     Path(candidates_cache_file).write_text(json.dumps({
         **full_key,

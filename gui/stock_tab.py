@@ -40,8 +40,8 @@ def _parse_ticker_list(raw: str) -> list[str]:
             out.append(t)
     return out
 
-_PRICE_COLS    = ["symbol", "price"]
-_PRICE_HEADERS = ["Symbol", "Price"]
+_PRICE_COLS    = ["symbol", "price", "rsi", "bb_pct"]
+_PRICE_HEADERS = ["Symbol", "Price", "RSI", "BB%"]
 
 _COLS    = ["symbol", "price", "rsi", "bb_pct"]
 _HEADERS = ["Symbol", "Price", "RSI", "BB%"]
@@ -90,8 +90,9 @@ _FAIL_COLOR = QColor("#8a8a8a")   # greyed: measured, but outside the thresholds
 def _style_row(table: QTableWidget, r: int, row: dict, cols: list[str]):
     """Grey a row that was measured but missed the RSI/BB% thresholds.
 
-    Only explicit-list scans produce these — a universe scan drops such symbols
-    outright, so every row it returns passes and nothing is greyed.
+    Every scan produces these now: the technical pass measures the whole
+    price-screened list and rejects nothing, so the left-hand table shows why a
+    symbol missed the cut instead of it simply vanishing.
     """
     if row.get("passes", True):
         return
@@ -193,23 +194,38 @@ class StockScannerTab(QWidget):
     # ── startup cache loading ──────────────────────────────────────────────────
 
     def _load_cached_results(self):
-        self._load_cache(PRICE_CACHE, "qualified", self._price_table,
-                         self._price_box, _PRICE_COLS, "symbols")
+        # The candidates cache holds the same symbols as the price cache but with
+        # RSI/BB% attached, so it is the better source for the left table. The
+        # price cache is the fallback for a price scan with no technical pass yet.
+        if not self._load_cache(CANDIDATES_CACHE, "candidates", self._price_table,
+                                self._price_box, _PRICE_COLS, "symbols"):
+            self._load_cache(PRICE_CACHE, "qualified", self._price_table,
+                             self._price_box, _PRICE_COLS, "symbols")
         self._load_cache(CANDIDATES_CACHE, "candidates", self._cand_table,
-                         self._cand_box, _COLS, "candidates")
+                         self._cand_box, _COLS, "candidates",
+                         only_passing=True)
 
-    def _load_cache(self, path_str, key, table, box, cols, noun):
+    def _load_cache(self, path_str, key, table, box, cols, noun,
+                    only_passing: bool = False) -> bool:
+        """Fill ``table`` from a cache file. Returns whether anything was loaded."""
         path = Path(path_str)
         if not path.exists():
-            return
+            return False
         try:
             cached = json.loads(path.read_text())
         except Exception:
-            return
+            return False
         rows = cached.get(key, [])
-        ts   = cached.get("scanned_at") or cached.get("date", "unknown")
-        _fill_table(table, rows, cols)
-        box.setTitle(f"{box.property('_base')} — {len(rows)} {noun}  |  last scan: {ts}")
+        if not rows:
+            return False
+        ts    = cached.get("scanned_at") or cached.get("date", "unknown")
+        shown = [r for r in rows if r.get("passes")] if only_passing else rows
+        _fill_table(table, shown, cols)
+        title = f"{box.property('_base')} — {len(shown)} {noun}"
+        if not only_passing and any("passes" in r for r in rows):
+            title += f", {sum(1 for r in rows if r.get('passes'))} pass"
+        box.setTitle(f"{title}  |  last scan: {ts}")
+        return True
 
     # ── UI construction ─────────────────────────────────────────────────────────
 
@@ -585,7 +601,12 @@ class StockScannerTab(QWidget):
             f"Price-Screened — {self._price_table.rowCount()} symbols  |  scanning…")
 
     def _on_tech_found(self, rows: list):
-        _append_rows(self._cand_table, rows, _COLS)
+        # Pass 2 streams every measured symbol; only the passes are candidates.
+        # The left-hand table is refilled wholesale when the pass finishes rather
+        # than updated per row — it is already showing these symbols from pass 1,
+        # and it is user-sortable, so a row index captured here would not survive
+        # the user clicking a header mid-scan.
+        _append_rows(self._cand_table, [r for r in rows if r.get("passes")], _COLS)
         self._cand_box.setTitle(
             f"Technical Candidates — {self._cand_table.rowCount()} candidates  |  scanning…")
 
@@ -599,10 +620,20 @@ class StockScannerTab(QWidget):
     def _on_tech_finished(self, results: list):
         self._idle()
         self._tech_bar.setValue(100)
-        self._log.append(f"Technical scan done — {len(results)} candidate(s) found.")
+        passed = [r for r in results if r.get("passes")]
+        self._log.append(
+            f"Technical scan done — {len(passed)} of {len(results)} symbol(s) "
+            f"met the thresholds.")
         ts = self._read_scan_timestamp(CANDIDATES_CACHE)
-        _fill_table(self._cand_table, results, _COLS)
-        self._cand_box.setTitle(f"Technical Candidates — {len(results)} candidates  |  last scan: {ts}")
+        # Left: everything measured, failures greyed, so a miss is explainable.
+        # Right: the candidates the Options Scanner will actually see.
+        _fill_table(self._price_table, results, _PRICE_COLS)
+        self._price_box.setTitle(
+            f"Price-Screened — {len(results)} symbols, {len(passed)} pass"
+            f"  |  last scan: {ts}")
+        _fill_table(self._cand_table, passed, _COLS)
+        self._cand_box.setTitle(
+            f"Technical Candidates — {len(passed)} candidates  |  last scan: {ts}")
         self.scan_finished.emit()
 
     def _read_scan_timestamp(self, path_str: str) -> str:
