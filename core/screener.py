@@ -11,8 +11,8 @@ import pandas as pd
 import numpy as np
 
 
-def _us_market_holidays(year: int) -> set[date]:
-    """Return NYSE/Nasdaq market holidays for the given year."""
+def _us_market_holidays(year: int) -> dict[date, str]:
+    """Return NYSE/Nasdaq market holidays for the given year, date → name."""
     def nth_weekday(y, m, wd, n):
         first = date(y, m, 1)
         delta = (wd - first.weekday()) % 7
@@ -41,17 +41,31 @@ def _us_market_holidays(year: int) -> set[date]:
     good_friday = date(year, month, day) - timedelta(days=2)
 
     return {
-        observed(date(year, 1, 1)),          # New Year's Day
-        nth_weekday(year, 1, 0, 3),          # MLK Day        (3rd Mon Jan)
-        nth_weekday(year, 2, 0, 3),          # Presidents Day (3rd Mon Feb)
-        good_friday,                          # Good Friday
-        last_monday(year, 5),                 # Memorial Day   (last Mon May)
-        observed(date(year, 6, 19)),          # Juneteenth
-        observed(date(year, 7, 4)),           # Independence Day
-        nth_weekday(year, 9, 0, 1),          # Labor Day      (1st Mon Sep)
-        nth_weekday(year, 11, 3, 4),         # Thanksgiving   (4th Thu Nov)
-        observed(date(year, 12, 25)),         # Christmas
+        observed(date(year, 1, 1)):   "New Year's Day",
+        nth_weekday(year, 1, 0, 3):   "MLK Day",            # 3rd Mon Jan
+        nth_weekday(year, 2, 0, 3):   "Presidents Day",     # 3rd Mon Feb
+        good_friday:                  "Good Friday",
+        last_monday(year, 5):         "Memorial Day",       # last Mon May
+        observed(date(year, 6, 19)):  "Juneteenth",
+        observed(date(year, 7, 4)):   "Independence Day",
+        nth_weekday(year, 9, 0, 1):   "Labor Day",          # 1st Mon Sep
+        nth_weekday(year, 11, 3, 4):  "Thanksgiving",       # 4th Thu Nov
+        observed(date(year, 12, 25)): "Christmas",
     }
+
+
+def _weekday_holiday_name(d: date) -> str | None:
+    """The holiday closing the market on ``d``, or None (weekends included).
+
+    Weekends are deliberately excluded. A Saturday or Sunday scan gets full
+    greeks from Schwab — it keeps serving the last session's analytics through a
+    weekend — so "the market is closed" is not the thing that predicts missing
+    IV. A weekday holiday is: Schwab appears to roll to a new trading day and
+    reset the greeks for a session that never opens.
+    """
+    if d.weekday() >= 5:
+        return None
+    return (_us_market_holidays(d.year) | _us_market_holidays(d.year - 1)).get(d)
 
 
 def _last_trading_day(ref: date) -> date:
@@ -1451,6 +1465,21 @@ def run_options_filter(
             _atm_iv(df, px) is not None for df in chains.values())
 
     retry = sorted(s for s, ch in fetched.items() if ch and not _has_usable_iv(s, ch))
+    if retry and not any(_has_usable_iv(s, ch) for s, ch in fetched.items() if ch):
+        # Not one symbol in the whole run came back with an IV, so this is not
+        # the clustering the retry was written for — refetching every chain
+        # would double the API calls to recover nothing.
+        holiday = _weekday_holiday_name(today)
+        if on_log:
+            on_log(
+                f"  No usable IV on any of {len(retry)} symbols"
+                + (f" — the market is closed today ({holiday}) and Schwab "
+                   f"returns -999 in every greek field."
+                   if holiday else
+                   " — Schwab is returning -999 across the board.")
+                + " IV, σ-cushion and IV/HV will be blank for this scan; "
+                  "HV is unaffected. Skipping the retry pass.")
+        retry = []
     if retry:
         if on_log:
             on_log(f"  {len(retry)} symbol(s) came back with no usable IV "
