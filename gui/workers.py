@@ -204,7 +204,11 @@ class OptionsWorker(QThread):
 class LsoWorker(QThread):
     log_msg    = pyqtSignal(str)
     progress   = pyqtSignal(int, int)
-    finished   = pyqtSignal(list)
+    # (contracts, summary). The summary carries what was dropped: a stopped run
+    # returns analysis rows only for the symbols it reached, and the merge below
+    # silently discards the rest. Without the count, a truncated table is
+    # indistinguishable from a complete one — which is how QBTS went missing.
+    finished   = pyqtSignal(list, dict)
     error      = pyqtSignal(str)
 
     def __init__(self):
@@ -271,11 +275,13 @@ class LsoWorker(QThread):
         sym_analysis = {r["symbol"]: r for r in analysis}
 
         merged = []
+        skipped_symbols: set[str] = set()
         for contract in results:
             sym        = contract["symbol"]
             strike     = contract.get("strike")
             stock_price = price_lookup.get(sym)
             if sym not in sym_analysis:
+                skipped_symbols.add(sym)
                 continue
             if strike is not None and stock_price is not None:
                 otm_pct = round((stock_price - strike) / stock_price * 100, 2)
@@ -308,4 +314,17 @@ class LsoWorker(QThread):
                 "capital":     round(strike * 100) if strike is not None else None,
             })
 
-        self.finished.emit(merged)
+        summary = {
+            "cached":          len(results),
+            "analyzed":        len(merged),
+            "skipped":         len(results) - len(merged),
+            "skipped_symbols": sorted(skipped_symbols),
+            "stopped":         self._stop,
+        }
+        if summary["skipped"]:
+            self.log_msg.emit(
+                f"{summary['skipped']} contract(s) skipped — no analysis for "
+                f"{len(skipped_symbols)} symbol(s): "
+                f"{', '.join(summary['skipped_symbols'])}"
+                + (" (run stopped before reaching them)" if self._stop else ""))
+        self.finished.emit(merged, summary)

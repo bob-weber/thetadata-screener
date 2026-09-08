@@ -316,14 +316,25 @@ class LsoAnalysisTab(QWidget):
         if total > 0:
             self._progress_bar.setValue(int(current * 100 / total))
 
-    def _on_finished(self, results: list):
+    def _on_finished(self, results: list, summary: dict | None = None):
         self._results = results
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._export_btn.setEnabled(bool(results))
         self._progress_bar.setValue(100)
 
-        status = f"{len(results)} contracts analyzed."
+        summary = summary or {}
+        skipped = summary.get("skipped", 0)
+        if skipped:
+            # Lead with the shortfall: a partial table looks exactly like a
+            # complete one, so the count is the only way to notice a symbol
+            # never made it through.
+            status = (f"{len(results)} of {summary.get('cached', '?')} contracts "
+                      f"analyzed — {skipped} skipped"
+                      + (" (run stopped early)" if summary.get("stopped")
+                         else " (no analysis row)") + ".")
+        else:
+            status = f"{len(results)} contracts analyzed."
         untagged = sorted({r.get("symbol", "") for r in results
                            if not r.get("tags_researched")})
         if untagged:
@@ -331,7 +342,9 @@ class LsoAnalysisTab(QWidget):
                        f"durable-tags.json: {', '.join(untagged)}")
         self._status_label.setText(status)
 
-        self._log.append(f"Done — {len(results)} contracts analyzed.")
+        self._log.append(
+            f"Done — {len(results)} contracts analyzed"
+            + (f", {skipped} skipped." if skipped else "."))
         if untagged:
             self._log.append(
                 f"Not in durable-tags.json ({len(untagged)}): "
