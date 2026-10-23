@@ -141,7 +141,9 @@ class PortfolioTab(QWidget):
             try:
                 data = json.loads(path.read_text())
                 outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
-                return data.get("events", []), outcomes
+                events = data.get("events", [])
+                _drop_split_roll_duplicates(events)
+                return events, outcomes
             except Exception:
                 pass
         return [], {}
@@ -455,7 +457,8 @@ class PortfolioTab(QWidget):
         upgraded = 0
         for e in new_events:
             for old in by_uid.get(_event_uid(e), ()):
-                missing = [k for k in ("action", "roll") if k in e and k not in old]
+                missing = [k for k in ("action", "roll", "close_exp")
+                           if k in e and k not in old]
                 if missing:
                     old.update({k: e[k] for k in missing})
                     upgraded += 1
@@ -478,6 +481,10 @@ class PortfolioTab(QWidget):
             for _ in range(deficit):
                 self._events.append(templates[uid])
                 added_evs += 1
+
+        # A roll shown as one row here and as two legs in an overlapping
+        # statement has different uids, so the merge above keeps both.
+        added_evs -= _drop_split_roll_duplicates(self._events)
 
         self._outcomes.update(new_outcomes)
         self._save_events()
@@ -528,7 +535,7 @@ _SECTION_BREAKS = {"Profits and Losses", "Account Summary", "Equities",
 _TRD_CAL_RE = re.compile(
     r'(?:SOLD|BOT)\s+\S+\s+CALENDAR\s+([A-Z]{1,10})\s+100'
     r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'   # TO-OPEN expiration
-    r'/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'        # TO-CLOSE expiration (skip)
+    r'/(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'      # TO-CLOSE expiration
     r'\s+([\d.]+)\s+(PUT|CALL)',
     re.IGNORECASE,
 )
@@ -538,7 +545,7 @@ _TRD_CAL_RE = re.compile(
 _TRD_DIAG_RE = re.compile(
     r'(?:SOLD|BOT)\s+\S+\s+DIAGONAL\s+([A-Z]{1,10})\s+100'
     r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'   # TO-OPEN expiration
-    r'/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'        # TO-CLOSE expiration (skip)
+    r'/(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'      # TO-CLOSE expiration
     r'\s+([\d.]+)/([\d.]+)\s+(PUT|CALL)',   # TO-OPEN / TO-CLOSE strike
     re.IGNORECASE,
 )
@@ -862,14 +869,18 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
             # Specific spread shapes first: the single-leg pattern can't match
             # them (the symbol slot would have to be DIAGONAL/VERTICAL), so
             # without these the row is skipped and its cash never lands.
-            close_strike = None
+            close_strike = close_exp = None
             cal  = _TRD_CAL_RE.search(desc)
             diag = None if cal else _TRD_DIAG_RE.search(desc)
             vert = None if (cal or diag) else _TRD_VERT_RE.search(desc)
             m = cal or diag or vert or _TRD_SINGLE_RE.search(desc)
             if not m:
                 continue
-            if diag or vert:
+            if diag:
+                sym, exp, close_exp, strike, close_strike, otyp = m.groups()
+            elif cal:
+                sym, exp, close_exp, strike, otyp = m.groups()
+            elif vert:
                 sym, exp, strike, close_strike, otyp = m.groups()
             else:
                 sym, exp, strike, otyp = m.groups()
@@ -885,6 +896,8 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
                 "action": qm.group(1).upper() if qm else "SOLD",
                 "roll": roll is not None,
             }
+            if close_exp is not None:
+                ev["close_exp"] = _parse_exp(close_exp.strip())
             # A diagonal also retires a leg at a *different* strike, which lives
             # under its own cycle and would otherwise never learn it was closed.
             if close_strike is not None:
@@ -904,6 +917,49 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
                 "assigned": how.upper() == "UPON",
             })
     return events
+
+
+def _drop_split_roll_duplicates(events: list[dict]) -> int:
+    """Remove leg pairs that repeat a CALENDAR/DIAGONAL event, in place.
+
+    Statements don't agree on how to show a roll: one lists it as a single
+    CALENDAR/DIAGONAL row with its net credit, an overlapping one lists the
+    same order as its buy-to-close and sell-to-open legs. Their uids differ,
+    so both survive the merge and the roll's premium counts twice. A leg pair
+    is dropped only when it matches a roll's date, symbol, type, quantity,
+    strikes and (when the roll recorded it) to-close expiration, and its
+    amounts add up to the roll's. Returns the number of events removed.
+    """
+    singles: dict[tuple, list[int]] = {}
+    rolls: list[dict] = []
+    for i, e in enumerate(events):
+        if e.get("kind") != "opt" or "action" not in e:
+            continue
+        if e.get("roll"):
+            rolls.append(e)
+        elif not e.get("close_strike"):          # verticals carry one too
+            key = (e["date"], e["sym"], e["otype"], e["action"], e["qty"], e["strike"])
+            singles.setdefault(key, []).append(i)
+
+    drop: set[int] = set()
+    for r in rolls:
+        opp = "BOT" if r["action"] == "SOLD" else "SOLD"
+        opens  = singles.get((r["date"], r["sym"], r["otype"], r["action"],
+                              r["qty"], r["strike"]), [])
+        closes = singles.get((r["date"], r["sym"], r["otype"], opp, r["qty"],
+                              r.get("close_strike", r["strike"])), [])
+        pair = next(((a, b) for a in opens if a not in drop
+                     for b in closes if b not in drop
+                     if events[a]["exp"] == r["exp"]
+                     and events[b]["exp"] == r.get("close_exp", events[b]["exp"])
+                     and abs(events[a]["amount"] + events[b]["amount"]
+                             - r["amount"]) < 0.05), None)
+        if pair:
+            drop.update(pair)
+
+    if drop:
+        events[:] = [e for i, e in enumerate(events) if i not in drop]
+    return len(drop)
 
 
 def _parse_account(rows: list[list[str]]) -> str:
@@ -955,7 +1011,8 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                  "stock_pnl": 0.0, "stages": [], "put_strike": None, "put_exp": None,
                  "qty_by_exp": {}, "end_date": None, "shares": 0.0, "total_cost": 0.0,
                  "has_option": False, "has_put": False, "open_qty": 0,
-                 "roll_group": None, "qty_known": True, "closed_date": None}
+                 "roll_group": None, "qty_known": True, "closed_date": None,
+                 "live_key": key, "stock_qty": 0, "calls": {}}
             live[key] = c
             mine.append(c)
             cycles.append(c)
@@ -970,6 +1027,56 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                 if c["shares"] > 0:
                     return c
             return None
+
+        def _holders():
+            return [c for c in live.values() if c["shares"] > 0]
+
+        def _open_calls(c, on):
+            """Contracts of calls still open on this cycle as of `on`. Expiring
+            worthless leaves no event, so a call past its expiration is over."""
+            return sum(q for (_, exp), q in c["calls"].items()
+                       if q > 0 and (_parse_mdy(exp) or date.max) >= on)
+
+        def _call_holder(e):
+            """The share cycle a call belongs to, when more than one holds shares.
+
+            A call can't say which lot it covers, so closing one goes to the
+            cycle that has it open, and a new one goes to the cycle with
+            uncovered shares — the one whose free contracts match exactly,
+            if any does.
+            """
+            holders = _holders()
+            if len(holders) <= 1:
+                return holders[0] if holders else None
+            on = _parse_mdy(e["date"]) or date.min
+            if e.get("action") == "BOT" or e.get("roll"):
+                # A roll's to-close leg says which call it replaces.
+                leg = ((e.get("close_strike") or e["strike"], e.get("close_exp"))
+                       if e.get("roll") else (e["strike"], e["exp"]))
+                for c in holders:
+                    if c["calls"].get(leg, 0) > 0:
+                        return c
+                if e.get("action") == "BOT":
+                    return holders[0]
+            free = [(int(c["shares"] // 100) - _open_calls(c, on), c) for c in holders]
+            for f, c in free:
+                if f == e["qty"]:
+                    return c
+            return next((c for f, c in free if f >= e["qty"]),
+                        next((c for f, c in free if f > 0), holders[0]))
+
+        def _sale_holder(e):
+            """The share cycle a stock sale comes out of. Called away settles at
+            the call's strike, which finds the cycle that wrote that call."""
+            holders = _holders()
+            if len(holders) <= 1 or not e["assigned"] or not e["shares"]:
+                return holders[0] if holders else None
+            px = e["amount"] / e["shares"]
+            wrote = [c for c in holders
+                     if any(q > 0 and abs(float(k) - px) < 0.005
+                            for (k, _), q in c["calls"].items())]
+            return next((c for c in wrote if c["shares"] >= e["shares"]),
+                        wrote[0] if wrote else holders[0])
 
         for e in evs:
             if e["kind"] == "opt":
@@ -987,11 +1094,12 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         # A cycle that went flat today at another strike is this
                         # position rolled — carry it over under the new strike.
                         rolled = next((c for k, c in live.items()
-                                       if c["open_qty"] == 0
+                                       if c["open_qty"] == 0 and c["shares"] <= 0
                                        and c["closed_date"] == e["date"]), None)
                         if rolled is not None:
-                            _retire(rolled["put_strike"])
+                            _retire(rolled["live_key"])
                             live[key] = rolled
+                            rolled["live_key"] = key
                             cycle = rolled
                     if cycle is None:
                         cycle = _new(key, e["date"])
@@ -1037,7 +1145,16 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                 else:
                     # A call belongs to whichever position holds the shares it
                     # covers; with none assigned it rides the newest cycle.
-                    cycle = _holder() or (mine[-1] if mine else _new(e["strike"], e["date"]))
+                    cycle = _call_holder(e) or (mine[-1] if mine else _new(e["strike"], e["date"]))
+                    # Open calls per (strike, exp), so a later close, roll or
+                    # called-away sale can find the cycle that wrote them.
+                    if e.get("action") in ("SOLD", "BOT"):
+                        if e.get("roll") and e.get("close_exp"):
+                            old = (e.get("close_strike") or e["strike"], e["close_exp"])
+                            cycle["calls"][old] = max(cycle["calls"].get(old, 0) - e["qty"], 0)
+                        leg = (e["strike"], e["exp"])
+                        signed = -e["qty"] if e["action"] == "BOT" else e["qty"]
+                        cycle["calls"][leg] = max(cycle["calls"].get(leg, 0) + signed, 0)
                     cycle["has_option"] = True
                     cycle["premium"]   += e["amount"]
                     cycle["fees"]      += e["fees"]
@@ -1060,14 +1177,81 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         cycle = _holder()
                         if cycle is None:
                             continue
+                    if e["assigned"] and cycle.get("open_qty"):
+                        # Assignment retires the contracts it exercised — 300
+                        # shares is three of them. Without this the puts stay on
+                        # the books after the shares arrive, and the row counts
+                        # capital that is no longer at risk.
+                        taken = min(int(e["shares"] // 100), cycle["open_qty"])
+                        cycle["open_qty"] -= taken
+                        exp = cycle["put_exp"]
+                        if exp in cycle["qty_by_exp"]:
+                            cycle["qty_by_exp"][exp] = max(
+                                cycle["qty_by_exp"][exp] - taken, 0)
+                        # The shares live under their own key, so a new put
+                        # sold at this strike starts a fresh cycle instead of
+                        # finding the share holder flat and retiring it.
+                        stock_key = f"{cycle['live_key']}#stock"
+                        stock = live.get(stock_key)
+                        if taken and stock is None and cycle["open_qty"] == 0:
+                            # Fully assigned: the whole position is shares now.
+                            _retire(cycle["live_key"])
+                            cycle["live_key"] = stock_key
+                            live[stock_key] = cycle
+                        elif taken:
+                            # Only part of the position was assigned (or an
+                            # earlier part already was), so it is two things at
+                            # one strike: the shares (which will carry the
+                            # covered calls) and the puts still short. One row
+                            # cannot say both — status, expiration and capital
+                            # would each have to describe one and lie about the
+                            # other — so the shares go to one share cycle and
+                            # the puts keep this one. Premium follows the
+                            # contracts pro rata: the assigned ones' share
+                            # reduces the stock's basis, the rest stays open.
+                            share = taken / (taken + cycle["open_qty"])
+                            if stock is None:
+                                stock = _new(stock_key, e["date"])
+                                stock["has_option"] = True
+                                stock["has_put"]    = True
+                                stock["stages"]     = list(cycle["stages"])
+                                stock["open_date"]  = cycle["open_date"]
+                            stock["put_strike"] = cycle["put_strike"]
+                            stock["put_exp"]    = cycle["put_exp"]
+                            moved_prem = round(cycle["premium"] * share, 2)
+                            moved_fees = round(cycle["fees"] * share, 2)
+                            stock["premium"] += moved_prem
+                            stock["fees"]    += moved_fees
+                            cycle["premium"] -= moved_prem
+                            cycle["fees"]    -= moved_fees
+                            if cycle["open_qty"] == 0:
+                                # The last of the puts joined the shares; this
+                                # row has nothing left to describe.
+                                _retire(cycle["live_key"])
+                                cycle["merged"] = True
+                            else:
+                                cycle["closed_date"] = None
+                            cycle = stock
                     cycle["fees"]       += e["fees"]
                     cycle["shares"]     += e["shares"]
                     cycle["total_cost"] += abs(e["amount"])
+                    # Contracts-equivalent of the stock taken on. Retiring the
+                    # assigned puts above empties qty_by_exp, so this is what the
+                    # row counts once the position is shares rather than options.
+                    cycle["stock_qty"]  = cycle.get("stock_qty", 0) + int(e["shares"] // 100)
                     cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
                 else:  # SOLD
-                    cycle = _holder()
+                    cycle = _sale_holder(e)
                     if cycle is None:
                         continue
+                    if e["assigned"] and e["shares"]:
+                        # The exercised calls are spent.
+                        px, left = e["amount"] / e["shares"], int(e["shares"] // 100)
+                        for leg, q in cycle["calls"].items():
+                            if left and q > 0 and abs(float(leg[0]) - px) < 0.005:
+                                used = min(q, left)
+                                cycle["calls"][leg] -= used
+                                left -= used
                     cycle["fees"] += e["fees"]
                     shares, total_cost = cycle["shares"], cycle["total_cost"]
                     if shares > 0:
@@ -1081,17 +1265,18 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                     cycle["stages"].append("Called away" if e["assigned"] else "Sold")
                     cycle["end_date"] = e["date"]
                     if cycle["shares"] <= 0:
-                        _retire(cycle["put_strike"])
+                        _retire(cycle["live_key"])
 
     # Only wheel cycles (those with at least one option leg) belong here;
     # pure stock buys/sells live in the Long Stock Positions table.
-    rows = [_cycle_to_row(c, outcomes) for c in cycles if c["has_option"]]
+    rows = [_cycle_to_row(c, outcomes) for c in cycles
+            if c["has_option"] and not c.get("merged")]
     return rows + _blended_rows(rows)
 
 
 def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     strike = float(c["put_strike"]) if c["put_strike"] else 0.0
-    qty    = c["qty_by_exp"].get(c["put_exp"], 0)
+    qty    = c["qty_by_exp"].get(c["put_exp"], 0) or c.get("stock_qty", 0)
     premium    = round(c["premium"], 2)
     fees       = round(c["fees"], 2)
     stock_pnl  = round(c["stock_pnl"], 2)
