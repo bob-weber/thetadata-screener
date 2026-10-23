@@ -1011,7 +1011,8 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                  "stock_pnl": 0.0, "stages": [], "put_strike": None, "put_exp": None,
                  "qty_by_exp": {}, "end_date": None, "shares": 0.0, "total_cost": 0.0,
                  "has_option": False, "has_put": False, "open_qty": 0,
-                 "roll_group": None, "qty_known": True, "closed_date": None}
+                 "roll_group": None, "qty_known": True, "closed_date": None,
+                 "live_key": key, "stock_qty": 0}
             live[key] = c
             mine.append(c)
             cycles.append(c)
@@ -1046,8 +1047,9 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                                        if c["open_qty"] == 0
                                        and c["closed_date"] == e["date"]), None)
                         if rolled is not None:
-                            _retire(rolled["put_strike"])
+                            _retire(rolled["live_key"])
                             live[key] = rolled
+                            rolled["live_key"] = key
                             cycle = rolled
                     if cycle is None:
                         cycle = _new(key, e["date"])
@@ -1116,9 +1118,48 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         cycle = _holder()
                         if cycle is None:
                             continue
+                    if e["assigned"] and cycle.get("open_qty"):
+                        # Assignment retires the contracts it exercised — 300
+                        # shares is three of them. Without this the puts stay on
+                        # the books after the shares arrive, and the row counts
+                        # capital that is no longer at risk.
+                        taken = min(int(e["shares"] // 100), cycle["open_qty"])
+                        cycle["open_qty"] -= taken
+                        exp = cycle["put_exp"]
+                        if exp in cycle["qty_by_exp"]:
+                            cycle["qty_by_exp"][exp] = max(
+                                cycle["qty_by_exp"][exp] - taken, 0)
+                        if cycle["open_qty"] > 0 and taken:
+                            # Only part of the position was assigned, so it is now
+                            # two things at one strike: the shares (which will
+                            # carry the covered calls) and the puts still short.
+                            # One row cannot say both — status, expiration and
+                            # capital would each have to describe one and lie
+                            # about the other — so the shares move to their own
+                            # cycle and the puts keep this one. Premium follows
+                            # the contracts pro rata: the assigned ones' share
+                            # reduces the stock's basis, the rest stays open.
+                            share = taken / (taken + cycle["open_qty"])
+                            stock = _new(f"{cycle['live_key']}#stock", e["date"])
+                            stock["has_option"]  = True
+                            stock["has_put"]     = True
+                            stock["put_strike"]  = cycle["put_strike"]
+                            stock["put_exp"]     = cycle["put_exp"]
+                            stock["stages"]      = list(cycle["stages"])
+                            stock["open_date"]   = cycle["open_date"]
+                            stock["premium"]     = round(cycle["premium"] * share, 2)
+                            stock["fees"]        = round(cycle["fees"] * share, 2)
+                            cycle["premium"]    -= stock["premium"]
+                            cycle["fees"]       -= stock["fees"]
+                            cycle["closed_date"] = None
+                            cycle = stock
                     cycle["fees"]       += e["fees"]
                     cycle["shares"]     += e["shares"]
                     cycle["total_cost"] += abs(e["amount"])
+                    # Contracts-equivalent of the stock taken on. Retiring the
+                    # assigned puts above empties qty_by_exp, so this is what the
+                    # row counts once the position is shares rather than options.
+                    cycle["stock_qty"]  = cycle.get("stock_qty", 0) + int(e["shares"] // 100)
                     cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
                 else:  # SOLD
                     cycle = _holder()
@@ -1137,7 +1178,7 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                     cycle["stages"].append("Called away" if e["assigned"] else "Sold")
                     cycle["end_date"] = e["date"]
                     if cycle["shares"] <= 0:
-                        _retire(cycle["put_strike"])
+                        _retire(cycle["live_key"])
 
     # Only wheel cycles (those with at least one option leg) belong here;
     # pure stock buys/sells live in the Long Stock Positions table.
@@ -1147,7 +1188,7 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
 
 def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     strike = float(c["put_strike"]) if c["put_strike"] else 0.0
-    qty    = c["qty_by_exp"].get(c["put_exp"], 0)
+    qty    = c["qty_by_exp"].get(c["put_exp"], 0) or c.get("stock_qty", 0)
     premium    = round(c["premium"], 2)
     fees       = round(c["fees"], 2)
     stock_pnl  = round(c["stock_pnl"], 2)
