@@ -1012,7 +1012,7 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                  "qty_by_exp": {}, "end_date": None, "shares": 0.0, "total_cost": 0.0,
                  "has_option": False, "has_put": False, "open_qty": 0,
                  "roll_group": None, "qty_known": True, "closed_date": None,
-                 "live_key": key, "stock_qty": 0}
+                 "live_key": key, "stock_qty": 0, "calls": {}}
             live[key] = c
             mine.append(c)
             cycles.append(c)
@@ -1027,6 +1027,56 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                 if c["shares"] > 0:
                     return c
             return None
+
+        def _holders():
+            return [c for c in live.values() if c["shares"] > 0]
+
+        def _open_calls(c, on):
+            """Contracts of calls still open on this cycle as of `on`. Expiring
+            worthless leaves no event, so a call past its expiration is over."""
+            return sum(q for (_, exp), q in c["calls"].items()
+                       if q > 0 and (_parse_mdy(exp) or date.max) >= on)
+
+        def _call_holder(e):
+            """The share cycle a call belongs to, when more than one holds shares.
+
+            A call can't say which lot it covers, so closing one goes to the
+            cycle that has it open, and a new one goes to the cycle with
+            uncovered shares — the one whose free contracts match exactly,
+            if any does.
+            """
+            holders = _holders()
+            if len(holders) <= 1:
+                return holders[0] if holders else None
+            on = _parse_mdy(e["date"]) or date.min
+            if e.get("action") == "BOT" or e.get("roll"):
+                # A roll's to-close leg says which call it replaces.
+                leg = ((e.get("close_strike") or e["strike"], e.get("close_exp"))
+                       if e.get("roll") else (e["strike"], e["exp"]))
+                for c in holders:
+                    if c["calls"].get(leg, 0) > 0:
+                        return c
+                if e.get("action") == "BOT":
+                    return holders[0]
+            free = [(int(c["shares"] // 100) - _open_calls(c, on), c) for c in holders]
+            for f, c in free:
+                if f == e["qty"]:
+                    return c
+            return next((c for f, c in free if f >= e["qty"]),
+                        next((c for f, c in free if f > 0), holders[0]))
+
+        def _sale_holder(e):
+            """The share cycle a stock sale comes out of. Called away settles at
+            the call's strike, which finds the cycle that wrote that call."""
+            holders = _holders()
+            if len(holders) <= 1 or not e["assigned"] or not e["shares"]:
+                return holders[0] if holders else None
+            px = e["amount"] / e["shares"]
+            wrote = [c for c in holders
+                     if any(q > 0 and abs(float(k) - px) < 0.005
+                            for (k, _), q in c["calls"].items())]
+            return next((c for c in wrote if c["shares"] >= e["shares"]),
+                        wrote[0] if wrote else holders[0])
 
         for e in evs:
             if e["kind"] == "opt":
@@ -1095,7 +1145,16 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                 else:
                     # A call belongs to whichever position holds the shares it
                     # covers; with none assigned it rides the newest cycle.
-                    cycle = _holder() or (mine[-1] if mine else _new(e["strike"], e["date"]))
+                    cycle = _call_holder(e) or (mine[-1] if mine else _new(e["strike"], e["date"]))
+                    # Open calls per (strike, exp), so a later close, roll or
+                    # called-away sale can find the cycle that wrote them.
+                    if e.get("action") in ("SOLD", "BOT"):
+                        if e.get("roll") and e.get("close_exp"):
+                            old = (e.get("close_strike") or e["strike"], e["close_exp"])
+                            cycle["calls"][old] = max(cycle["calls"].get(old, 0) - e["qty"], 0)
+                        leg = (e["strike"], e["exp"])
+                        signed = -e["qty"] if e["action"] == "BOT" else e["qty"]
+                        cycle["calls"][leg] = max(cycle["calls"].get(leg, 0) + signed, 0)
                     cycle["has_option"] = True
                     cycle["premium"]   += e["amount"]
                     cycle["fees"]      += e["fees"]
@@ -1182,9 +1241,17 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                     cycle["stock_qty"]  = cycle.get("stock_qty", 0) + int(e["shares"] // 100)
                     cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
                 else:  # SOLD
-                    cycle = _holder()
+                    cycle = _sale_holder(e)
                     if cycle is None:
                         continue
+                    if e["assigned"] and e["shares"]:
+                        # The exercised calls are spent.
+                        px, left = e["amount"] / e["shares"], int(e["shares"] // 100)
+                        for leg, q in cycle["calls"].items():
+                            if left and q > 0 and abs(float(leg[0]) - px) < 0.005:
+                                used = min(q, left)
+                                cycle["calls"][leg] -= used
+                                left -= used
                     cycle["fees"] += e["fees"]
                     shares, total_cost = cycle["shares"], cycle["total_cost"]
                     if shares > 0:
