@@ -494,6 +494,7 @@ def _net_same_day_rolls(legs: list[tuple[date, dict]]) -> None:
                 match = max(opens, key=lambda o: abs(o["amount"]))
             match["amount"] += close["amount"]
             close["amount"] = 0.0
+            close["carry_to"] = match    # where the closed leg's unaccrued premium goes
 
 
 def _bdays(start: date, end: date) -> list[date]:
@@ -555,6 +556,14 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
     allocated is the average over days a position is open. Weekly RoR = weekly
     realized / weekly allocated. A roll placed as two orders is netted into one
     event first — see ``_net_same_day_rolls``.
+
+    A leg that's superseded before its expiration books only the days it was
+    held, at the rate it would have earned to expiration; the rest carries
+    into whatever superseded it. Booking all of it into the held days instead
+    front-loads income — the roll that replaces it pays the buyback out of its
+    own net credit, which accrues forward — and means importing next week's
+    trades rewrites this week's figure. With the carry, a day's premium never
+    changes once later trades arrive.
     """
     parsed: list[tuple[date, dict]] = []
     for t in data.get("opt_trades", []):
@@ -586,7 +595,7 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
             closing_leg = {
                 "action": "BOT", "qty": leg["qty"], "symbol": leg["symbol"],
                 "exp": trade_d, "strike": close_strike, "type": leg["type"],
-                "is_roll": False, "amount": 0.0,
+                "is_roll": False, "amount": 0.0, "carry_to": leg,
             }
             legs_by_key.setdefault(
                 (leg["symbol"], close_strike, leg["type"]), []).append(
@@ -603,6 +612,9 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
     # single contract of collateral, understating capital at risk sixfold.
     daily_prem:   dict[date, float] = {}
     daily_collat: dict[date, float] = {}
+    # id(leg) → (leg, days it books premium on, days it would accrue over)
+    plans: dict[int, tuple[dict, list[date], int]] = {}
+    succ:  dict[int, dict] = {}      # id(leg) → leg its unaccrued premium carries to
     for events in legs_by_key.values():
         events.sort(key=lambda e: e[0])
         open_qty = 0
@@ -620,33 +632,60 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
 
             next_date = events[i + 1][0] if i + 1 < len(events) else None
             same_day_superseded = next_date is not None and next_date <= ev_date
-            # The premium window always collapses to at least ev_date itself
-            # (via _bdays's own start/end clamp) even when superseded same-day,
-            # so every trade's cash is booked somewhere — it's never dropped.
-            # A last event that leaves nothing open (a close with no later
-            # roll) has nothing left to project forward — it books entirely on
-            # its own trade date rather than smoothing out to its parsed
-            # expiration, which is only a meaningful projection while a
-            # position is still actually open.
-            if next_date is not None:
-                window_end = min(next_date - timedelta(days=1), leg["exp"])
-            elif open_qty > 0:
-                window_end = leg["exp"]
+            # A leg accrues to its expiration while it's open. One that leaves
+            # nothing open (a close) has nothing to project forward and books
+            # on its own trade date — unless it was rolled into a leg on
+            # another strike, which then takes everything it was carrying.
+            planned = _bdays(ev_date, leg["exp"] if open_qty > 0 else ev_date)
+            target  = leg.get("carry_to")
+            if (target is not None and open_qty <= 0
+                    and all(l is not target for _, l in events[:i])):
+                held = []
+                succ[id(leg)] = target
+            elif next_date is None:
+                held = planned
             else:
-                window_end = ev_date
-            bdays   = _bdays(ev_date, window_end)
-            per_day = leg["amount"] / len(bdays)
-            for d in bdays:
-                daily_prem[d] = daily_prem.get(d, 0.0) + per_day
+                held = [] if same_day_superseded else [d for d in planned if d < next_date]
+                succ[id(leg)] = events[i + 1][1]
+            plans[id(leg)] = (leg, held, len(planned))
 
             # Collateral, unlike premium, is skipped for a same-day-superseded
             # leg — it never carried overnight risk, so it shouldn't stack with
             # whatever replaced it on that same day.
             if same_day_superseded or open_qty <= 0 or leg["type"] != "PUT":
                 continue
+            window_end = (min(next_date - timedelta(days=1), leg["exp"])
+                          if next_date is not None else leg["exp"])
             collat = leg["strike"] * 100 * open_qty
-            for d in bdays:
+            for d in _bdays(ev_date, window_end):
                 daily_collat[d] = daily_collat.get(d, 0.0) + collat
+
+    # Book premium in carry order: a leg is booked only once everything
+    # carrying into it has been, so its total includes what it inherited.
+    carry: dict[int, float] = {k: 0.0 for k in plans}
+    waiting = Counter(id(t) for t in succ.values())
+    ready = [k for k in plans if not waiting[k]]
+    while ready:
+        k = ready.pop()
+        leg, held, n_planned = plans.pop(k)
+        total   = leg["amount"] + carry[k]
+        per_day = total / n_planned
+        for d in held:
+            daily_prem[d] = daily_prem.get(d, 0.0) + per_day
+        rest = total - per_day * len(held)
+        nxt = id(succ[k]) if k in succ else None
+        if nxt in carry:
+            carry[nxt] += rest
+            waiting[nxt] -= 1
+            if not waiting[nxt]:
+                ready.append(nxt)
+        elif rest:
+            day = held[-1] if held else leg["exp"]
+            daily_prem[day] = daily_prem.get(day, 0.0) + rest
+    # Nothing should be left, but never drop cash if the carries ever loop.
+    for k, (leg, held, _) in plans.items():
+        day = held[0] if held else leg["exp"]
+        daily_prem[day] = daily_prem.get(day, 0.0) + leg["amount"] + carry[k]
 
     # Stock realized gain/loss, all on the day of sale.
     for d, r in _stock_realized_by_date(data).items():
