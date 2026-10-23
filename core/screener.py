@@ -341,12 +341,17 @@ def _fetch_schwab_chain(client, symbol: str, right: str, to_date: date) -> dict:
             exp_d = date.fromisoformat(exp_key.split(":")[0])
         except ValueError:
             continue
+        # A strike can list an adjusted contract (e.g. IONQ1, deliverable "48 IONQ,
+        # $1535.23") beside the standard one. Its premium buys a different
+        # deliverable, so it isn't comparable to the 100-share contract — and
+        # Schwab gives it no greeks (-999) and a near-empty book. Drop it.
         rows = [
             {"strike": c.get("strikePrice"), "bid": c.get("bid"),
              "ask": c.get("ask"), "delta": c.get("delta"),
              "iv": c.get("volatility"),          # annualized IV %, per contract
              "open_interest": c.get("openInterest")}
             for contracts in strikes.values() for c in contracts
+            if not c.get("nonStandard")
         ]
         if rows:
             chains[exp_d] = pd.DataFrame(rows)
