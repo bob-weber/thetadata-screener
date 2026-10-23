@@ -141,7 +141,9 @@ class PortfolioTab(QWidget):
             try:
                 data = json.loads(path.read_text())
                 outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
-                return data.get("events", []), outcomes
+                events = data.get("events", [])
+                _drop_split_roll_duplicates(events)
+                return events, outcomes
             except Exception:
                 pass
         return [], {}
@@ -455,7 +457,8 @@ class PortfolioTab(QWidget):
         upgraded = 0
         for e in new_events:
             for old in by_uid.get(_event_uid(e), ()):
-                missing = [k for k in ("action", "roll") if k in e and k not in old]
+                missing = [k for k in ("action", "roll", "close_exp")
+                           if k in e and k not in old]
                 if missing:
                     old.update({k: e[k] for k in missing})
                     upgraded += 1
@@ -478,6 +481,10 @@ class PortfolioTab(QWidget):
             for _ in range(deficit):
                 self._events.append(templates[uid])
                 added_evs += 1
+
+        # A roll shown as one row here and as two legs in an overlapping
+        # statement has different uids, so the merge above keeps both.
+        added_evs -= _drop_split_roll_duplicates(self._events)
 
         self._outcomes.update(new_outcomes)
         self._save_events()
@@ -528,7 +535,7 @@ _SECTION_BREAKS = {"Profits and Losses", "Account Summary", "Equities",
 _TRD_CAL_RE = re.compile(
     r'(?:SOLD|BOT)\s+\S+\s+CALENDAR\s+([A-Z]{1,10})\s+100'
     r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'   # TO-OPEN expiration
-    r'/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'        # TO-CLOSE expiration (skip)
+    r'/(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'      # TO-CLOSE expiration
     r'\s+([\d.]+)\s+(PUT|CALL)',
     re.IGNORECASE,
 )
@@ -538,7 +545,7 @@ _TRD_CAL_RE = re.compile(
 _TRD_DIAG_RE = re.compile(
     r'(?:SOLD|BOT)\s+\S+\s+DIAGONAL\s+([A-Z]{1,10})\s+100'
     r'.*?(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'   # TO-OPEN expiration
-    r'/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'        # TO-CLOSE expiration (skip)
+    r'/(\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'      # TO-CLOSE expiration
     r'\s+([\d.]+)/([\d.]+)\s+(PUT|CALL)',   # TO-OPEN / TO-CLOSE strike
     re.IGNORECASE,
 )
@@ -862,14 +869,18 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
             # Specific spread shapes first: the single-leg pattern can't match
             # them (the symbol slot would have to be DIAGONAL/VERTICAL), so
             # without these the row is skipped and its cash never lands.
-            close_strike = None
+            close_strike = close_exp = None
             cal  = _TRD_CAL_RE.search(desc)
             diag = None if cal else _TRD_DIAG_RE.search(desc)
             vert = None if (cal or diag) else _TRD_VERT_RE.search(desc)
             m = cal or diag or vert or _TRD_SINGLE_RE.search(desc)
             if not m:
                 continue
-            if diag or vert:
+            if diag:
+                sym, exp, close_exp, strike, close_strike, otyp = m.groups()
+            elif cal:
+                sym, exp, close_exp, strike, otyp = m.groups()
+            elif vert:
                 sym, exp, strike, close_strike, otyp = m.groups()
             else:
                 sym, exp, strike, otyp = m.groups()
@@ -885,6 +896,8 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
                 "action": qm.group(1).upper() if qm else "SOLD",
                 "roll": roll is not None,
             }
+            if close_exp is not None:
+                ev["close_exp"] = _parse_exp(close_exp.strip())
             # A diagonal also retires a leg at a *different* strike, which lives
             # under its own cycle and would otherwise never learn it was closed.
             if close_strike is not None:
@@ -904,6 +917,49 @@ def _collect_cash_events(rows: list[list[str]]) -> list[dict]:
                 "assigned": how.upper() == "UPON",
             })
     return events
+
+
+def _drop_split_roll_duplicates(events: list[dict]) -> int:
+    """Remove leg pairs that repeat a CALENDAR/DIAGONAL event, in place.
+
+    Statements don't agree on how to show a roll: one lists it as a single
+    CALENDAR/DIAGONAL row with its net credit, an overlapping one lists the
+    same order as its buy-to-close and sell-to-open legs. Their uids differ,
+    so both survive the merge and the roll's premium counts twice. A leg pair
+    is dropped only when it matches a roll's date, symbol, type, quantity,
+    strikes and (when the roll recorded it) to-close expiration, and its
+    amounts add up to the roll's. Returns the number of events removed.
+    """
+    singles: dict[tuple, list[int]] = {}
+    rolls: list[dict] = []
+    for i, e in enumerate(events):
+        if e.get("kind") != "opt" or "action" not in e:
+            continue
+        if e.get("roll"):
+            rolls.append(e)
+        elif not e.get("close_strike"):          # verticals carry one too
+            key = (e["date"], e["sym"], e["otype"], e["action"], e["qty"], e["strike"])
+            singles.setdefault(key, []).append(i)
+
+    drop: set[int] = set()
+    for r in rolls:
+        opp = "BOT" if r["action"] == "SOLD" else "SOLD"
+        opens  = singles.get((r["date"], r["sym"], r["otype"], r["action"],
+                              r["qty"], r["strike"]), [])
+        closes = singles.get((r["date"], r["sym"], r["otype"], opp, r["qty"],
+                              r.get("close_strike", r["strike"])), [])
+        pair = next(((a, b) for a in opens if a not in drop
+                     for b in closes if b not in drop
+                     if events[a]["exp"] == r["exp"]
+                     and events[b]["exp"] == r.get("close_exp", events[b]["exp"])
+                     and abs(events[a]["amount"] + events[b]["amount"]
+                             - r["amount"]) < 0.05), None)
+        if pair:
+            drop.update(pair)
+
+    if drop:
+        events[:] = [e for i, e in enumerate(events) if i not in drop]
+    return len(drop)
 
 
 def _parse_account(rows: list[list[str]]) -> str:

@@ -154,6 +154,7 @@ def _load_history(path: Path) -> dict:
             data = json.loads(path.read_text())
             for k in ("deposits", "balances", "opt_trades", "stk_trades"):
                 data.setdefault(k, [])
+            _drop_split_roll_duplicates(data["opt_trades"])
             return data
         except Exception:
             pass
@@ -206,7 +207,7 @@ def _merge_counted(existing: list[dict], new: list[dict], key_fn) -> int:
 
 def merge_statement(data: dict, parsed: dict) -> dict:
     """Merge a parsed statement into accumulated history. Returns counts added."""
-    return {
+    counts = {
         "deposits":   _merge(data["deposits"],   parsed["deposits"],
                              lambda e: e["ref"] or (e["date"], e["amount"])),
         "balances":   _merge(data["balances"],   parsed["balances"],
@@ -216,6 +217,10 @@ def merge_statement(data: dict, parsed: dict) -> dict:
         "stk_trades": _merge_counted(data["stk_trades"], parsed["stk_trades"],
                                      lambda e: (e["date"], e["desc"], e["amount"])),
     }
+    # A roll shown as one row here and as two legs in an overlapping
+    # statement merges as two different trades.
+    counts["opt_trades"] -= _drop_split_roll_duplicates(data["opt_trades"])
+    return counts
 
 
 def _fetch_price_history(symbols: list[str], start: date, end: date) -> dict:
@@ -352,11 +357,11 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
 # (captured separately since a strike change means a different collateral key).
 _OPT_CAL_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+CALENDAR\s+(?P<symbol>\S+)\s+100.*?'
-    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/(?P<close_exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
     r'\s+(?P<strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 _OPT_DIAG_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+DIAGONAL\s+(?P<symbol>\S+)\s+100.*?'
-    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/\d{1,2}\s+[A-Z]{3}\s+\d{2,4}'
+    r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})/(?P<close_exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
     r'\s+(?P<strike>[\d.]+)/(?P<close_strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 _OPT_VERT_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+VERTICAL\s+(?P<symbol>\S+)\s+100.*?'
@@ -403,7 +408,56 @@ def _parse_opt_leg(desc: str) -> dict | None:
     groups = m.groupdict()
     if groups.get("close_strike"):
         leg["close_strike"] = float(groups["close_strike"])
+    if groups.get("close_exp"):
+        leg["close_exp"] = _parse_exp_date(groups["close_exp"])
     return leg
+
+
+def _drop_split_roll_duplicates(opt_trades: list[dict]) -> int:
+    """Remove leg pairs that repeat a CALENDAR/DIAGONAL row, in place.
+
+    Statements don't agree on how to show a roll: one lists it as a single
+    CALENDAR/DIAGONAL row with its net credit, an overlapping one lists the
+    same order as its buy-to-close and sell-to-open legs. The descriptions
+    differ, so the merge can't see they're the same order, and the roll is
+    stored twice. A leg pair is dropped only when it matches a roll row's
+    date, symbol, type, quantity, both expirations and both strikes, and its
+    amounts add up to the roll's. Returns the number of rows removed.
+    """
+    singles: dict[tuple, list[int]] = {}
+    combos: list[tuple[dict, dict]] = []
+    for i, t in enumerate(opt_trades):
+        leg = _parse_opt_leg(t.get("desc", ""))
+        if not leg:
+            continue
+        if leg["is_roll"]:
+            if leg.get("close_exp"):
+                combos.append((t, leg))
+        else:
+            key = (t["date"], leg["symbol"], leg["type"], leg["action"],
+                   leg["qty"], leg["exp"], leg["strike"])
+            singles.setdefault(key, []).append(i)
+
+    drop: set[int] = set()
+    for t, leg in combos:
+        # The roll's first-listed leg carries its action and quantity; the
+        # to-close leg is the opposite side.
+        opp = "BOT" if leg["action"] == "SOLD" else "SOLD"
+        open_key = (t["date"], leg["symbol"], leg["type"], leg["action"],
+                    leg["qty"], leg["exp"], leg["strike"])
+        close_key = (t["date"], leg["symbol"], leg["type"], opp, -leg["qty"],
+                     leg["close_exp"], leg.get("close_strike", leg["strike"]))
+        pair = next(((a, b)
+                     for a in singles.get(open_key, []) if a not in drop
+                     for b in singles.get(close_key, []) if b not in drop
+                     if abs(opt_trades[a]["amount"] + opt_trades[b]["amount"]
+                            - t["amount"]) < 0.05), None)
+        if pair:
+            drop.update(pair)
+
+    if drop:
+        opt_trades[:] = [t for i, t in enumerate(opt_trades) if i not in drop]
+    return len(drop)
 
 
 def _net_same_day_rolls(legs: list[tuple[date, dict]]) -> None:
