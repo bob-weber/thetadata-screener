@@ -345,6 +345,9 @@
   "KTOS": [
     "defense-aerospace"
   ],
+  "LASR": [
+    "defense-aerospace"
+  ],
   "LEN": [
     "rate-sensitive-growth"
   ],
@@ -529,6 +532,9 @@
   ],
   "RIOT": [
     "crypto-linked"
+  ],
+  "RIVN": [
+    "rate-sensitive-growth"
   ],
   "RKLB": [
     "ai-sentiment-spillover",
