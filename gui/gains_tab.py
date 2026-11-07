@@ -28,7 +28,7 @@ _RANGE_OPTIONS = [
     ("Custom…",  "custom"),
 ]
 
-from .account_store import events_path, gains_path, list_accounts
+from .account_store import events_path, gains_path, keep_unreadable, list_accounts, write_json
 from .sharebook import ShareBook
 
 _DEPOSIT_TYPES    = {"CRC"}
@@ -181,12 +181,13 @@ def _load_history(path: Path) -> dict:
             _drop_split_roll_duplicates(data["opt_trades"])
             return data
         except Exception:
-            pass
+            # Unreadable: keep a copy before an import can save over it.
+            keep_unreadable(path)
     return _blank_history()
 
 
 def _save_history(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2))
+    write_json(path, data)
 
 
 def _merge(existing: list[dict], new: list[dict], key_fn) -> int:

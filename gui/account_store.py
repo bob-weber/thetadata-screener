@@ -14,7 +14,10 @@ first run.
 """
 
 import json
+import os
 import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 _EVENTS_PREFIX = "my_option_events_"
@@ -67,6 +70,31 @@ def list_accounts() -> list[str]:
     return out
 
 
+def write_json(path: Path, data) -> None:
+    """Write ``data`` to ``path`` all or nothing.
+
+    The account files are the only copy of the imported history. Writing in
+    place means a crash or full disk mid-write leaves a truncated file, which
+    then loads as an empty account — and the next import overwrites it. Writing
+    beside it and swapping it in leaves the old file whole on any failure.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def keep_unreadable(path: Path) -> Path:
+    """Copy a file that won't parse aside before anything can overwrite it."""
+    backup = path.with_name(f"{path.name}.unreadable-{datetime.now():%Y%m%d-%H%M%S}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _set_aside(path: Path) -> None:
+    """Rename a legacy file out of the way instead of deleting it."""
+    path.rename(path.with_name(f"{path.name}.migrated-{datetime.now():%Y%m%d-%H%M%S}"))
+
+
 def migrate_legacy() -> None:
     """Move pre-existing single-account files into per-account buckets (once)."""
     if not _LEGACY_EVENTS.exists():
@@ -77,9 +105,11 @@ def migrate_legacy() -> None:
         acct = ""
     acct = acct or DEFAULT_ACCT
 
+    # A per-account file that already exists wins, but the legacy one is kept
+    # (renamed), not deleted: it may hold history the bucket doesn't.
     dest = events_path(acct)
     if dest.exists():
-        _LEGACY_EVENTS.unlink(missing_ok=True)
+        _set_aside(_LEGACY_EVENTS)
     else:
         _LEGACY_EVENTS.rename(dest)
 
@@ -87,7 +117,7 @@ def migrate_legacy() -> None:
     if _LEGACY_GAINS.exists():
         gdest = gains_path(acct)
         if gdest.exists():
-            _LEGACY_GAINS.unlink(missing_ok=True)
+            _set_aside(_LEGACY_GAINS)
         else:
             _LEGACY_GAINS.rename(gdest)
 

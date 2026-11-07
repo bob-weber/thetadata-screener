@@ -107,7 +107,7 @@ class _InTempDir(unittest.TestCase):
     def _positions(self):
         """Positions rows as the app builds them, by symbol and status."""
         rows = self._rows()
-        _, _, stks, _ = p._parse_tos_csv(self.stmt)
+        stks = p._parse_equities(rows)
         holdings = {"asof": p._parse_statement_end(rows).strftime("%m/%d/%Y"),
                     "equities": {h["symbol"]: {"shares": float(h["shares"]),
                                                "price": float(h["cost_basis"])}
@@ -309,6 +309,88 @@ class Positions(_InTempDir):
                 syms = [r["symbol"] for grp in p._grouped_order(live, field, desc, {}) for r in grp]
                 runs = [s for i, s in enumerate(syms) if i == 0 or syms[i - 1] != s]
                 self.assertEqual(len(runs), len(set(runs)), (field, desc, syms))
+
+
+def _put(d, q, exp, amt, strike="50", action="SOLD", roll=False, close_exp=None):
+    e = {"sym": "Q", "date": d, "kind": "opt", "otype": "PUT", "amount": amt,
+         "fees": 0.0, "strike": strike, "exp": exp, "qty": q, "action": action,
+         "roll": roll}
+    if close_exp:
+        e["close_exp"] = close_exp
+    return e
+
+
+class PutQuantities(unittest.TestCase):
+    """Contract counts the Positions tab must get right without a statement row."""
+
+    def _open(self, events):
+        return [(r["opened"], r["qty"], r["_capital"]) for r in p._reconstruct_wheels(events, {})
+                if r["status"] == "Open"]
+
+    def test_expired_position_is_not_reopened_by_a_later_sale(self):
+        # IRA RIOT 18: August's lot expired (no row); October's sale is new.
+        rows = p._reconstruct_wheels([_put("08/17/2026", 44, "08/21/2026", 836.0),
+                                      _put("10/05/2026", 21, "12/31/2099", 400.0)], {})
+        by_status = {r["status"]: (r["opened"], r["premium"]) for r in rows}
+        self.assertEqual(by_status["Open"], ("10/05/2026", "400.00"))
+        self.assertEqual(by_status["Expired"], ("08/17/2026", "836.00"))
+
+    def test_partial_calendar_roll_keeps_the_contracts_left_behind(self):
+        ev = [_put("12/01/2099", 10, "12/11/2099", 500.0),
+              _put("12/03/2099", 5, "12/18/2099", 50.0, roll=True, close_exp="12/11/2099")]
+        self.assertEqual(self._open(ev), [("12/01/2099", "10", 50000.0)])
+        ev.append(_put("12/04/2099", 5, "12/11/2099", -100.0, action="BOT"))
+        self.assertEqual(self._open(ev), [("12/01/2099", "5", 25000.0)])
+
+    def test_contracts_at_two_expirations_all_count(self):
+        ev = [_put("12/01/2099", 10, "12/11/2099", 500.0), _put("12/02/2099", 5, "12/18/2099", 300.0)]
+        self.assertEqual(self._open(ev), [("12/01/2099", "15", 75000.0)])
+
+    def test_second_assignment_at_a_strike_goes_to_its_own_put(self):
+        stock = lambda d: {"sym": "Q", "date": d, "kind": "stock", "action": "BOT",
+                           "shares": 100.0, "amount": -5000.0, "fees": 0.0, "assigned": True}
+        rows = p._reconstruct_wheels([_put("01/05/2026", 1, "01/09/2026", 100.0), stock("01/10/2026"),
+                                      _put("01/12/2026", 1, "01/23/2026", 120.0), stock("01/24/2026")], {})
+        self.assertEqual([(r["status"], r["qty"], r["premium"]) for r in rows],
+                         [("Holding", "200", "220.00")])
+
+
+class Storage(_InTempDir):
+    def test_vertical_and_its_split_legs_count_once(self):
+        rows = list(csv.reader(io.StringIO(
+            "Cash Balance\nDATE,TIME,TYPE,REF #,DESCRIPTION,Misc Fees,Commissions & Fees,AMOUNT,BALANCE\n"
+            "6/22/26,10:00:00,TRD,=\"1\",BOT +3 VERTICAL DVN 100 (Weeklys) 26 JUN 26 43/43.5 CALL @.26 CBOE,-0.09,,-78.00,100\n"
+            "6/22/26,10:00:00,TRD,=\"2\",BOT +3 DVN 100 (Weeklys) 26 JUN 26 43 CALL @1.40 CBOE,-0.05,,-420.00,100\n"
+            "6/22/26,10:00:00,TRD,=\"3\",SOLD -3 DVN 100 (Weeklys) 26 JUN 26 43.5 CALL @1.14 CBOE,-0.04,,342.00,100\n")))
+        events = p._collect_cash_events(rows)
+        self.assertEqual(p._drop_split_roll_duplicates(events), 2)
+        self.assertEqual(len(events), 1)
+
+    def test_unreadable_account_file_is_kept_before_anything_overwrites_it(self):
+        from gui.account_store import events_path
+        path = events_path(ACCT)
+        path.write_text('{"events": [ truncated')
+        QMessageBox.warning = staticmethod(lambda *a, **k: None)
+        tab = p.PortfolioTab()
+        tab._read_events(ACCT)
+        kept = list(Path(self.tmp).glob(path.name + ".unreadable-*"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(), '{"events": [ truncated')
+
+    def test_saves_replace_the_file_whole(self):
+        from gui.account_store import write_json
+        target = Path(self.tmp) / "x.json"
+        write_json(target, {"a": 1})
+        self.assertEqual(target.read_text().replace(" ", "").replace("\n", ""), '{"a":1}')
+        self.assertEqual(list(Path(self.tmp).glob("x.json.tmp")), [])
+
+    def test_legacy_file_is_set_aside_not_deleted(self):
+        from gui import account_store as a
+        a.events_path("default").write_text('{"events": []}')
+        a._LEGACY_EVENTS.write_text('{"events": [1]}')
+        a.migrate_legacy()
+        self.assertFalse(a._LEGACY_EVENTS.exists())
+        self.assertEqual(len(list(Path(self.tmp).glob("my_option_events.json.migrated-*"))), 1)
 
 
 class ShareBookTests(unittest.TestCase):
