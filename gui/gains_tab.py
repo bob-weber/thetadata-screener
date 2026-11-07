@@ -115,6 +115,10 @@ def parse_statement(path: Path) -> dict:
         row_type = cells[2]
         amount   = _parse_amount(cells[7])
         balance  = _parse_amount(cells[8])
+        # Misc Fees and Commissions & Fees sit beside AMOUNT, not inside it:
+        # the row's cash effect is all three (they're negative).
+        fees     = round((_parse_amount(cells[5]) or 0.0)
+                         + (_parse_amount(cells[6]) or 0.0), 2)
         ref      = _clean_ref(cells[3]) if len(cells) > 3 else ""
         desc     = cells[4] if len(cells) > 4 else ""
         diso     = row_date.isoformat()
@@ -131,14 +135,15 @@ def parse_statement(path: Path) -> dict:
         elif row_type in ("TRD", "EXP") and amount is not None:
             stk = _STK_TRD_RE.match(desc) or _STK_EXP_RE.match(desc)
             if row_type == "TRD" and _is_option(desc):
-                opt_trades.append({"date": diso, "amount": amount, "desc": desc})
+                opt_trades.append({"date": diso, "amount": amount, "fees": fees,
+                                   "desc": desc})
             elif stk:
                 action = stk.group(1).upper()
                 shares = abs(float(stk.group(2)))
                 symbol = stk.group(3).upper()
                 stk_trades.append({
                     "date": diso, "action": action, "symbol": symbol,
-                    "shares": shares, "amount": amount, "desc": desc,
+                    "shares": shares, "amount": amount, "fees": fees, "desc": desc,
                 })
 
     return {"deposits": deposits, "balances": balances,
@@ -206,8 +211,28 @@ def _merge_counted(existing: list[dict], new: list[dict], key_fn) -> int:
     return added
 
 
+def _backfill_fees(existing: list[dict], new: list[dict], key_fn) -> None:
+    """Give stored trades from before fees were recorded their fees.
+
+    The merge key (date, description, amount) is unchanged, so re-importing a
+    statement can't add the field by itself: each stored trade without one
+    takes it from its twin in the statement, fill for fill.
+    """
+    pending: dict = {}
+    for e in new:
+        pending.setdefault(key_fn(e), []).append(e.get("fees", 0.0))
+    for e in existing:
+        if "fees" not in e:
+            fees = pending.get(key_fn(e))
+            if fees:
+                e["fees"] = fees.pop(0)
+
+
 def merge_statement(data: dict, parsed: dict) -> dict:
     """Merge a parsed statement into accumulated history. Returns counts added."""
+    trade_key = lambda e: (e["date"], e["desc"], e["amount"])
+    _backfill_fees(data["opt_trades"], parsed["opt_trades"], trade_key)
+    _backfill_fees(data["stk_trades"], parsed["stk_trades"], trade_key)
     counts = {
         "deposits":   _merge(data["deposits"],   parsed["deposits"],
                              lambda e: e["ref"] or (e["date"], e["amount"])),
@@ -224,10 +249,28 @@ def merge_statement(data: dict, parsed: dict) -> dict:
     return counts
 
 
+_PRICE_CACHE: dict[tuple, dict] = {}   # (symbol, start, end) → closes
+
+
 def _fetch_price_history(symbols: list[str], start: date, end: date) -> dict:
-    """Return {symbol: {iso_date: close}} via yfinance."""
+    """Return {symbol: {iso_date: close}} via yfinance, cached for the session.
+
+    Every redraw (a checkbox, the range selector, an account switch) used to
+    download each symbol's whole history again on the GUI thread.
+    """
     if not symbols:
         return {}
+    missing = [s for s in symbols if (s, start, end) not in _PRICE_CACHE]
+    if missing:
+        fetched = _download_price_history(missing, start, end)
+        for s in missing:
+            _PRICE_CACHE[(s, start, end)] = fetched.get(s, {})
+    return {s: _PRICE_CACHE[(s, start, end)] for s in symbols
+            if _PRICE_CACHE.get((s, start, end))}
+
+
+def _download_price_history(symbols: list[str], start: date, end: date) -> dict:
+    """{symbol: {iso_date: close}} straight from yfinance."""
     try:
         import yfinance as yf
     except Exception:
@@ -272,6 +315,23 @@ def _account_transfers(acct: str) -> tuple[list[dict], list[dict]]:
 
 def _iso(mdy: str) -> str:
     return datetime.strptime(mdy, "%m/%d/%Y").date().isoformat()
+
+
+def with_fees(data: dict) -> dict:
+    """``data`` with each trade's fees folded into its amount (in memory).
+
+    Stored amounts stay as the statement prints them — they're part of the
+    merge key — so every calculation works on this net view instead.
+    """
+    def net(ts):
+        return [{**t, "amount": t["amount"] + t.get("fees", 0.0)} for t in ts]
+    return {**data, "opt_trades": net(data.get("opt_trades", [])),
+            "stk_trades": net(data.get("stk_trades", []))}
+
+
+def prepared(data: dict, acct: str | None) -> dict:
+    """What the charts calculate on: fees netted in, transfers applied."""
+    return with_transfers(with_fees(data), acct)
 
 
 def with_transfers(data: dict, acct: str | None) -> dict:
@@ -406,7 +466,9 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
                         holdings[sym] = [sh, tc]
                     else:
                         # short / no basis — treat proceeds as realized
-                        cum_stk_realized += t["amount"]
+                        # (a transfer out moved shares; it realizes nothing)
+                        if not t.get("transfer"):
+                            cum_stk_realized += t["amount"]
             ti += 1
 
         realized = cum_opt + cum_stk_realized
@@ -611,7 +673,8 @@ def _stock_realized_by_date(data: dict) -> dict[date, float]:
                 tc -= avg * q
                 holdings[sym] = [sh, tc]
             else:
-                realized = t["amount"]   # short / no basis
+                # short / no basis; a transfer out realizes nothing
+                realized = 0.0 if t.get("transfer") else t["amount"]
             try:
                 d = date.fromisoformat(t["date"])
             except Exception:
@@ -782,8 +845,12 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
         win_start = date.fromisoformat(range_from)
         win_end   = date.fromisoformat(range_to)
     elif isinstance(sel, int):
-        win_end   = last
-        win_start = last - timedelta(days=sel)
+        # Count back from the last real trade, like the P&L tab — not from the
+        # furthest day premium is projected to accrue.
+        real = [date.fromisoformat(t["date"])
+                for t in data.get("opt_trades", []) + data.get("stk_trades", [])]
+        win_end   = min(max(real), last) if real else last
+        win_start = win_end - timedelta(days=sel)
     else:
         win_start, win_end = first, last
 
@@ -898,7 +965,7 @@ class GainsTab(QWidget):
             hi = dates[-1] + timedelta(days=1)
             lo = dates[-1] - timedelta(days=sel)
 
-        idx = [i for i, d in enumerate(dates) if lo <= d <= hi]
+        idx = [i for i, d in enumerate(dates) if lo <= d < hi]
         if not idx:
             return None
         n = len(dates)
@@ -911,7 +978,7 @@ class GainsTab(QWidget):
         for ax in (self._ax1, self._ax2):
             ax.clear()
 
-        full = reconstruct(with_transfers(self._data, self._account))
+        full = reconstruct(prepared(self._data, self._account))
         if not full:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "Import a TOS CSV in the Positions tab",
@@ -1062,12 +1129,12 @@ class WeeklyRorTab(QWidget):
         self._ax_d.clear()
         self._ax_r.clear()
 
-        if not self._data.get("opt_trades"):
+        if not (self._data.get("opt_trades") or self._data.get("stk_trades")):
             self._empty("Import a TOS CSV in the Positions tab")
             return
 
         wk = _weekly_allocated_ror(
-            with_transfers(self._data, self._account),
+            prepared(self._data, self._account),
             self._range_sel, self._range_from, self._range_to)
         if not wk or not wk["weeks"]:
             self._empty("No data in selected range")
