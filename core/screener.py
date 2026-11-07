@@ -40,8 +40,12 @@ def _us_market_holidays(year: int) -> dict[date, str]:
     day   = (h + ll - 7 * m + 114) % 31 + 1
     good_friday = date(year, month, day) - timedelta(days=2)
 
+    # New Year's Day is the one holiday NYSE doesn't move back: when Jan 1 is
+    # a Saturday the market stays open on Dec 31 (Rule 7.2).
+    new_year = date(year, 1, 1)
+    new_year = new_year + timedelta(days=1) if new_year.weekday() == 6 else new_year
     return {
-        observed(date(year, 1, 1)):   "New Year's Day",
+        new_year:                     "New Year's Day",
         nth_weekday(year, 1, 0, 3):   "MLK Day",            # 3rd Mon Jan
         nth_weekday(year, 2, 0, 3):   "Presidents Day",     # 3rd Mon Feb
         good_friday:                  "Good Friday",
@@ -226,6 +230,16 @@ def calc_bb_pct(closes: pd.Series, period: int = 20, std_mult: float = 2.0) -> f
     return bb_pct_at(float(closes.iloc[-1]), *edges)
 
 
+def otm_pct(stock_price: float, strike: float, right: str) -> float:
+    """How far out of the money a strike is, in % of the stock price.
+
+    Out of the money is below the price for a put and above it for a call;
+    measured the put way, every OTM call read as in the money.
+    """
+    gap = stock_price - strike
+    return round((gap if right == "P" else -gap) / stock_price * 100, 2)
+
+
 def calc_hv(closes: pd.Series, period: int = 20) -> float | None:
     """Annualized realized (historical) volatility % over the last ``period`` bars.
 
@@ -250,8 +264,8 @@ def fetch_history_df(symbol: str, days: int = 180,
 
     Used by the chart window. ``intraday_minutes`` (1/5/10/15/30) requests
     intraday candles for the short timeframes; None gives daily candles. Pulls
-    ``days`` of lookback so the 20-bar Bollinger Bands and 14-bar RSI can warm
-    up. Requires a cached Schwab token (no interactive login on the GUI thread).
+    ``days`` of lookback — the caller adds indicator warm-up on top of the
+    window it shows (see chart_window). Requires a cached Schwab token (no interactive login on the GUI thread).
     Raises ScreenerError if the token is missing or the symbol returns no candles.
     """
     from core import schwab_client
@@ -479,8 +493,13 @@ def _resolve_priceable(client, edgar_symbols: list[str], on_log=None, on_progres
                     rejected[s] = kind
                 else:
                     resolved[s] = s
-        except Exception:
-            for s in batch:      # on a request error, keep the batch rather than drop it
+        except Exception as e:
+            # An expired token fails every batch the same way; keeping them all
+            # would save an unvalidated universe (warrants, preferreds,
+            # non-optionable names) as validated. That's a login problem.
+            if schwab_client.is_auth_error(e):
+                raise ScreenerError(_SCHWAB_AUTH_MSG) from e
+            for s in batch:      # a transient error: keep the batch rather than drop it
                 resolved[s] = s
         if on_progress:
             on_progress(min(i + chunk, total), total)
@@ -846,17 +865,24 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
     error (429/403 → rate-limit backoff; other errors → give up after 2 tries).
     Returns ``(results, limiter)`` where results maps key → value for everything
     that returned (None values are dropped). ``results`` is None if the user
-    stopped. Raises ScreenerError if hard-blocked with no progress for 30s.
+    stopped; what had arrived by then is kept on ``limiter.partial``, and keys
+    that failed outright on ``limiter.failed``. Raises ScreenerError if
+    rate-limited with no success for 30s — measured from the last success, not
+    the start, so a block that sets in mid-scan still trips it.
     """
     from core import schwab_client
     limiter = _RateLimiter(start_rate)
     results: dict = {}
+    limiter.partial = results
+    limiter.failed  = []
     auth_error = None   # set by any worker that hits an expired/revoked token
 
     def _worker(key):
         nonlocal auth_error
         other_errors = 0
         for attempt in range(8):
+            if stop_flag and stop_flag():          # don't keep retrying after Stop
+                return key, None
             limiter.pace()
             try:
                 value = call_one(key)
@@ -878,30 +904,40 @@ def _concurrent_fetch(keys, call_one, *, workers, start_rate,
 
     total = len(keys)
     done  = 0
-    start = time.monotonic()
+    last_success = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_worker, k) for k in keys]
         for fut in as_completed(futures):
+            # Record what just arrived before honouring Stop, so it's kept.
+            key, value = fut.result()
+            done += 1
+            if value is not None:
+                results[key] = value
+                last_success = time.monotonic()
+            else:
+                limiter.failed.append(key)
             if stop_flag and stop_flag():
                 for f in futures:
                     f.cancel()
+                # Fetches that finished but weren't collected yet are kept too.
+                for f in futures:
+                    if f is not fut and f.done() and not f.cancelled():
+                        k, v = f.result()
+                        if v is not None:
+                            results[k] = v
                 return None, limiter
             if auth_error is not None:             # expired token → surface it, don't return empty
                 for f in futures:
                     f.cancel()
                 raise ScreenerError(_SCHWAB_AUTH_MSG) from auth_error
-            # Circuit breaker: rate-limited with no progress after 30s = hard block.
-            if not results and limiter.hits and time.monotonic() - start > 30:
+            # Circuit breaker: rate-limited with no success for 30s = hard block.
+            if limiter.hits and time.monotonic() - last_success > 30:
                 for f in futures:
                     f.cancel()
                 raise ScreenerError(
                     "Schwab is blocking requests (rate limit / temporary cool-off). "
                     "Wait a few minutes, then retry. If it persists, re-run the "
                     "Schwab login.")
-            key, value = fut.result()
-            done += 1
-            if value is not None:
-                results[key] = value
             if on_progress:
                 on_progress(done, total)
     return results, limiter
@@ -993,7 +1029,9 @@ def run_price_screen(
         if on_log:
             on_log(f"Scanning my stocks: {len(all_symbols)} symbols (price range not applied)")
     elif watchlist_file and Path(watchlist_file).exists():
-        all_symbols = [t.strip() for t in Path(watchlist_file).read_text().splitlines() if t.strip()]
+        # Commas, spaces or newlines, like the GUI's ticker lists.
+        all_symbols = [t.upper() for t in re.split(r"[\s,]+", Path(watchlist_file).read_text())
+                       if t.strip()]
         if on_log:
             on_log(f"Using watchlist: {len(all_symbols)} symbols")
     else:
@@ -1011,6 +1049,7 @@ def run_price_screen(
     total   = len(all_symbols)
     skipped = 0
     chunk   = 250
+    failed_batches = 0
 
     for i in range(0, total, chunk):
         if stop_flag and stop_flag():
@@ -1019,12 +1058,23 @@ def run_price_screen(
             return []
 
         batch = all_symbols[i:i + chunk]
-        try:
-            data = schwab_client.quotes(client, batch)
-        except Exception as e:
-            if schwab_client.is_auth_error(e):
-                raise ScreenerError(_SCHWAB_AUTH_MSG) from e
-            data = {}   # tolerate a transient per-batch failure
+        data = None
+        for attempt in range(3):                 # a transient 5xx/timeout retries
+            try:
+                data = schwab_client.quotes(client, batch)
+                break
+            except Exception as e:
+                if schwab_client.is_auth_error(e):
+                    raise ScreenerError(_SCHWAB_AUTH_MSG) from e
+                time.sleep(1.0 * (attempt + 1))
+        if data is None:
+            # Still failing: these symbols weren't screened, which is not the
+            # same as having no quote — say so, and don't cache the gap.
+            failed_batches += 1
+            if on_log:
+                on_log(f"  Quote batch {i // chunk + 1} failed after retries — "
+                       f"{len(batch)} symbols not screened ({batch[0]} … {batch[-1]}).")
+            data = {}
 
         batch_qualified: list[dict] = []
         for sym in batch:
@@ -1048,11 +1098,16 @@ def run_price_screen(
         else:
             on_log(f"Pass 1 done — {len(price_qualified)} in ${price_min}–${price_max}, {skipped} skipped")
 
-    price_path.write_text(json.dumps({
-        **price_key,
-        "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "qualified":  price_qualified,
-    }))
+    if failed_batches:
+        if on_log:
+            on_log(f"Price screen incomplete ({failed_batches} batch(es) failed) — "
+                   "not cached; re-run to fill the gap.")
+    else:
+        price_path.write_text(json.dumps({
+            **price_key,
+            "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "qualified":  price_qualified,
+        }))
     return price_qualified
 
 
@@ -1167,8 +1222,13 @@ def run_technical_filter(
     # near midnight. On a trading day we substitute the live quote for today's bar;
     # on a weekend/holiday there's no new bar, so the stored closes stand as-is.
     from zoneinfo import ZoneInfo
-    et_today         = datetime.now(ZoneInfo("America/New_York")).date()
-    is_trading_today = _last_trading_day(et_today) == et_today
+    et_now           = datetime.now(ZoneInfo("America/New_York"))
+    et_today         = et_now.date()
+    # Before the 9:30 open there is no session yet: the "live" price is the
+    # prior close (or a thin pre-market print), and appending it would add a
+    # phantom bar that shifts RSI and the band window.
+    is_trading_today = (_last_trading_day(et_today) == et_today
+                        and (et_now.hour, et_now.minute) >= (9, 30))
 
     price_lookup = {item["symbol"]: item["price"] for item in price_qualified}
     filter_kw = dict(
@@ -1213,6 +1273,7 @@ def run_technical_filter(
         on_log(f"Pass 2: {len(fresh)} symbols current in store, fetching {len(stale)} …")
 
     fetched: dict[str, tuple] = {}
+    failed: set[str] = set()
     elapsed = 0.0
     if stale:
         from core import schwab_client
@@ -1264,9 +1325,17 @@ def run_technical_filter(
             workers=_FETCH_WORKERS, start_rate=_FETCH_START_RATE,
             on_progress=_prog, stop_flag=stop_flag)
         if fetched is None:                          # user stopped
+            # Keep what was fetched: the next scan would otherwise pay for
+            # every one of those requests again.
+            for sym, (closes, last_date) in limiter.partial.items():
+                if last_date and len(closes) >= bb_period + 1:
+                    store[sym] = {"last": last_date, "days": HISTORY_DAYS,
+                                  "closes": closes}
+            _save_history_store(store, store_path)
             if on_log:
-                on_log("Stopped by user.")
+                on_log(f"Stopped by user — kept {len(limiter.partial)} histories fetched so far.")
             return []
+        failed = set(limiter.failed)
         elapsed = time.monotonic() - fetch_start
         if limiter.hits and on_log:
             on_log(f"Schwab rate-limited {limiter.hits}× — auto-throttled to "
@@ -1292,10 +1361,24 @@ def run_technical_filter(
     # ── Apply RSI / BB% filter in memory ──────────────────────────────────────
     tech_candidates: list[dict] = []
 
-    for sym, closes_list in histories.items():
+    # Every price-screened symbol comes back, measured or not: one whose history
+    # couldn't be fetched, or is too short for the indicators (a recent IPO),
+    # returns blank RSI/BB% and fails — a greyed row says why it isn't a
+    # candidate, where dropping it made it simply vanish from the scan.
+    for sym in symbols:
+        closes_list = histories.get(sym) or (fetched.get(sym) or ([], None))[0]
         cand = _evaluate_candidate(sym, closes_list, price_lookup, **filter_kw)
-        if cand is not None:
-            tech_candidates.append(cand)
+        if cand is None:
+            continue
+        if sym in failed:
+            cand["note"] = "history fetch failed"
+        elif cand.get("rsi") is None and sym not in histories:
+            cand["note"] = "not enough history"
+        tech_candidates.append(cand)
+    if failed and on_log:
+        on_log(f"{len(failed)} symbol(s) had no history after retries "
+               f"(shown with blank RSI/BB%): {', '.join(sorted(failed)[:10])}"
+               + (" …" if len(failed) > 10 else ""))
 
     n_pass = sum(1 for c in tech_candidates if c.get("passes"))
     if on_log:
@@ -1640,13 +1723,13 @@ def run_options_filter(
                     delta = None
 
                 try:
-                    otm_pct = round((stock_price - float(opt["strike"])) / stock_price * 100, 2)
+                    otm = otm_pct(stock_price, float(opt["strike"]), right)
                 except (TypeError, ValueError):
-                    otm_pct = None
+                    otm = None
 
                 # Cushion in σ at this strike: OTM% / the underlying's expected move.
-                cushion_sigma = (round(otm_pct / sigma_pct, 2)
-                                 if sigma_pct and otm_pct is not None else None)
+                cushion_sigma = (round(otm / sigma_pct, 2)
+                                 if sigma_pct and otm is not None else None)
 
                 # Back to a plain float: the column is numpy-typed, and the
                 # results are written to the cache as JSON.
@@ -1659,7 +1742,7 @@ def run_options_filter(
                     "expiration": exp.strftime("%Y-%m-%d"),
                     "dte":        dte,
                     "strike":     strike,
-                    "otm_pct":    otm_pct,
+                    "otm_pct":    otm,
                     "premium":    round(float(opt[price_col]), 2),
                     "premium_pct": round(float(opt["premium_pct"]) * 100, 2),
                     "delta":      delta,
@@ -1684,8 +1767,10 @@ def run_options_filter(
                     # spread routinely exceeds the whole extrinsic value, so the
                     # roll exists on paper and nowhere else.
                     "spread_pct":    _spread_pct(opt),
+                    # A strike with no OI in a chain where others have it is NaN
+                    # in the frame, and int(NaN) raised — aborting the scan.
                     "open_interest": (int(opt["open_interest"])
-                                      if opt.get("open_interest") is not None else None),
+                                      if pd.notna(opt.get("open_interest")) else None),
                 })
 
     if on_log and bandless_syms:

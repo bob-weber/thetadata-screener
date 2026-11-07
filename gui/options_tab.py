@@ -453,6 +453,7 @@ class OptionsScannerTab(QWidget):
         self._worker.candidates_loaded.connect(self._on_candidates_loaded)
         self._worker.opts_progress.connect(self._on_opts_progress)
         self._worker.finished.connect(self._on_finished)
+        self._worker.stopped.connect(self._on_stopped)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -479,6 +480,13 @@ class OptionsScannerTab(QWidget):
         self._results_box.setTitle(
             f"Results — {len(results)} contract(s) (EOD {self._cache_trade_date()})")
         self.scan_finished.emit()
+
+    def _on_stopped(self):
+        """A stopped scan leaves the last complete results in place."""
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._log.append("Stopped — previous results kept.")
+        self._load_cached_results()
 
     def _on_error(self, msg: str):
         self._run_btn.setEnabled(True)

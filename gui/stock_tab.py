@@ -54,9 +54,9 @@ _HELP = {
               "bar when computing RSI and BB%, so both track the current price "
               "rather than yesterday's close.",
     "rsi":    "Wilder's RSI over the RSI-period bars (default 14).\n\n"
-              "Below 30 is oversold, above 70 overbought. A Universe scan keeps "
-              "only symbols under the RSI threshold; an Import List or Specify "
-              "Stocks scan reports it for every ticker without filtering.",
+              "Below 30 is oversold, above 70 overbought. Every scan measures "
+              "it for every price-screened ticker; rows outside the RSI / BB% "
+              "thresholds are greyed and don't go on to the Options Scanner.",
     "bb_pct": "Where price sits inside its Bollinger Bands: 0% = lower band, "
               "100% = upper band, over the BB period (default 20) at 2σ.\n\n"
               "Below 0 means price has broken under the lower band; above 100, "
@@ -101,6 +101,10 @@ def _style_row(table: QTableWidget, r: int, row: dict, cols: list[str]):
     if row.get("rsi") is None or row.get("bb_pct") is None:
         why = ("Not enough history to compute RSI / BB% — excluded from the "
                "Options Scanner.")
+        if row.get("note") == "history fetch failed":
+            why = ("Schwab returned no price history for this ticker after "
+                   "retries — RSI / BB% unknown, excluded from the Options "
+                   "Scanner. A re-scan usually fills it.")
     for c in range(len(cols)):
         item = table.item(r, c)
         if item is not None:
@@ -534,6 +538,7 @@ class StockScannerTab(QWidget):
         self._worker.tech_found.connect(self._on_tech_found)
         self._worker.price_done.connect(self._on_price_finished)
         self._worker.finished.connect(self._on_tech_finished)
+        self._worker.stopped.connect(self._on_stopped)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -642,6 +647,11 @@ class StockScannerTab(QWidget):
             return cached.get("scanned_at") or cached.get("date", "unknown")
         except Exception:
             return "unknown"
+
+    def _on_stopped(self):
+        """A stopped scan leaves the last results in both tables."""
+        self._idle()
+        self._log.append("Scan stopped — previous results kept.")
 
     def _on_error(self, msg: str):
         self._idle()

@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
+import pandas as pd
+
 from core import screener
 
 _BB_PERIOD  = 20
@@ -34,6 +36,13 @@ _TIMEFRAMES = [
 ]
 _DEFAULT_TF = "6M"
 
+# Extra calendar days fetched ahead of the window so the indicators have warmed
+# up by its first bar: ~140 daily bars before the window; for intraday, enough
+# sessions (weekends and a holiday included) for 14-period RSI to converge.
+_WARMUP_DAYS_DAILY          = 200
+_WARMUP_DAYS_INTRADAY_SHORT = 5     # 5-minute bars: 78 per session
+_WARMUP_DAYS_INTRADAY       = 14    # 30-minute bars: 13 per session
+
 
 class _HistoryWorker(QThread):
     """Fetch history + compute indicators off the UI thread."""
@@ -49,14 +58,23 @@ class _HistoryWorker(QThread):
 
     def run(self):
         try:
-            df    = screener.fetch_history_df(self._symbol, days=self._days,
+            # Indicators need history before the first bar shown: the bands
+            # need 20 bars and Wilder's RSI several multiples of 14 to settle
+            # (the scanner uses ~126 daily bars). Fetch extra, compute on all of
+            # it, then show only the chosen window — counted back from the last
+            # bar, so a weekend or holiday still shows the last session.
+            warm = _WARMUP_DAYS_DAILY if self._minutes is None else (
+                _WARMUP_DAYS_INTRADAY_SHORT if self._minutes <= 5 else _WARMUP_DAYS_INTRADAY)
+            df    = screener.fetch_history_df(self._symbol, days=self._days + warm,
                                               intraday_minutes=self._minutes)
             close = df["close"]
             sma, upper, lower = screener.calc_bb_bands(close, _BB_PERIOD, _BB_STD)
             rsi   = screener.calc_rsi_series(close, _RSI_PERIOD)
+            shown = df.index > df.index[-1] - pd.Timedelta(days=self._days)
             self.loaded.emit({
-                "req_id": self._req_id, "df": df,
-                "sma": sma, "upper": upper, "lower": lower, "rsi": rsi,
+                "req_id": self._req_id, "df": df[shown],
+                "sma": sma[shown], "upper": upper[shown], "lower": lower[shown],
+                "rsi": rsi[shown],
             })
         except Exception as e:  # ScreenerError or anything unexpected
             self.error.emit({"req_id": self._req_id, "msg": str(e)})

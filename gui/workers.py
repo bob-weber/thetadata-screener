@@ -4,6 +4,10 @@ from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.screener import otm_pct as screener_otm_pct
+
+from .account_store import write_json
+
 OPTIONS_RESULTS_CACHE = "options_results_cache.json"
 _OPT_CACHE_KEYS = ["date", "expiration_date", "right", "side",
                    "premium_pct_min", "premium_pct_max"]
@@ -45,6 +49,7 @@ class StockScanWorker(QThread):
     tech_found     = pyqtSignal(list)
     price_done     = pyqtSignal(list)   # price-qualified rows, when Pass 1 finishes
     finished       = pyqtSignal(list)   # final technical candidates
+    stopped        = pyqtSignal()       # user pressed Stop; the last results stand
     error          = pyqtSignal(str)
 
     def __init__(self, config: dict, watchlist_file: str | None = None):
@@ -68,9 +73,12 @@ class StockScanWorker(QThread):
                 watchlist_file=self._watchlist,
                 use_cache=False,
             )
-            self.price_done.emit(price_qualified)
+            # A stopped pass returns nothing, which is not "no symbols in range":
+            # say it stopped and leave the tables as they were.
             if self._stop:
+                self.stopped.emit()
                 return
+            self.price_done.emit(price_qualified)
             if not price_qualified:
                 self.log_msg.emit("No symbols in price range — skipping technical scan.")
                 self.finished.emit([])
@@ -85,6 +93,9 @@ class StockScanWorker(QThread):
                 stop_flag=lambda: self._stop,
                 use_cache=True,   # reuse per-symbol history store; live price always re-applied
             )
+            if self._stop:
+                self.stopped.emit()
+                return
             self.finished.emit(results)
         except ScreenerError as e:
             self.error.emit(str(e))
@@ -97,6 +108,7 @@ class OptionsWorker(QThread):
     opts_progress     = pyqtSignal(int, int)
     candidates_loaded = pyqtSignal(int)
     finished          = pyqtSignal(list)
+    stopped           = pyqtSignal()      # user pressed Stop; cached results stand
     error             = pyqtSignal(str)
 
     def __init__(self, config: dict, reject: set[str] | None = None):
@@ -139,10 +151,9 @@ class OptionsWorker(QThread):
         if not candidates:
             self.error.emit("Stock scan returned no candidates — run the Stock Scanner first.")
             return None
-        # Explicit-list scans report every ticker and mark those outside the
-        # RSI/BB% thresholds (greyed out in the Stock Scanner). They're reference
-        # rows, not candidates, so they never reach an option chain. A universe
-        # scan has already dropped its failures, so nothing here is marked.
+        # Every scan reports every price-screened ticker and marks those outside
+        # the RSI/BB% thresholds (greyed out in the Stock Scanner). They're
+        # reference rows, not candidates, so they never reach an option chain.
         graded = [c for c in candidates if c.get("passes", True)]
         skipped = len(candidates) - len(graded)
         if skipped:
@@ -193,7 +204,12 @@ class OptionsWorker(QThread):
                 on_progress=lambda c, t: self.opts_progress.emit(c, t),
                 stop_flag=lambda: self._stop,
             )
-            opt_path.write_text(json.dumps({**key, "results": results}))
+            if self._stop:
+                # A stopped scan returns nothing; writing that would replace the
+                # last complete results (and empty the LSO tab after a restart).
+                self.stopped.emit()
+                return
+            write_json(opt_path, {**key, "results": results})
             self.finished.emit(results)
         except ScreenerError as e:
             self.error.emit(str(e))
@@ -233,6 +249,7 @@ class LsoWorker(QThread):
             return
 
         results   = cached.get("results", [])
+        right     = cached.get("right", "P")
         exp_str   = cached.get("expiration_date", "")
         scan_date = cached.get("date", "unknown date")
         if not results:
@@ -284,7 +301,7 @@ class LsoWorker(QThread):
                 skipped_symbols.add(sym)
                 continue
             if strike is not None and stock_price is not None:
-                otm_pct = round((stock_price - strike) / stock_price * 100, 2)
+                otm_pct = screener_otm_pct(stock_price, strike, right)
             else:
                 otm_pct = contract.get("otm_pct")
             tech   = tech_lookup.get(sym, {})
