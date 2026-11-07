@@ -17,7 +17,13 @@ gui-env/bin/python run_portfolio.py
 gui-env/bin/python -m core.schwab_client login
 ```
 
-There are no test suites or linting configs in this repo.
+Tests cover the portfolio tracker only (stdlib `unittest`; no linting config):
+
+```bash
+gui-env/bin/python -m unittest discover tests
+```
+
+`tests/test_portfolio.py` builds a made-up TOS statement in a temp directory (also the working directory, so real account files are never read or written) and checks statement parsing, fees, capital, transfers, rolls and target prices — each case a bug that shipped once. Run it after any change to `positions_tab.py`, `gains_tab.py` or `sharebook.py`.
 
 ## Architecture
 
@@ -93,7 +99,8 @@ Built with PyQt6. `run_screener.py` just creates the `QApplication` (no local te
 - **`portfolio_window.py`** — `QMainWindow` wrapping `PortfolioTab`.
 - **`positions_tab.py`** — Position tracker. Imports TOS Account Statement CSVs into per-account `my_option_events_<acct>.json` (`events` from the `Cash Balance` section, `outcomes` from its RAD rows, `holdings` = the newest statement's `Equities` list). The `Account Order/Trade History` sections are not used, so TOS's symbol filter on the export is harmless. `_reconstruct_wheels()` rebuilds rows from events: wheel cycles start from a short put (rolls, including diagonal and partial ones, stay on one row); shares bought outright start a long stock row that their covered calls join; a bought option is a long option row. Rows carry Assn/Buy Price, Cost Basis (less put premium) and Recovery (less call premium), plus a Blended row per symbol. The Positions tab shows live rows grouped by ticker (custom sort, spanned Symbol cell); finished cycles go to the Closed tab. Prices via yfinance.
   - `holdings_adjustments()` squares trades with the statement's holdings: shares listed but never bought become a *Transferred in* lot; shares bought but no longer listed leave as a transfer out at cost. TOS writes no row for a move between accounts, so this is the only record of one. Outright buys are shown only once an account has a holdings snapshot.
-- **`gains_tab.py`** — P&L Chart and Weekly RoR, cash basis (buying an option is a realized debit). `with_transfers()` applies the same transfers in memory, matching a sale of never-held shares to another account's transfer out for its cost.
+- **`gains_tab.py`** — P&L Chart and Weekly RoR, cash basis (buying an option is a realized debit). Fees are stored per trade beside the statement amount (a re-import backfills them fill for fill) and netted in by `with_fees()`; `with_transfers()` applies the same share transfers in memory, matching a sale of never-held shares to another account's transfer out for its cost. Net deposits come from each day's running cash balance less all trade cash, since TOS exports omit deposit rows. With a range selected, realized/total/fees count from the range start; net deposits stay all-time.
+- **`sharebook.py`** — `ShareBook`, the single average-cost share tracker used by both tabs.
 
 ### Market data (Schwab)
 

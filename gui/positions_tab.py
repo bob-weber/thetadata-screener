@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 from core.lso_analyzer import tags_for
 
 from .account_store import DEFAULT_ACCT, events_path, safe_token
+from .sharebook import ShareBook
 
 POSITIONS_FILE   = Path("my_option_positions.json")     # legacy cache, rebuilt from events
 STOCKS_FILE      = Path("my_stock_positions.json")       # legacy cache, rebuilt from events
@@ -312,6 +313,12 @@ class PortfolioTab(QWidget):
 
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
         """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
+        # The same range again (an account switch re-applies it right after the
+        # load already drew with it) would only redo the work.
+        def _key(s, f, t):
+            return (s, f, t) if s == "custom" else (s,)
+        if _key(sel, date_from, date_to) == _key(self._range_sel, self._range_from, self._range_to):
+            return
         self._range_sel  = sel
         self._range_from = date_from
         self._range_to   = date_to
@@ -1281,6 +1288,30 @@ def _outcome_unkey(s: str) -> tuple:
     return tuple(s.split("|"))
 
 
+def _normalize_verticals(events: list[dict]) -> list[dict]:
+    """Read a vertical spread row as the roll it is.
+
+    A vertical closes a short at one strike and opens one at another, same
+    expiration — a diagonal roll without the change of date. It's stored as
+    parsed ("BOT +3 VERTICAL DVN … 43/43.5 CALL": a BOT at 43 naming 43.5),
+    which reads backwards: the BOT closes the 43 and the 43.5 is sold. A
+    "SOLD" vertical opens its first strike and closes the second, which is
+    already the diagonal shape. Both become a roll that sells the new strike
+    and closes the old one. Stored events are not changed — the strike is
+    part of their merge identity.
+    """
+    out = []
+    for e in events:
+        if (e.get("kind") == "opt" and not e.get("roll") and e.get("close_strike")
+                and not e.get("close_exp")):
+            if e.get("action") == "BOT":
+                e = {**e, "action": "SOLD", "strike": e["close_strike"],
+                     "close_strike": e["strike"]}
+            e = {**e, "roll": True, "close_exp": e["exp"]}
+        out.append(e)
+    return out
+
+
 def _reconcile_holdings(events: list[dict], holdings: dict | None) -> list[dict]:
     """The events plus the transfers that square them with the statement."""
     seeded, moved = holdings_adjustments(events, holdings)
@@ -1311,22 +1342,17 @@ def holdings_adjustments(events: list[dict], holdings: dict | None
     snap = holdings["equities"]
     asof = _parse_mdy(holdings.get("asof", "")) or date.max
     first = min((_parse_mdy(e["date"]) or date.max) for e in events)
-    held: dict[str, list[float]] = {}           # sym → [shares, cost] from events
+    book = ShareBook()                          # shares and cost from events
     bought: dict[str, list] = {}                # sym → [outright shares, last buy date]
     for e in sorted(events, key=lambda e: _parse_mdy(e["date"]) or date.min):
         if e["kind"] != "stock" or (_parse_mdy(e["date"]) or date.min) > asof:
             continue
-        sh, cost = held.get(e["sym"], [0.0, 0.0])
         if e["action"] == "BOT" and not e["assigned"]:
             b = bought.setdefault(e["sym"], [0.0, e["date"]])
             b[0] += e["shares"]
             b[1] = e["date"]
-        if e["action"] == "BOT":
-            sh, cost = sh + e["shares"], cost + abs(e["amount"])
-        elif sh > 0:
-            q = min(e["shares"], sh)
-            sh, cost = sh - q, cost - cost / sh * q
-        held[e["sym"]] = [sh, cost]
+        book.apply(e["sym"], e["action"], e["shares"], e["amount"])
+    held = {sym: [sh, tc] for sym, sh, tc in book.held()}
     seeded = []
     for sym, h in snap.items():
         shares, price = float(h.get("shares", 0)), float(h.get("price", 0))
@@ -1366,19 +1392,14 @@ def holdings_adjustments(events: list[dict], holdings: dict | None
     # What each transfer out carried: the average cost of the shares held when
     # it left. (The Positions tab prices it off the lot it leaves instead; the
     # two agree when, as usual, only outright-bought shares were held.)
-    pos: dict[str, list[float]] = {}
+    book = ShareBook()
     for e in sorted(seeded + events + moved, key=lambda e: _parse_mdy(e["date"]) or date.min):
         if e["kind"] != "stock":
             continue
-        sh, cost = pos.get(e["sym"], [0.0, 0.0])
-        if e["action"] == "BOT":
-            sh, cost = sh + e["shares"], cost + abs(e["amount"])
-        elif sh > 0:
-            q = min(e["shares"], sh)
-            if e.get("transfer_out"):
-                e["cost"] = round(cost / sh * q, 2)
-            sh, cost = sh - q, cost - cost / sh * q
-        pos[e["sym"]] = [sh, cost]
+        _, removed = book.apply(e["sym"], e["action"], e["shares"], e["amount"],
+                                bool(e.get("transfer_out")))
+        if e.get("transfer_out"):
+            e["cost"] = round(removed, 2)
     return seeded, moved
 
 
@@ -1390,7 +1411,7 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
     stock position (their covered calls join it); a bought option to open is a
     long option position of its own.
     """
-    events = _reconcile_holdings(events, holdings)
+    events = _reconcile_holdings(_normalize_verticals(events), holdings)
     # Shares bought outright are shown only once a statement's holdings have
     # been imported: without them, shares moved to another account look held
     # here forever (no statement row records a transfer), so an account with
@@ -1507,6 +1528,46 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                 return any(c["calls"].get(leg, 0) > 0 for c in mine)
             c = live.get(e["strike"])
             return bool(c and c["qty_by_exp"].get(e["exp"], 0) > 0)
+
+        def _exercise_long_call(e, px):
+            """Shares bought UPON exercise of a long call at ``px``, if one is open.
+
+            The call becomes the shares: the row carries on as a holding, at
+            the strike, with what the call cost still in its premium — so Cost
+            Basis is strike + call cost per share, and Recovery stays honest.
+            Part of a position exercised splits off pro rata, the rest stays
+            a long call.
+            """
+            c = next((c for c in live.values()
+                      if c.get("long") and c["long"]["type"] == "CALL"
+                      and c.get("long_qty", 0) > 0
+                      and abs(float(c["long"]["strike"]) - px) < 0.005), None)
+            if c is None:
+                return None
+            n = min(int(e["shares"] // 100), c["long_qty"])
+            if n <= 0:
+                return None
+            if n < c["long_qty"]:
+                part = n / c["long_qty"]
+                stock = _new(f"{c['live_key']}#ex{e['date']}", c["open_date"])
+                stock["has_option"] = True
+                stock["stages"]     = list(c["stages"])
+                for k in ("premium", "fees"):
+                    moved = round(c[k] * part, 2)
+                    stock[k] += moved
+                    c[k]     -= moved
+                c["long_cost"]   = c["long_cost"] * (1 - part)
+                c["long_qty"]   -= n
+                c["long_bought"] = max(c["long_bought"] - n, c["long_qty"])
+            else:
+                _retire(c["live_key"])
+                c.pop("long")
+                stock = c
+                stock["live_key"] = f"{c['live_key']}#ex"
+                live[stock["live_key"]] = stock
+            stock["bought"] = True
+            stock["stages"].append("Exercised")
+            return stock
 
         for e in evs:
             if e["kind"] == "opt" and not e.get("roll"):
@@ -1697,6 +1758,8 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                         cycle = next((c for c in live.values()
                                       if c["put_strike"] and
                                       abs(float(c["put_strike"]) - px) < 0.005), None)
+                        if cycle is None:
+                            cycle = _exercise_long_call(e, px)
                         cycle = cycle or _holder()
                     if cycle is None:
                         # Shares bought outright with none already held start
@@ -1776,7 +1839,8 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                     # assigned puts above empties qty_by_exp, so this is what the
                     # row counts once the position is shares rather than options.
                     cycle["stock_qty"]  = cycle.get("stock_qty", 0) + int(e["shares"] // 100)
-                    if not (e.get("pre_history") and cycle["stages"]):
+                    if not (e.get("pre_history") and cycle["stages"]) \
+                            and cycle["stages"][-1:] != ["Exercised"]:
                         cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
                 else:  # SOLD
                     cycle = _sale_holder(e)

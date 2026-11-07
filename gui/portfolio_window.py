@@ -100,6 +100,10 @@ Interest and dividends, being small and unlisted, land here too.</li>
 <li>Net Deposits is the blue base; gain/loss bars stack on top (green/red).
 Untick <i>Show deposits</i> to plot P&amp;L from a zero baseline so it autoscales.</li>
 <li><b>RoR %</b> in the titles = P&amp;L ÷ net deposits.</li>
+<li><b>With a range selected</b>, Realized, Total and Fees (and their bars) count
+from the start of the range — what that window earned and paid — while Net
+Deposits stays the account's capital at each date, so RoR is the window's gain
+on the capital in the account.</li>
 <li>The date axis is the union of all event dates (balance, trade, deposit), so a
 trading day plots even if its end-of-day balance row hasn't posted yet.</li>
 </ul>

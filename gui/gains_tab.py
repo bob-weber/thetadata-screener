@@ -29,6 +29,7 @@ _RANGE_OPTIONS = [
 ]
 
 from .account_store import events_path, gains_path, list_accounts
+from .sharebook import ShareBook
 
 _DEPOSIT_TYPES    = {"CRC"}
 _WITHDRAWAL_TYPES = {"CDB"}
@@ -386,15 +387,14 @@ def with_transfers(data: dict, acct: str | None) -> dict:
              "desc": "transfer out", "transfer": True} for e in moved]
 
     # Sales the account can't cover from what it held.
-    held: dict[str, float] = {}
+    book = ShareBook()
     others = None
     for t in sorted(ins + data.get("stk_trades", []) + outs, key=lambda t: t["date"]):
         sym = t["symbol"]
-        sh  = held.get(sym, 0.0)
         if t["action"] == "BOT":
-            held[sym] = sh + t["shares"]
+            book.buy(sym, t["shares"], t["amount"])
             continue
-        short = t["shares"] - sh
+        short = t["shares"] - book.shares(sym)
         if not t.get("transfer") and short > 0.0001:
             if others is None:
                 others = [dict(e) for a in list_accounts() if a != acct
@@ -410,11 +410,11 @@ def with_transfers(data: dict, acct: str | None) -> dict:
                 ins.append({"date": d, "action": "BOT", "symbol": sym, "shares": n,
                             "amount": -round(per * n, 2),
                             "desc": "transfer in", "transfer": True})
+                book.buy(sym, n, per * n)
                 lot["cost"]   = lot.get("cost", 0.0) - per * n
                 lot["shares"] -= n
                 short -= n
-                sh    += n
-        held[sym] = max(sh - t["shares"], 0.0)
+        book.sell(sym, t["shares"], t["amount"], bool(t.get("transfer")))
 
     if not ins and not outs:
         return data
@@ -496,7 +496,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     cum_cash = 0.0
     cum_moved = 0.0
 
-    holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
+    book = ShareBook()
     cum_opt = 0.0
     cum_stk_realized = 0.0
     ti = 0   # trade index
@@ -523,35 +523,16 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
             if t["kind"] == "opt":
                 cum_opt += t["amount"]
             else:
-                sym = t["symbol"]
-                sh, tc = holdings.get(sym, [0.0, 0.0])
-                if t["action"] == "BOT":
-                    sh += t["shares"]
-                    tc += abs(t["amount"])
-                    holdings[sym] = [sh, tc]
-                else:  # SOLD — realize against average cost
-                    if sh > 0:
-                        avg = tc / sh
-                        q   = min(t["shares"], sh)
-                        if not t.get("transfer"):      # moved, not sold
-                            cum_stk_realized += t["amount"] - avg * q
-                        sh -= q
-                        tc -= avg * q
-                        holdings[sym] = [sh, tc]
-                    else:
-                        # short / no basis — treat proceeds as realized
-                        # (a transfer out moved shares; it realizes nothing)
-                        if not t.get("transfer"):
-                            cum_stk_realized += t["amount"]
+                realized, _ = book.apply(t["symbol"], t["action"], t["shares"],
+                                         t["amount"], bool(t.get("transfer")))
+                cum_stk_realized += realized
             ti += 1
 
         realized = cum_opt + cum_stk_realized
 
         # unrealized = market value of current holdings − their cost
         unreal = 0.0
-        for sym, (sh, tc) in holdings.items():
-            if sh <= 0:
-                continue
+        for sym, sh, tc in book.held():
             p = _price_on(price_hist.get(sym, {}), bd)
             if p is not None:
                 unreal += p * sh - tc
@@ -591,7 +572,7 @@ _OPT_DIAG_RE = re.compile(
 _OPT_VERT_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+VERTICAL\s+(?P<symbol>\S+)\s+100.*?'
     r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
-    r'\s+(?P<strike>[\d.]+)/[\d.]+\s+(?P<type>PUT|CALL)', re.IGNORECASE)
+    r'\s+(?P<strike>[\d.]+)/(?P<strike2>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 _OPT_SINGLE_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+(?P<symbol>\S+)\s+100.*?'
     r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})\s+(?P<strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
@@ -606,6 +587,26 @@ def _parse_exp_date(s: str) -> date | None:
     return None
 
 
+def _vertical_leg(v: re.Match) -> dict | None:
+    """A vertical as the roll it is: sell the new strike, close the old one.
+
+    "BOT +3 VERTICAL DVN … 43/43.5 CALL" buys back the 43 and sells the 43.5;
+    a SOLD vertical sells its first strike and buys back the second. Same
+    expiration on both sides, so it chains like a diagonal roll.
+    """
+    exp = _parse_exp_date(v.group("exp"))
+    if exp is None:
+        return None
+    a, b = float(v.group("strike")), float(v.group("strike2"))
+    bought = v.group("action").upper() == "BOT"
+    qty = abs(int(v.group("qty")))
+    return {
+        "action": "SOLD", "qty": -qty, "symbol": v.group("symbol").upper(),
+        "exp": exp, "strike": b if bought else a, "close_strike": a if bought else b,
+        "close_exp": exp, "type": v.group("type").upper(), "is_roll": True,
+    }
+
+
 def _parse_opt_leg(desc: str) -> dict | None:
     m = _OPT_CAL_RE.search(desc)
     is_roll = m is not None
@@ -613,8 +614,9 @@ def _parse_opt_leg(desc: str) -> dict | None:
         m = _OPT_DIAG_RE.search(desc)
         is_roll = m is not None
     if m is None:
-        m = _OPT_VERT_RE.search(desc)
-    if m is None:
+        v = _OPT_VERT_RE.search(desc)
+        if v is not None:
+            return _vertical_leg(v)
         m = _OPT_SINGLE_RE.search(desc)
     if not m:
         return None
@@ -736,34 +738,19 @@ def _bdays(start: date, end: date) -> list[date]:
 
 def _stock_realized_by_date(data: dict) -> dict[date, float]:
     """Realized P&L from stock sales (avg-cost basis), booked on the sale day."""
-    trades = sorted(data.get("stk_trades", []), key=lambda t: t["date"])
-    holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
+    book = ShareBook()
     out: dict[date, float] = {}
-    for t in trades:
-        sym = t["symbol"]
-        sh, tc = holdings.get(sym, [0.0, 0.0])
+    for t in sorted(data.get("stk_trades", []), key=lambda t: t["date"]):
+        realized, _ = book.apply(t["symbol"], t["action"], t["shares"],
+                                 t["amount"], bool(t.get("transfer")))
         if t["action"] == "BOT":
-            sh += t["shares"]
-            tc += abs(t["amount"])
-            holdings[sym] = [sh, tc]
-        else:  # SOLD — realize proceeds against average cost
-            if sh > 0:
-                avg = tc / sh
-                q   = min(t["shares"], sh)
-                realized = 0.0 if t.get("transfer") else t["amount"] - avg * q
-                sh -= q
-                tc -= avg * q
-                holdings[sym] = [sh, tc]
-            else:
-                # short / no basis; a transfer out realizes nothing
-                realized = 0.0 if t.get("transfer") else t["amount"]
-            try:
-                d = date.fromisoformat(t["date"])
-            except Exception:
-                continue
-            out[d] = out.get(d, 0.0) + realized
+            continue
+        try:
+            d = date.fromisoformat(t["date"])
+        except Exception:
+            continue
+        out[d] = out.get(d, 0.0) + realized
     return out
-
 
 def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
                           range_to: str | None) -> dict | None:
@@ -1021,6 +1008,12 @@ class GainsTab(QWidget):
 
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
         """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
+        # The same range again (an account switch re-applies it right after the
+        # load already drew with it) would only redo the work.
+        def _key(s, f, t):
+            return (s, f, t) if s == "custom" else (s,)
+        if _key(sel, date_from, date_to) == _key(self._range_sel, self._range_from, self._range_to):
+            return
         self._range_sel  = sel
         self._range_from = date_from
         self._range_to   = date_to
@@ -1054,10 +1047,20 @@ class GainsTab(QWidget):
         if not idx:
             return None
         n = len(dates)
-        return {
+        out = {
             k: ([v[i] for i in idx] if isinstance(v, list) and len(v) == n else v)
             for k, v in series.items()
         }
+        # Realized, total and fees are running totals since the first
+        # statement; within a range they count from where the range starts —
+        # the last point before it — so the figures are what that window
+        # earned. Net deposits stay as they are: capital is a level, not a
+        # flow, and the RoR divides by what was in the account.
+        start = idx[0] - 1
+        for k in ("realized", "total", "fees"):
+            base = series[k][start] if start >= 0 else 0.0
+            out[k] = [v - base for v in out[k]]
+        return out
 
     def _refresh_chart(self):
         for ax in (self._ax1, self._ax2):
@@ -1187,6 +1190,12 @@ class WeeklyRorTab(QWidget):
 
     # ── external hooks ──────────────────────────────────────────────────────
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
+        # The same range again (an account switch re-applies it right after the
+        # load already drew with it) would only redo the work.
+        def _key(s, f, t):
+            return (s, f, t) if s == "custom" else (s,)
+        if _key(sel, date_from, date_to) == _key(self._range_sel, self._range_from, self._range_to):
+            return
         self._range_sel  = sel
         self._range_from = date_from
         self._range_to   = date_to
