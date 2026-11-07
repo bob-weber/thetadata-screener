@@ -136,13 +136,18 @@ def parse_statement(path: Path) -> dict:
         if balance is not None:
             day_balance[diso] = balance
 
-        elif row_type in _DEPOSIT_TYPES and amount is not None and amount > 0:
+        # Separate from the balance capture above: every row has a balance,
+        # so chaining these onto it would skip every trade.
+        if row_type in _DEPOSIT_TYPES and amount is not None and amount > 0:
             deposits.append({"ref": ref, "date": diso, "amount": amount})
 
         elif row_type in _WITHDRAWAL_TYPES and amount is not None and amount < 0:
             deposits.append({"ref": ref, "date": diso, "amount": amount})
 
-        elif row_type in ("TRD", "EXP") and amount is not None:
+        elif row_type in ("TRD", "EXP") and (amount is not None or fees):
+            # A fill at $0.00 (a zero-credit roll) prints a blank AMOUNT but
+            # still pays fees.
+            amount = amount or 0.0
             stk = _STK_TRD_RE.match(desc) or _STK_EXP_RE.match(desc)
             if row_type == "TRD" and _is_option(desc):
                 opt_trades.append({"date": diso, "amount": amount, "fees": fees,
@@ -207,37 +212,37 @@ def _merge_counted(existing: list[dict], new: list[dict], key_fn) -> int:
     tops the count up to the higher of the two instead of double-counting.
     """
     have = Counter(key_fn(e) for e in existing)
-    want: Counter = Counter()
-    templates: dict = {}
+    fills: dict = {}
     for e in new:
-        k = key_fn(e)
-        want[k] += 1
-        templates.setdefault(k, e)
+        fills.setdefault(key_fn(e), []).append(e)
 
     added = 0
-    for k, n in want.items():
-        for _ in range(n - have.get(k, 0)):
-            existing.append(dict(templates[k]))
+    for k, rows in fills.items():
+        # Each missing fill is the statement's own row: identical fills can
+        # differ in fees, so copying the first would misstate the rest.
+        for e in rows[have.get(k, 0):]:
+            existing.append(dict(e))
             added += 1
     existing.sort(key=lambda e: e["date"])
     return added
 
 
 def _backfill_fees(existing: list[dict], new: list[dict], key_fn) -> None:
-    """Give stored trades from before fees were recorded their fees.
+    """Give stored trades the statement's fees, fill for fill.
 
-    The merge key (date, description, amount) is unchanged, so re-importing a
-    statement can't add the field by itself: each stored trade without one
-    takes it from its twin in the statement, fill for fill.
+    The merge key (date, description, amount) leaves fees out, so a re-import
+    can't correct them by itself: each stored trade takes the fees of its twin
+    in the statement — filling them in for trades stored before fees were
+    recorded, and repairing identical fills that were stored with the first
+    one's fees.
     """
     pending: dict = {}
     for e in new:
         pending.setdefault(key_fn(e), []).append(e.get("fees", 0.0))
     for e in existing:
-        if "fees" not in e:
-            fees = pending.get(key_fn(e))
-            if fees:
-                e["fees"] = fees.pop(0)
+        fees = pending.get(key_fn(e))
+        if fees:
+            e["fees"] = fees.pop(0)
 
 
 def _merge_balances(existing: list[dict], new: list[dict]) -> int:

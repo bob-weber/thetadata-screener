@@ -726,19 +726,26 @@ class PortfolioTab(QWidget):
         # A statement is complete for its date range, so identical partial fills
         # within one statement are kept, while overlapping statements (which
         # repeat the same fills) don't double-count.
-        existing_counts = Counter(_event_uid(e) for e in self._events)
-        new_counts = Counter()
-        templates: dict[tuple, dict] = {}
+        # Identical fills can still carry different fees (one pays the
+        # commission, its twin doesn't), so every fill is kept in order rather
+        # than copying the first one — and stored twins take the statement's
+        # fees fill for fill, which repairs histories imported before this.
+        existing: dict[tuple, list[dict]] = {}
+        for e in self._events:
+            existing.setdefault(_event_uid(e), []).append(e)
+        incoming: dict[tuple, list[dict]] = {}
         for e in new_events:
-            uid = _event_uid(e)
-            new_counts[uid] += 1
-            templates.setdefault(uid, e)
+            incoming.setdefault(_event_uid(e), []).append(e)
 
         added_evs = 0
-        for uid, n in new_counts.items():
-            deficit = n - existing_counts.get(uid, 0)
-            for _ in range(deficit):
-                self._events.append(templates[uid])
+        for uid, fills in incoming.items():
+            have = existing.get(uid, [])
+            for old, new in zip(have, fills):
+                if old.get("fees") != new.get("fees"):
+                    old["fees"] = new.get("fees", 0.0)
+                    upgraded += 1
+            for new in fills[len(have):]:
+                self._events.append(new)
                 added_evs += 1
 
         # A roll shown as one row here and as two legs in an overlapping
