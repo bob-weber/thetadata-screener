@@ -60,8 +60,10 @@ _HELP = {
     "cushion_sigma":
                    "OTM distance in expected moves: OTM% ÷ the expected move to "
                    "expiration. The primary risk gate.\n\n"
-                   "Scores −30 below 1σ (1.5σ for gappy names — earnings in the "
-                   "period, or Energy / Basic Materials), 0 from 1–1.5σ, +5 above.",
+                   "The adequate mark is 1σ (1.5σ for gappy names — earnings in "
+                   "the period, or Energy / Basic Materials). Scores −15 more than "
+                   "half a σ short of it, −5 just short, 0 up to half a σ past it, "
+                   "+5 beyond that.",
     "iv_hv":       "Implied volatility ÷ the stock's own 20-day realized "
                    "volatility, both annualized.\n\n"
                    "Above 1 the option prices more movement than the stock has "

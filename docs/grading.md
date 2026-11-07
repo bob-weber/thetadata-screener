@@ -410,8 +410,9 @@ date. The two failure modes are not symmetric — a gate that wrongly stops firi
 can put you short puts into a live disaster, while one that wrongly keeps firing
 only costs you a trade — so staleness is surfaced, never silently resolved in
 either direction. An entry with no usable date is stale from the start: undated
-is unverified. An unreadable `severity` degrades to `overhang` and is flagged,
-because a malformed entry is a data error, not a clean bill of health.
+is unverified. An unreadable `severity` degrades to `review` and is flagged:
+a malformed entry is a data error, not a clean bill of health — but it is not
+evidence of a case either, so it flags without capping the tier.
 
 Because the entries are local data rather than market data, they survive a
 yfinance failure: the flags and the tier cap still apply on the error path even

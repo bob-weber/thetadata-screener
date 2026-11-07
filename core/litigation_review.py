@@ -34,7 +34,9 @@ CIK_CACHE_FILE  = "edgar_cik_cache.json"     # matches *_cache.json in .gitignor
 # SEC asks for a contact address and caps traffic at 10 requests/second.
 _UA         = {"User-Agent": "lso-tools/1.0 contact@example.com"}
 _SEC_WORKERS    = 4
-_SEC_START_RATE = 6
+# Paced per symbol, and each symbol costs two requests (the submissions index,
+# then the filing), so 4/s keeps the peak near 8 req/s — under SEC's 10.
+_SEC_START_RATE = 4
 
 # Language that marks a real, broken-out matter rather than the ordinary-course
 # paragraph every filer carries.
@@ -562,6 +564,16 @@ def _load_store(litigation_file: str | Path) -> dict:
 def _needs_review(entry: dict | None, today: date) -> bool:
     if not entry:
         return True
+    # A confirmed entry past its review date stays flagged until you re-read it,
+    # but the machine check only needs to run once per quarter: without this it
+    # re-fetched from EDGAR on every analysis, indefinitely.
+    if entry.get("confirmed") and entry.get("auto_asof"):
+        try:
+            checked = date.fromisoformat(entry["auto_asof"])
+        except ValueError:
+            checked = None
+        if checked and (today - checked).days < _LITIGATION_REVIEW_DAYS:
+            return False
     return _litigation_state(entry, today)["stale"]
 
 
@@ -652,7 +664,10 @@ def refresh(symbols, on_log=None, on_progress=None, stop_flag=None,
         if old.get("confirmed"):
             if _SEVERITY_ORDER.get(entry["severity"], 0) > \
                _SEVERITY_ORDER.get(old.get("severity"), 0):
-                store[sym] = {**old, **entry, "confirmed": False,
+                # Stays confirmed: a later pass may raise it again but must not
+                # lower or clear it — otherwise one auto-raise un-gates the name
+                # a quarter later when the filing parses as 'clear'.
+                store[sym] = {**old, **entry, "confirmed": True,
                               "note": f"auto-raised over confirmed "
                                       f"{old.get('severity')}: {entry['note']}"}
                 raised += 1

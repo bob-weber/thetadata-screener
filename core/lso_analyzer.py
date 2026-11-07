@@ -735,8 +735,11 @@ def apply_contract_adjustments(
     top of the symbol's fundamental score.
     """
     # A hard-gated symbol stays rejected whatever the contract looks like —
-    # otherwise a generous chain would re-score it back above F.
-    if result.get("reject"):
+    # otherwise a generous chain would re-score it back above F. A symbol whose
+    # data lookup failed stays ungraded: no earnings date means the −40 that an
+    # earnings-in-period contract carries can't be applied, so any letter grade
+    # the chain produced would be unfounded.
+    if result.get("reject") or result.get("data_error"):
         return {
             **result,
             "iv": iv, "cushion_sigma": cushion_sigma, "iv_hv": iv_hv,
@@ -878,7 +881,9 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
                 if hasattr(ed, "date"):
                     ed = ed.date()
                 earnings_date = ed
-                if today < ed <= expiration:
+                # Today counts: an after-the-close report gaps the stock
+                # overnight, and the date alone can't say it already happened.
+                if today <= ed <= expiration:
                     earnings_in_period = True
                     score -= 40
                     flags.append("EARNINGS IN PERIOD")
@@ -1005,13 +1010,27 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             err_flags.append("LITIGATION UNCLEAR")
         if litigation["stale"]:
             err_flags.append("LITIGATION REVIEW DUE")
+        # The hard gates come from local tags too, so they still apply: a
+        # biotech-binary name must not slip through as a '?' that a good chain
+        # then grades B. With no listing date, the recent-ipo tag is the gate.
+        err_rejects = [why for tag, why in _HARD_GATE_TAGS.items() if tag in tags]
+        ipo_reason = _ipo_gate_reason({}, tags)
+        if ipo_reason:
+            err_rejects.append(ipo_reason)
+        if err_rejects:
+            err_flags.insert(0, "HARD REJECT")
         # No market cap on this path — yfinance is what failed — so an
         # exposure-only overhang goes untested and keeps capping.
         err_tier, err_alloc, _ = _risk_tier(50, tags, "unknown", False, litigation)
+        if err_rejects:
+            err_tier, err_alloc = "Reject", "0%"
         return {
             "symbol":             symbol,
-            "grade":              "?",
-            "score":              50,
+            # A failed lookup has no earnings date, beta or cap to grade on, so
+            # it stays '?' — apply_contract_adjustments leaves it unscored.
+            "grade":              "F" if err_rejects else "?",
+            "score":              0 if err_rejects else 50,
+            "data_error":         True,
             "sector":             "Error",
             "tags":               tags,
             "tags_researched":    tags_researched,
@@ -1019,8 +1038,8 @@ def analyze_symbol(symbol: str, expiration: date, on_log=None) -> dict:
             "funded_by_paper":    False,
             "risk_tier":          err_tier,
             "max_allocation":     err_alloc,
-            "reject":             False,
-            "reject_reason":      "",
+            "reject":             bool(err_rejects),
+            "reject_reason":      " • ".join(err_rejects),
             "litigation":         litigation,
             "industry":           "",
             "beta":               None,
