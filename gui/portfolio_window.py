@@ -34,19 +34,76 @@ today). Custom uses the From/To dates. On the Positions tab, active
 (Open/Holding) positions are always shown regardless of range.</p>
 
 <h3>Positions tab</h3>
-<p>One row per wheel cycle (Put → Assigned → Covered Call → …), reconstructed
-from the statement. P&amp;L and RoR include all premiums plus the stock outcome,
-net of fees.</p>
+<p>One row per <i>live</i> wheel cycle (Put → Assigned → Covered Call → …),
+reconstructed from the statement. Rows are always <b>grouped by ticker</b>: one
+Symbol/Market cell spans each ticker's rows, and sorting on any column orders
+the rows within each ticker and the tickers by their leading row (Blended stays
+at the bottom of its group). Finished cycles — expired, closed, sold or
+called away — move to the <b>Closed</b> tab, which shows their P&amp;L and is
+filtered by the Range selector on the date each cycle opened. P&amp;L and RoR include all premiums plus the stock outcome,
+net of fees. A roll — including one that changes strike — stays on the same
+line, so a put rolled 12.5 → 13 and then assigned carries both strikes' premium.</p>
+<p><b>Target prices</b> (per share, net of fees):</p>
+<ul>
+<li><b>Assn/Buy Price</b> — what the shares cost: the strike for assigned
+shares, the average purchase price for shares bought outright (averaged if
+taken on in parts). Holding rows only.</li>
+<li><b>Cost Basis</b> — Assn Price less the <i>put</i> premium. For an open put
+it is the price you'd pay if assigned now.</li>
+<li><b>Recovery</b> — Cost Basis less the <i>covered-call</i> premium: the exit
+price at which the whole cycle breaks even. A call struck below it locks in a
+loss if called away.</li>
+<li><b>Blended</b> rows weight each live line by its shares (open puts counted
+as if assigned); Assn/Buy Price there blends only shares actually held. Long
+options are left out — their prices aren't share prices.</li>
+</ul>
+<p><b>Qty / Unit.</b> Rows holding shares count shares; option rows count
+contracts (a bought-back put shows the most it had open). A Blended row counts
+contracts when every line is an option, otherwise shares — open puts as the
+shares they'd bring if assigned, the same count its basis is averaged over.
+When no call is open on held shares, Lifecycle says how the last one ended
+(<i>Call expired</i> or <i>Call closed</i>).</p>
+<p><b>Positions that don't start with a put</b>:</p>
+<ul>
+<li><b>Shares bought outright</b> are a long stock line; covered calls written
+on them join it.</li>
+<li><b>Long options</b> (a bought call or put, e.g. a LEAP) are their own line.
+Premium is the net cash paid and received — the purchase is a realized debit,
+the sale a realized credit. While open, Capital is what you paid, Cost Basis is
+the option's cost per share, and Recovery is the underlying price at which it's
+worth that at expiration (strike + cost for a call, strike − cost for a put).</li>
+<li><b>Holdings from the statement.</b> Each import saves the statement's
+Equities list (only a newer statement replaces it). Shares it lists that the
+imported trades never bought are shown as <i>Transferred in</i> at the
+statement's average cost, with no Weeks Held or RoR since the real purchase date
+is unknown. Shares the trades bought that it no longer lists were moved to
+another account: they close as <i>Transferred</i>, at cost, with no gain or loss.
+Until an account has imported a statement with this version, shares bought
+outright aren't shown for it.</li>
+</ul>
 
 <h3>P&amp;L Chart tab</h3>
 <ul>
 <li><b>Realized P&amp;L</b> = option premium cash flows + stock gains/losses
 (average-cost basis), recognized on the trade/sale date (cash basis).</li>
+<li><b>Fees</b> = commissions and misc fees from the statement's fee columns,
+already subtracted from Realized and Total; shown so you can check them.</li>
 <li><b>Total P&amp;L</b> = realized + unrealized. Unrealized marks open share
 holdings to market using yfinance closes.</li>
-<li><b>Net Deposits</b> is the blue base; gain/loss bars stack on top (green/red).
+<li><b>Net Deposits</b> is the capital that came into the account from outside:
+each day's cash balance (from the statement's running BALANCE column) less all
+trade cash to date — premiums, stock bought and sold, fees. That catches every
+deposit, withdrawal, rollover and cash transfer, which TOS often leaves out of
+the statement as rows (a full-history export omits them all). Shares moved
+between accounts count at cost: in where they arrive, out where they leave.
+Interest and dividends, being small and unlisted, land here too.</li>
+<li>Net Deposits is the blue base; gain/loss bars stack on top (green/red).
 Untick <i>Show deposits</i> to plot P&amp;L from a zero baseline so it autoscales.</li>
 <li><b>RoR %</b> in the titles = P&amp;L ÷ net deposits.</li>
+<li><b>With a range selected</b>, Realized, Total and Fees (and their bars) count
+from the start of the range — what that window earned and paid — while Net
+Deposits stays the account's capital at each date, so RoR is the window's gain
+on the capital in the account.</li>
 <li>The date axis is the union of all event dates (balance, trade, deposit), so a
 trading day plots even if its end-of-day balance row hasn't posted yet.</li>
 </ul>
@@ -136,7 +193,6 @@ class PortfolioWindow(QMainWindow):
         cbl.addWidget(QLabel("To:"))
         cbl.addWidget(self._date_to)
         self._custom_box.setVisible(False)
-        self._init_custom_dates()
 
         self._range_combo.currentIndexChanged.connect(self._emit_range)
         self._date_from.dateChanged.connect(self._emit_range)
@@ -168,6 +224,9 @@ class PortfolioWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(positions_tab,    "Positions")
+        closed_idx = tabs.addTab(positions_tab.closed_widget(), "Closed")
+        positions_tab.closed_count_changed.connect(
+            lambda n: tabs.setTabText(closed_idx, f"Closed ({n})"))
         tabs.addTab(gains_tab,        "P&L Chart")
         tabs.addTab(self._weekly_tab, "Weekly RoR")
 
@@ -184,7 +243,8 @@ class PortfolioWindow(QMainWindow):
         act.triggered.connect(self._show_help)
 
         self._refresh_accounts()   # populate combo + load the initial account
-        self._emit_range()         # apply the default ("All Time") to every tab
+        self._init_custom_dates()  # the account's data span; empty before the load
+        self._emit_range()        # apply the default ("All Time") to every tab
 
     def _show_help(self):
         dlg = QDialog(self)

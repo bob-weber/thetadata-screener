@@ -28,7 +28,8 @@ _RANGE_OPTIONS = [
     ("Custom…",  "custom"),
 ]
 
-from .account_store import gains_path
+from .account_store import events_path, gains_path, list_accounts
+from .sharebook import ShareBook
 
 _DEPOSIT_TYPES    = {"CRC"}
 _WITHDRAWAL_TYPES = {"CDB"}
@@ -39,8 +40,9 @@ _CB_SECTION_STOPS = {"Account Trade History", "Profits and Losses",
 _STK_TRD_RE = re.compile(
     r'^(BOT|SOLD)\s+([+-]?\d+(?:\.\d+)?)\s+([A-Z]+)\s+@', re.IGNORECASE)
 # Stock assignment/exercise in the EXP rows, e.g. "BOT 100.0 SPXU UPON ..."
+# A called-away sale is signed: "SOLD -400.0 GAP UPON ...".
 _STK_EXP_RE = re.compile(
-    r'^(BOT|SOLD)\s+(\d+(?:\.\d+)?)\s+([A-Z]+)\s+UPON', re.IGNORECASE)
+    r'^(BOT|SOLD)\s+([+-]?\d+(?:\.\d+)?)\s+([A-Z]+)\s+UPON', re.IGNORECASE)
 
 
 def _parse_amount(raw: str) -> float | None:
@@ -91,6 +93,8 @@ def parse_statement(path: Path) -> dict:
     balances:   list[dict] = []
     opt_trades: list[dict] = []
     stk_trades: list[dict] = []
+    opening:    dict | None = None   # cash before the statement's first row
+    day_balance: dict[str, float] = {}
     in_cb = False
 
     for row in rows:
@@ -114,34 +118,54 @@ def parse_statement(path: Path) -> dict:
         row_type = cells[2]
         amount   = _parse_amount(cells[7])
         balance  = _parse_amount(cells[8])
+        # Misc Fees and Commissions & Fees sit beside AMOUNT, not inside it:
+        # the row's cash effect is all three (they're negative).
+        fees     = round((_parse_amount(cells[5]) or 0.0)
+                         + (_parse_amount(cells[6]) or 0.0), 2)
         ref      = _clean_ref(cells[3]) if len(cells) > 3 else ""
         desc     = cells[4] if len(cells) > 4 else ""
         diso     = row_date.isoformat()
 
-        if row_type == "BAL" and balance is not None:
-            balances.append({"date": diso, "balance": balance})
+        # Every row carries the running balance, so the first one tells what
+        # the account held before anything on this statement happened.
+        if opening is None and balance is not None:
+            opening = {"date": diso,
+                       "balance": round(balance - (amount or 0.0) - fees, 2)}
 
-        elif row_type in _DEPOSIT_TYPES and amount is not None and amount > 0:
+        # End-of-day cash: the last running balance of each date (rows are
+        # in time order). It's what capital in is measured from.
+        if balance is not None:
+            day_balance[diso] = balance
+
+        # Separate from the balance capture above: every row has a balance,
+        # so chaining these onto it would skip every trade.
+        if row_type in _DEPOSIT_TYPES and amount is not None and amount > 0:
             deposits.append({"ref": ref, "date": diso, "amount": amount})
 
         elif row_type in _WITHDRAWAL_TYPES and amount is not None and amount < 0:
             deposits.append({"ref": ref, "date": diso, "amount": amount})
 
-        elif row_type in ("TRD", "EXP") and amount is not None:
+        elif row_type in ("TRD", "EXP") and (amount is not None or fees):
+            # A fill at $0.00 (a zero-credit roll) prints a blank AMOUNT but
+            # still pays fees.
+            amount = amount or 0.0
             stk = _STK_TRD_RE.match(desc) or _STK_EXP_RE.match(desc)
             if row_type == "TRD" and _is_option(desc):
-                opt_trades.append({"date": diso, "amount": amount, "desc": desc})
+                opt_trades.append({"date": diso, "amount": amount, "fees": fees,
+                                   "desc": desc})
             elif stk:
                 action = stk.group(1).upper()
                 shares = abs(float(stk.group(2)))
                 symbol = stk.group(3).upper()
                 stk_trades.append({
                     "date": diso, "action": action, "symbol": symbol,
-                    "shares": shares, "amount": amount, "desc": desc,
+                    "shares": shares, "amount": amount, "fees": fees, "desc": desc,
                 })
 
+    balances = [{"date": d, "balance": b} for d, b in sorted(day_balance.items())]
     return {"deposits": deposits, "balances": balances,
-            "opt_trades": opt_trades, "stk_trades": stk_trades}
+            "opt_trades": opt_trades, "stk_trades": stk_trades,
+            "opening": opening}
 
 
 def _blank_history() -> dict:
@@ -189,29 +213,62 @@ def _merge_counted(existing: list[dict], new: list[dict], key_fn) -> int:
     tops the count up to the higher of the two instead of double-counting.
     """
     have = Counter(key_fn(e) for e in existing)
-    want: Counter = Counter()
-    templates: dict = {}
+    fills: dict = {}
     for e in new:
-        k = key_fn(e)
-        want[k] += 1
-        templates.setdefault(k, e)
+        fills.setdefault(key_fn(e), []).append(e)
 
     added = 0
-    for k, n in want.items():
-        for _ in range(n - have.get(k, 0)):
-            existing.append(dict(templates[k]))
+    for k, rows in fills.items():
+        # Each missing fill is the statement's own row: identical fills can
+        # differ in fees, so copying the first would misstate the rest.
+        for e in rows[have.get(k, 0):]:
+            existing.append(dict(e))
             added += 1
     existing.sort(key=lambda e: e["date"])
     return added
 
 
+def _backfill_fees(existing: list[dict], new: list[dict], key_fn) -> None:
+    """Give stored trades the statement's fees, fill for fill.
+
+    The merge key (date, description, amount) leaves fees out, so a re-import
+    can't correct them by itself: each stored trade takes the fees of its twin
+    in the statement — filling them in for trades stored before fees were
+    recorded, and repairing identical fills that were stored with the first
+    one's fees.
+    """
+    pending: dict = {}
+    for e in new:
+        pending.setdefault(key_fn(e), []).append(e.get("fees", 0.0))
+    for e in existing:
+        fees = pending.get(key_fn(e))
+        if fees:
+            e["fees"] = fees.pop(0)
+
+
+def _merge_balances(existing: list[dict], new: list[dict]) -> int:
+    """End-of-day balances by date; the incoming statement's value wins (a
+    statement pulled mid-day can hold a balance the day later moved past)."""
+    by_date = {b["date"]: b for b in existing}
+    added = sum(1 for b in new if b["date"] not in by_date)
+    by_date.update({b["date"]: b for b in new})
+    existing[:] = sorted(by_date.values(), key=lambda b: b["date"])
+    return added
+
+
 def merge_statement(data: dict, parsed: dict) -> dict:
     """Merge a parsed statement into accumulated history. Returns counts added."""
+    trade_key = lambda e: (e["date"], e["desc"], e["amount"])
+    # The earliest statement's opening balance is the account's starting cash.
+    op = parsed.get("opening")
+    if op and (not data.get("opening") or op["date"] < data["opening"]["date"]):
+        data["opening"] = op
+    _backfill_fees(data["opt_trades"], parsed["opt_trades"], trade_key)
+    _backfill_fees(data["stk_trades"], parsed["stk_trades"], trade_key)
     counts = {
         "deposits":   _merge(data["deposits"],   parsed["deposits"],
                              lambda e: e["ref"] or (e["date"], e["amount"])),
-        "balances":   _merge(data["balances"],   parsed["balances"],
-                             lambda e: e["date"]),
+        "balances":   _merge_balances(data["balances"], parsed["balances"]),
         "opt_trades": _merge_counted(data["opt_trades"], parsed["opt_trades"],
                                      lambda e: (e["date"], e["desc"], e["amount"])),
         "stk_trades": _merge_counted(data["stk_trades"], parsed["stk_trades"],
@@ -223,10 +280,28 @@ def merge_statement(data: dict, parsed: dict) -> dict:
     return counts
 
 
+_PRICE_CACHE: dict[tuple, dict] = {}   # (symbol, start, end) → closes
+
+
 def _fetch_price_history(symbols: list[str], start: date, end: date) -> dict:
-    """Return {symbol: {iso_date: close}} via yfinance."""
+    """Return {symbol: {iso_date: close}} via yfinance, cached for the session.
+
+    Every redraw (a checkbox, the range selector, an account switch) used to
+    download each symbol's whole history again on the GUI thread.
+    """
     if not symbols:
         return {}
+    missing = [s for s in symbols if (s, start, end) not in _PRICE_CACHE]
+    if missing:
+        fetched = _download_price_history(missing, start, end)
+        for s in missing:
+            _PRICE_CACHE[(s, start, end)] = fetched.get(s, {})
+    return {s: _PRICE_CACHE[(s, start, end)] for s in symbols
+            if _PRICE_CACHE.get((s, start, end))}
+
+
+def _download_price_history(symbols: list[str], start: date, end: date) -> dict:
+    """{symbol: {iso_date: close}} straight from yfinance."""
     try:
         import yfinance as yf
     except Exception:
@@ -253,6 +328,123 @@ def _price_on(hist: dict, date_str: str) -> float | None:
     return hist[max(candidates)] if candidates else None
 
 
+def _account_transfers(acct: str) -> tuple[list[dict], list[dict]]:
+    """(transfers in, transfers out) for one account, from its positions data.
+
+    The statement records no row when shares move between accounts, so the
+    trades alone leave them held in the old account forever and sold from the
+    new one with no cost at all. The Positions tab squares each account with
+    the holdings its newest statement lists; this reuses that.
+    """
+    from .positions_tab import holdings_adjustments
+    try:
+        d = json.loads(events_path(acct).read_text())
+    except Exception:
+        return [], []
+    return holdings_adjustments(d.get("events", []), d.get("holdings"))
+
+
+def _iso(mdy: str) -> str:
+    return datetime.strptime(mdy, "%m/%d/%Y").date().isoformat()
+
+
+def with_fees(data: dict) -> dict:
+    """``data`` with each trade's fees folded into its amount (in memory).
+
+    Stored amounts stay as the statement prints them — they're part of the
+    merge key — so every calculation works on this net view instead.
+    """
+    def net(ts):
+        return [{**t, "amount": t["amount"] + t.get("fees", 0.0)} for t in ts]
+    return {**data, "opt_trades": net(data.get("opt_trades", [])),
+            "stk_trades": net(data.get("stk_trades", []))}
+
+
+def prepared(data: dict, acct: str | None) -> dict:
+    """What the charts calculate on: fees netted in, transfers applied."""
+    return with_transfers(with_fees(data), acct)
+
+
+def with_transfers(data: dict, acct: str | None) -> dict:
+    """``data`` with share transfers between accounts added as stock trades.
+
+    In memory only — the stored history is never changed. A transfer moves
+    shares at cost: in, it gives them a basis here; out, it removes them at
+    average cost without realizing anything. A sale of shares this account
+    never held (moved in, then sold before the newest statement could list
+    them — STRK in the Stocks account) takes its cost from the matching
+    transfer out of another account, so the realized gain is the real one
+    rather than the whole sale proceeds.
+    """
+    if not acct:
+        return data
+    seeded, moved = _account_transfers(acct)
+    ins  = [{"date": _iso(e["date"]), "action": "BOT", "symbol": e["sym"],
+             "shares": e["shares"], "amount": e["amount"],
+             "desc": "transfer in", "transfer": True} for e in seeded]
+    outs = [{"date": _iso(e["date"]), "action": "SOLD", "symbol": e["sym"],
+             "shares": e["shares"], "amount": e.get("cost", 0.0),
+             "desc": "transfer out", "transfer": True} for e in moved]
+
+    # Sales the account can't cover from what it held.
+    book = ShareBook()
+    others = None
+    for t in sorted(ins + data.get("stk_trades", []) + outs, key=lambda t: t["date"]):
+        sym = t["symbol"]
+        if t["action"] == "BOT":
+            book.buy(sym, t["shares"], t["amount"])
+            continue
+        short = t["shares"] - book.shares(sym)
+        if not t.get("transfer") and short > 0.0001:
+            if others is None:
+                others = [dict(e) for a in list_accounts() if a != acct
+                          for e in _account_transfers(a)[1]]
+            for lot in others:
+                if short <= 0.0001:
+                    break
+                if lot["sym"] != sym or lot["shares"] <= 0.0001:
+                    continue
+                n = min(short, lot["shares"])
+                per = lot.get("cost", 0.0) / lot["shares"] if lot["shares"] else 0.0
+                d = min(_iso(lot["date"]), t["date"])
+                ins.append({"date": d, "action": "BOT", "symbol": sym, "shares": n,
+                            "amount": -round(per * n, 2),
+                            "desc": "transfer in", "transfer": True})
+                book.buy(sym, n, per * n)
+                lot["cost"]   = lot.get("cost", 0.0) - per * n
+                lot["shares"] -= n
+                short -= n
+        book.sell(sym, t["shares"], t["amount"], bool(t.get("transfer")))
+
+    if not ins and not outs:
+        return data
+    # Ins first and outs last, so on a shared date the shares arrive before
+    # anything is sold from them and leave only after the day's own trades.
+    return {**data, "stk_trades": ins + data.get("stk_trades", []) + outs}
+
+
+def _capital_flows(data: dict) -> list[dict]:
+    """Everything that put capital into the account or took it out.
+
+    Deposits and withdrawals, plus two things TOS doesn't write as either:
+    the cash the account already held before its earliest imported statement
+    (an IRA rollover, money moved in from another account), and shares moved
+    between accounts — counted at cost, in for the account receiving them and
+    out for the one giving them up, so each account's RoR is measured on what
+    it actually had to work with.
+    """
+    flows = list(data.get("deposits", []))
+    op = data.get("opening")
+    if op and abs(op.get("balance", 0.0)) > 0.005:
+        flows.append({"date": op["date"], "amount": op["balance"], "kind": "opening"})
+    for t in data.get("stk_trades", []):
+        if t.get("transfer"):
+            amt = abs(t["amount"])
+            flows.append({"date": t["date"], "kind": "transfer",
+                          "amount": amt if t["action"] == "BOT" else -amt})
+    return flows
+
+
 def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     """
     Walk trades chronologically with average-cost basis.
@@ -269,7 +461,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     stk = [{**t, "kind": "stk"} for t in data["stk_trades"]]
     trades = sorted(opt + stk, key=lambda t: t["date"])
 
-    deposits = sorted(data["deposits"], key=lambda d: d["date"])
+    deposits = sorted(_capital_flows(data), key=lambda d: d["date"])
 
     # Timeline = every date that has an event (balance, trade, or deposit), so a
     # trading day still plots even when its end-of-day BAL row hasn't posted yet.
@@ -289,7 +481,22 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     else:
         price_hist = {}
 
-    holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
+    # Capital in. The statement's deposit rows are incomplete — a full-history
+    # export omits them, and transfers between accounts never appear — but
+    # every row's running balance is exact. So with balances, capital in up
+    # to a day is that day's cash less all trade cash so far (premiums, stock
+    # bought and sold, fees): whatever is left came from outside. Shares moved
+    # in or out at cost are added on top. Without balances (an old history),
+    # it falls back to the deposit rows plus the opening balance.
+    bals = sorted(balances, key=lambda b: b["date"])
+    use_balances = bool(bals)
+    opening = (data.get("opening") or {}).get("balance")
+    bi = 0
+    last_bal = opening
+    cum_cash = 0.0
+    cum_moved = 0.0
+
+    book = ShareBook()
     cum_opt = 0.0
     cum_stk_realized = 0.0
     ti = 0   # trade index
@@ -297,6 +504,8 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     dep_cum = 0.0
 
     dep_series, realized_series, total_series = [], [], []
+    fees_series: list[float] = []
+    cum_fees = 0.0   # already inside realized; tracked so it can be shown
 
     for bd in timeline:
         # advance deposits
@@ -306,40 +515,36 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         # advance trades
         while ti < len(trades) and trades[ti]["date"] <= bd:
             t = trades[ti]
+            cum_fees += -t.get("fees", 0.0)
+            if t.get("transfer"):
+                cum_moved += abs(t["amount"]) * (1 if t["action"] == "BOT" else -1)
+            else:
+                cum_cash += t["amount"]
             if t["kind"] == "opt":
                 cum_opt += t["amount"]
             else:
-                sym = t["symbol"]
-                sh, tc = holdings.get(sym, [0.0, 0.0])
-                if t["action"] == "BOT":
-                    sh += t["shares"]
-                    tc += abs(t["amount"])
-                    holdings[sym] = [sh, tc]
-                else:  # SOLD — realize against average cost
-                    if sh > 0:
-                        avg = tc / sh
-                        q   = min(t["shares"], sh)
-                        cum_stk_realized += t["amount"] - avg * q
-                        sh -= q
-                        tc -= avg * q
-                        holdings[sym] = [sh, tc]
-                    else:
-                        # short / no basis — treat proceeds as realized
-                        cum_stk_realized += t["amount"]
+                realized, _ = book.apply(t["symbol"], t["action"], t["shares"],
+                                         t["amount"], bool(t.get("transfer")))
+                cum_stk_realized += realized
             ti += 1
 
         realized = cum_opt + cum_stk_realized
 
         # unrealized = market value of current holdings − their cost
         unreal = 0.0
-        for sym, (sh, tc) in holdings.items():
-            if sh <= 0:
-                continue
+        for sym, sh, tc in book.held():
             p = _price_on(price_hist.get(sym, {}), bd)
             if p is not None:
                 unreal += p * sh - tc
 
+        if use_balances:
+            while bi < len(bals) and bals[bi]["date"] <= bd:
+                last_bal = bals[bi]["balance"]
+                bi += 1
+            if last_bal is not None:
+                dep_cum = last_bal - cum_cash + cum_moved
         dep_series.append(dep_cum)
+        fees_series.append(cum_fees)
         realized_series.append(realized)
         total_series.append(realized + unreal)
 
@@ -348,6 +553,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         "deposits": dep_series,
         "realized": realized_series,
         "total":    total_series,
+        "fees":     fees_series,
     }
 
 
@@ -366,7 +572,7 @@ _OPT_DIAG_RE = re.compile(
 _OPT_VERT_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+VERTICAL\s+(?P<symbol>\S+)\s+100.*?'
     r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})'
-    r'\s+(?P<strike>[\d.]+)/[\d.]+\s+(?P<type>PUT|CALL)', re.IGNORECASE)
+    r'\s+(?P<strike>[\d.]+)/(?P<strike2>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
 _OPT_SINGLE_RE = re.compile(
     r'\b(?P<action>SOLD|BOT)\s+(?P<qty>[+-]?\d+)\s+(?P<symbol>\S+)\s+100.*?'
     r'(?P<exp>\d{1,2}\s+[A-Z]{3}\s+\d{2,4})\s+(?P<strike>[\d.]+)\s+(?P<type>PUT|CALL)', re.IGNORECASE)
@@ -381,6 +587,26 @@ def _parse_exp_date(s: str) -> date | None:
     return None
 
 
+def _vertical_leg(v: re.Match) -> dict | None:
+    """A vertical as the roll it is: sell the new strike, close the old one.
+
+    "BOT +3 VERTICAL DVN … 43/43.5 CALL" buys back the 43 and sells the 43.5;
+    a SOLD vertical sells its first strike and buys back the second. Same
+    expiration on both sides, so it chains like a diagonal roll.
+    """
+    exp = _parse_exp_date(v.group("exp"))
+    if exp is None:
+        return None
+    a, b = float(v.group("strike")), float(v.group("strike2"))
+    bought = v.group("action").upper() == "BOT"
+    qty = abs(int(v.group("qty")))
+    return {
+        "action": "SOLD", "qty": -qty, "symbol": v.group("symbol").upper(),
+        "exp": exp, "strike": b if bought else a, "close_strike": a if bought else b,
+        "close_exp": exp, "type": v.group("type").upper(), "is_roll": True,
+    }
+
+
 def _parse_opt_leg(desc: str) -> dict | None:
     m = _OPT_CAL_RE.search(desc)
     is_roll = m is not None
@@ -388,8 +614,9 @@ def _parse_opt_leg(desc: str) -> dict | None:
         m = _OPT_DIAG_RE.search(desc)
         is_roll = m is not None
     if m is None:
-        m = _OPT_VERT_RE.search(desc)
-    if m is None:
+        v = _OPT_VERT_RE.search(desc)
+        if v is not None:
+            return _vertical_leg(v)
         m = _OPT_SINGLE_RE.search(desc)
     if not m:
         return None
@@ -511,33 +738,19 @@ def _bdays(start: date, end: date) -> list[date]:
 
 def _stock_realized_by_date(data: dict) -> dict[date, float]:
     """Realized P&L from stock sales (avg-cost basis), booked on the sale day."""
-    trades = sorted(data.get("stk_trades", []), key=lambda t: t["date"])
-    holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
+    book = ShareBook()
     out: dict[date, float] = {}
-    for t in trades:
-        sym = t["symbol"]
-        sh, tc = holdings.get(sym, [0.0, 0.0])
+    for t in sorted(data.get("stk_trades", []), key=lambda t: t["date"]):
+        realized, _ = book.apply(t["symbol"], t["action"], t["shares"],
+                                 t["amount"], bool(t.get("transfer")))
         if t["action"] == "BOT":
-            sh += t["shares"]
-            tc += abs(t["amount"])
-            holdings[sym] = [sh, tc]
-        else:  # SOLD — realize proceeds against average cost
-            if sh > 0:
-                avg = tc / sh
-                q   = min(t["shares"], sh)
-                realized = t["amount"] - avg * q
-                sh -= q
-                tc -= avg * q
-                holdings[sym] = [sh, tc]
-            else:
-                realized = t["amount"]   # short / no basis
-            try:
-                d = date.fromisoformat(t["date"])
-            except Exception:
-                continue
-            out[d] = out.get(d, 0.0) + realized
+            continue
+        try:
+            d = date.fromisoformat(t["date"])
+        except Exception:
+            continue
+        out[d] = out.get(d, 0.0) + realized
     return out
-
 
 def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
                           range_to: str | None) -> dict | None:
@@ -701,8 +914,12 @@ def _weekly_allocated_ror(data: dict, sel, range_from: str | None,
         win_start = date.fromisoformat(range_from)
         win_end   = date.fromisoformat(range_to)
     elif isinstance(sel, int):
-        win_end   = last
-        win_start = last - timedelta(days=sel)
+        # Count back from the last real trade, like the P&L tab — not from the
+        # furthest day premium is projected to accrue.
+        real = [date.fromisoformat(t["date"])
+                for t in data.get("opt_trades", []) + data.get("stk_trades", [])]
+        win_end   = min(max(real), last) if real else last
+        win_start = win_end - timedelta(days=sel)
     else:
         win_start, win_end = first, last
 
@@ -741,7 +958,10 @@ class GainsTab(QWidget):
         self._lbl_dep      = QLabel("Net deposits: —")
         self._lbl_realized = QLabel("Realized: —")
         self._lbl_total    = QLabel("Total: —")
-        for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+        self._lbl_fees     = QLabel("Fees: —")
+        self._lbl_fees.setToolTip("Commissions and misc fees paid, from the statement's "
+                                  "fee columns. Already subtracted from Realized and Total.")
+        for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
             lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
             summary.addWidget(lbl)
         summary.addStretch()
@@ -788,6 +1008,12 @@ class GainsTab(QWidget):
 
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
         """Shared time-range filter (sel: None=all, int=days back, 'custom')."""
+        # The same range again (an account switch re-applies it right after the
+        # load already drew with it) would only redo the work.
+        def _key(s, f, t):
+            return (s, f, t) if s == "custom" else (s,)
+        if _key(sel, date_from, date_to) == _key(self._range_sel, self._range_from, self._range_to):
+            return
         self._range_sel  = sel
         self._range_from = date_from
         self._range_to   = date_to
@@ -817,27 +1043,37 @@ class GainsTab(QWidget):
             hi = dates[-1] + timedelta(days=1)
             lo = dates[-1] - timedelta(days=sel)
 
-        idx = [i for i, d in enumerate(dates) if lo <= d <= hi]
+        idx = [i for i, d in enumerate(dates) if lo <= d < hi]
         if not idx:
             return None
         n = len(dates)
-        return {
+        out = {
             k: ([v[i] for i in idx] if isinstance(v, list) and len(v) == n else v)
             for k, v in series.items()
         }
+        # Realized, total and fees are running totals since the first
+        # statement; within a range they count from where the range starts —
+        # the last point before it — so the figures are what that window
+        # earned. Net deposits stay as they are: capital is a level, not a
+        # flow, and the RoR divides by what was in the account.
+        start = idx[0] - 1
+        for k in ("realized", "total", "fees"):
+            base = series[k][start] if start >= 0 else 0.0
+            out[k] = [v - base for v in out[k]]
+        return out
 
     def _refresh_chart(self):
         for ax in (self._ax1, self._ax2):
             ax.clear()
 
-        full = reconstruct(self._data)
+        full = reconstruct(prepared(self._data, self._account))
         if not full:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "Import a TOS CSV in the Positions tab",
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=11, color="gray")
             self._canvas.draw()
-            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
                 lbl.setText(lbl.text().split(":")[0] + ": —")
             return
 
@@ -848,7 +1084,7 @@ class GainsTab(QWidget):
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=11, color="gray")
             self._canvas.draw()
-            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
                 lbl.setText(lbl.text().split(":")[0] + ": —")
             return
 
@@ -893,6 +1129,7 @@ class GainsTab(QWidget):
         self._lbl_total.setStyleSheet(
             f"font-weight: bold; font-size: 13px; color: {'green' if total_pnl >= 0 else 'red'};")
         self._lbl_total.setText(f"Total: ${total_pnl:+,.2f} ({tot_ror:+.1f}%)")
+        self._lbl_fees.setText(f"Fees: ${series['fees'][-1]:,.2f}")
 
 
 def _bar_width(x: list[float]) -> float:
@@ -953,6 +1190,12 @@ class WeeklyRorTab(QWidget):
 
     # ── external hooks ──────────────────────────────────────────────────────
     def apply_range(self, sel, date_from: str | None = None, date_to: str | None = None):
+        # The same range again (an account switch re-applies it right after the
+        # load already drew with it) would only redo the work.
+        def _key(s, f, t):
+            return (s, f, t) if s == "custom" else (s,)
+        if _key(sel, date_from, date_to) == _key(self._range_sel, self._range_from, self._range_to):
+            return
         self._range_sel  = sel
         self._range_from = date_from
         self._range_to   = date_to
@@ -981,12 +1224,13 @@ class WeeklyRorTab(QWidget):
         self._ax_d.clear()
         self._ax_r.clear()
 
-        if not self._data.get("opt_trades"):
+        if not (self._data.get("opt_trades") or self._data.get("stk_trades")):
             self._empty("Import a TOS CSV in the Positions tab")
             return
 
         wk = _weekly_allocated_ror(
-            self._data, self._range_sel, self._range_from, self._range_to)
+            prepared(self._data, self._account),
+            self._range_sel, self._range_from, self._range_to)
         if not wk or not wk["weeks"]:
             self._empty("No data in selected range")
             return
