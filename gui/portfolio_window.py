@@ -90,7 +90,14 @@ outright aren't shown for it.</li>
 already subtracted from Realized and Total; shown so you can check them.</li>
 <li><b>Total P&amp;L</b> = realized + unrealized. Unrealized marks open share
 holdings to market using yfinance closes.</li>
-<li><b>Net Deposits</b> is the blue base; gain/loss bars stack on top (green/red).
+<li><b>Net Deposits</b> is the capital that came into the account from outside:
+each day's cash balance (from the statement's running BALANCE column) less all
+trade cash to date — premiums, stock bought and sold, fees. That catches every
+deposit, withdrawal, rollover and cash transfer, which TOS often leaves out of
+the statement as rows (a full-history export omits them all). Shares moved
+between accounts count at cost: in where they arrive, out where they leave.
+Interest and dividends, being small and unlisted, land here too.</li>
+<li>Net Deposits is the blue base; gain/loss bars stack on top (green/red).
 Untick <i>Show deposits</i> to plot P&amp;L from a zero baseline so it autoscales.</li>
 <li><b>RoR %</b> in the titles = P&amp;L ÷ net deposits.</li>
 <li>The date axis is the union of all event dates (balance, trade, deposit), so a

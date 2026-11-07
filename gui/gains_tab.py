@@ -92,6 +92,8 @@ def parse_statement(path: Path) -> dict:
     balances:   list[dict] = []
     opt_trades: list[dict] = []
     stk_trades: list[dict] = []
+    opening:    dict | None = None   # cash before the statement's first row
+    day_balance: dict[str, float] = {}
     in_cb = False
 
     for row in rows:
@@ -123,8 +125,16 @@ def parse_statement(path: Path) -> dict:
         desc     = cells[4] if len(cells) > 4 else ""
         diso     = row_date.isoformat()
 
-        if row_type == "BAL" and balance is not None:
-            balances.append({"date": diso, "balance": balance})
+        # Every row carries the running balance, so the first one tells what
+        # the account held before anything on this statement happened.
+        if opening is None and balance is not None:
+            opening = {"date": diso,
+                       "balance": round(balance - (amount or 0.0) - fees, 2)}
+
+        # End-of-day cash: the last running balance of each date (rows are
+        # in time order). It's what capital in is measured from.
+        if balance is not None:
+            day_balance[diso] = balance
 
         elif row_type in _DEPOSIT_TYPES and amount is not None and amount > 0:
             deposits.append({"ref": ref, "date": diso, "amount": amount})
@@ -146,8 +156,10 @@ def parse_statement(path: Path) -> dict:
                     "shares": shares, "amount": amount, "fees": fees, "desc": desc,
                 })
 
+    balances = [{"date": d, "balance": b} for d, b in sorted(day_balance.items())]
     return {"deposits": deposits, "balances": balances,
-            "opt_trades": opt_trades, "stk_trades": stk_trades}
+            "opt_trades": opt_trades, "stk_trades": stk_trades,
+            "opening": opening}
 
 
 def _blank_history() -> dict:
@@ -228,16 +240,29 @@ def _backfill_fees(existing: list[dict], new: list[dict], key_fn) -> None:
                 e["fees"] = fees.pop(0)
 
 
+def _merge_balances(existing: list[dict], new: list[dict]) -> int:
+    """End-of-day balances by date; the incoming statement's value wins (a
+    statement pulled mid-day can hold a balance the day later moved past)."""
+    by_date = {b["date"]: b for b in existing}
+    added = sum(1 for b in new if b["date"] not in by_date)
+    by_date.update({b["date"]: b for b in new})
+    existing[:] = sorted(by_date.values(), key=lambda b: b["date"])
+    return added
+
+
 def merge_statement(data: dict, parsed: dict) -> dict:
     """Merge a parsed statement into accumulated history. Returns counts added."""
     trade_key = lambda e: (e["date"], e["desc"], e["amount"])
+    # The earliest statement's opening balance is the account's starting cash.
+    op = parsed.get("opening")
+    if op and (not data.get("opening") or op["date"] < data["opening"]["date"]):
+        data["opening"] = op
     _backfill_fees(data["opt_trades"], parsed["opt_trades"], trade_key)
     _backfill_fees(data["stk_trades"], parsed["stk_trades"], trade_key)
     counts = {
         "deposits":   _merge(data["deposits"],   parsed["deposits"],
                              lambda e: e["ref"] or (e["date"], e["amount"])),
-        "balances":   _merge(data["balances"],   parsed["balances"],
-                             lambda e: e["date"]),
+        "balances":   _merge_balances(data["balances"], parsed["balances"]),
         "opt_trades": _merge_counted(data["opt_trades"], parsed["opt_trades"],
                                      lambda e: (e["date"], e["desc"], e["amount"])),
         "stk_trades": _merge_counted(data["stk_trades"], parsed["stk_trades"],
@@ -393,6 +418,28 @@ def with_transfers(data: dict, acct: str | None) -> dict:
     return {**data, "stk_trades": ins + data.get("stk_trades", []) + outs}
 
 
+def _capital_flows(data: dict) -> list[dict]:
+    """Everything that put capital into the account or took it out.
+
+    Deposits and withdrawals, plus two things TOS doesn't write as either:
+    the cash the account already held before its earliest imported statement
+    (an IRA rollover, money moved in from another account), and shares moved
+    between accounts — counted at cost, in for the account receiving them and
+    out for the one giving them up, so each account's RoR is measured on what
+    it actually had to work with.
+    """
+    flows = list(data.get("deposits", []))
+    op = data.get("opening")
+    if op and abs(op.get("balance", 0.0)) > 0.005:
+        flows.append({"date": op["date"], "amount": op["balance"], "kind": "opening"})
+    for t in data.get("stk_trades", []):
+        if t.get("transfer"):
+            amt = abs(t["amount"])
+            flows.append({"date": t["date"], "kind": "transfer",
+                          "amount": amt if t["action"] == "BOT" else -amt})
+    return flows
+
+
 def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     """
     Walk trades chronologically with average-cost basis.
@@ -409,7 +456,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     stk = [{**t, "kind": "stk"} for t in data["stk_trades"]]
     trades = sorted(opt + stk, key=lambda t: t["date"])
 
-    deposits = sorted(data["deposits"], key=lambda d: d["date"])
+    deposits = sorted(_capital_flows(data), key=lambda d: d["date"])
 
     # Timeline = every date that has an event (balance, trade, or deposit), so a
     # trading day still plots even when its end-of-day BAL row hasn't posted yet.
@@ -428,6 +475,21 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         price_hist = _fetch_price_history(symbols, start_d, end_d)
     else:
         price_hist = {}
+
+    # Capital in. The statement's deposit rows are incomplete — a full-history
+    # export omits them, and transfers between accounts never appear — but
+    # every row's running balance is exact. So with balances, capital in up
+    # to a day is that day's cash less all trade cash so far (premiums, stock
+    # bought and sold, fees): whatever is left came from outside. Shares moved
+    # in or out at cost are added on top. Without balances (an old history),
+    # it falls back to the deposit rows plus the opening balance.
+    bals = sorted(balances, key=lambda b: b["date"])
+    use_balances = bool(bals)
+    opening = (data.get("opening") or {}).get("balance")
+    bi = 0
+    last_bal = opening
+    cum_cash = 0.0
+    cum_moved = 0.0
 
     holdings: dict[str, list[float]] = {}   # symbol → [shares, total_cost]
     cum_opt = 0.0
@@ -449,6 +511,10 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         while ti < len(trades) and trades[ti]["date"] <= bd:
             t = trades[ti]
             cum_fees += -t.get("fees", 0.0)
+            if t.get("transfer"):
+                cum_moved += abs(t["amount"]) * (1 if t["action"] == "BOT" else -1)
+            else:
+                cum_cash += t["amount"]
             if t["kind"] == "opt":
                 cum_opt += t["amount"]
             else:
@@ -485,6 +551,12 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
             if p is not None:
                 unreal += p * sh - tc
 
+        if use_balances:
+            while bi < len(bals) and bals[bi]["date"] <= bd:
+                last_bal = bals[bi]["balance"]
+                bi += 1
+            if last_bal is not None:
+                dep_cum = last_bal - cum_cash + cum_moved
         dep_series.append(dep_cum)
         fees_series.append(cum_fees)
         realized_series.append(realized)
