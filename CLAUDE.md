@@ -91,7 +91,9 @@ Built with PyQt6. `run_screener.py` just creates the `QApplication` (no local te
 `run_portfolio.py` launches a standalone window; it needs no market-data API (prices via yfinance).
 
 - **`portfolio_window.py`** — `QMainWindow` wrapping `PortfolioTab`.
-- **`positions_tab.py`** — Position tracker; persists to `my_option_positions.json` and `my_stock_positions.json`. Imports TOS Account Statement CSVs (parses the `Options` section and matches fees from `Cash Balance TRD` rows). Refreshes prices via yfinance. Computes 5%/10% below strike automatically.
+- **`positions_tab.py`** — Position tracker. Imports TOS Account Statement CSVs into per-account `my_option_events_<acct>.json` (`events` from the `Cash Balance` section, `outcomes` from its RAD rows, `holdings` = the newest statement's `Equities` list). The `Account Order/Trade History` sections are not used, so TOS's symbol filter on the export is harmless. `_reconstruct_wheels()` rebuilds rows from events: wheel cycles start from a short put (rolls, including diagonal and partial ones, stay on one row); shares bought outright start a long stock row that their covered calls join; a bought option is a long option row. Rows carry Assn/Buy Price, Cost Basis (less put premium) and Recovery (less call premium), plus a Blended row per symbol. The Positions tab shows live rows grouped by ticker (custom sort, spanned Symbol cell); finished cycles go to the Closed tab. Prices via yfinance.
+  - `holdings_adjustments()` squares trades with the statement's holdings: shares listed but never bought become a *Transferred in* lot; shares bought but no longer listed leave as a transfer out at cost. TOS writes no row for a move between accounts, so this is the only record of one. Outright buys are shown only once an account has a holdings snapshot.
+- **`gains_tab.py`** — P&L Chart and Weekly RoR, cash basis (buying an option is a realized debit). `with_transfers()` applies the same transfers in memory, matching a sale of never-held shares to another account's transfer out for its cost.
 
 ### Market data (Schwab)
 

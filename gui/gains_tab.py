@@ -28,7 +28,7 @@ _RANGE_OPTIONS = [
     ("Custom…",  "custom"),
 ]
 
-from .account_store import gains_path
+from .account_store import events_path, gains_path, list_accounts
 
 _DEPOSIT_TYPES    = {"CRC"}
 _WITHDRAWAL_TYPES = {"CDB"}
@@ -39,8 +39,9 @@ _CB_SECTION_STOPS = {"Account Trade History", "Profits and Losses",
 _STK_TRD_RE = re.compile(
     r'^(BOT|SOLD)\s+([+-]?\d+(?:\.\d+)?)\s+([A-Z]+)\s+@', re.IGNORECASE)
 # Stock assignment/exercise in the EXP rows, e.g. "BOT 100.0 SPXU UPON ..."
+# A called-away sale is signed: "SOLD -400.0 GAP UPON ...".
 _STK_EXP_RE = re.compile(
-    r'^(BOT|SOLD)\s+(\d+(?:\.\d+)?)\s+([A-Z]+)\s+UPON', re.IGNORECASE)
+    r'^(BOT|SOLD)\s+([+-]?\d+(?:\.\d+)?)\s+([A-Z]+)\s+UPON', re.IGNORECASE)
 
 
 def _parse_amount(raw: str) -> float | None:
@@ -253,6 +254,85 @@ def _price_on(hist: dict, date_str: str) -> float | None:
     return hist[max(candidates)] if candidates else None
 
 
+def _account_transfers(acct: str) -> tuple[list[dict], list[dict]]:
+    """(transfers in, transfers out) for one account, from its positions data.
+
+    The statement records no row when shares move between accounts, so the
+    trades alone leave them held in the old account forever and sold from the
+    new one with no cost at all. The Positions tab squares each account with
+    the holdings its newest statement lists; this reuses that.
+    """
+    from .positions_tab import holdings_adjustments
+    try:
+        d = json.loads(events_path(acct).read_text())
+    except Exception:
+        return [], []
+    return holdings_adjustments(d.get("events", []), d.get("holdings"))
+
+
+def _iso(mdy: str) -> str:
+    return datetime.strptime(mdy, "%m/%d/%Y").date().isoformat()
+
+
+def with_transfers(data: dict, acct: str | None) -> dict:
+    """``data`` with share transfers between accounts added as stock trades.
+
+    In memory only — the stored history is never changed. A transfer moves
+    shares at cost: in, it gives them a basis here; out, it removes them at
+    average cost without realizing anything. A sale of shares this account
+    never held (moved in, then sold before the newest statement could list
+    them — STRK in the Stocks account) takes its cost from the matching
+    transfer out of another account, so the realized gain is the real one
+    rather than the whole sale proceeds.
+    """
+    if not acct:
+        return data
+    seeded, moved = _account_transfers(acct)
+    ins  = [{"date": _iso(e["date"]), "action": "BOT", "symbol": e["sym"],
+             "shares": e["shares"], "amount": e["amount"],
+             "desc": "transfer in", "transfer": True} for e in seeded]
+    outs = [{"date": _iso(e["date"]), "action": "SOLD", "symbol": e["sym"],
+             "shares": e["shares"], "amount": e.get("cost", 0.0),
+             "desc": "transfer out", "transfer": True} for e in moved]
+
+    # Sales the account can't cover from what it held.
+    held: dict[str, float] = {}
+    others = None
+    for t in sorted(ins + data.get("stk_trades", []) + outs, key=lambda t: t["date"]):
+        sym = t["symbol"]
+        sh  = held.get(sym, 0.0)
+        if t["action"] == "BOT":
+            held[sym] = sh + t["shares"]
+            continue
+        short = t["shares"] - sh
+        if not t.get("transfer") and short > 0.0001:
+            if others is None:
+                others = [dict(e) for a in list_accounts() if a != acct
+                          for e in _account_transfers(a)[1]]
+            for lot in others:
+                if short <= 0.0001:
+                    break
+                if lot["sym"] != sym or lot["shares"] <= 0.0001:
+                    continue
+                n = min(short, lot["shares"])
+                per = lot.get("cost", 0.0) / lot["shares"] if lot["shares"] else 0.0
+                d = min(_iso(lot["date"]), t["date"])
+                ins.append({"date": d, "action": "BOT", "symbol": sym, "shares": n,
+                            "amount": -round(per * n, 2),
+                            "desc": "transfer in", "transfer": True})
+                lot["cost"]   = lot.get("cost", 0.0) - per * n
+                lot["shares"] -= n
+                short -= n
+                sh    += n
+        held[sym] = max(sh - t["shares"], 0.0)
+
+    if not ins and not outs:
+        return data
+    # Ins first and outs last, so on a shared date the shares arrive before
+    # anything is sold from them and leave only after the day's own trades.
+    return {**data, "stk_trades": ins + data.get("stk_trades", []) + outs}
+
+
 def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     """
     Walk trades chronologically with average-cost basis.
@@ -319,7 +399,8 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
                     if sh > 0:
                         avg = tc / sh
                         q   = min(t["shares"], sh)
-                        cum_stk_realized += t["amount"] - avg * q
+                        if not t.get("transfer"):      # moved, not sold
+                            cum_stk_realized += t["amount"] - avg * q
                         sh -= q
                         tc -= avg * q
                         holdings[sym] = [sh, tc]
@@ -525,7 +606,7 @@ def _stock_realized_by_date(data: dict) -> dict[date, float]:
             if sh > 0:
                 avg = tc / sh
                 q   = min(t["shares"], sh)
-                realized = t["amount"] - avg * q
+                realized = 0.0 if t.get("transfer") else t["amount"] - avg * q
                 sh -= q
                 tc -= avg * q
                 holdings[sym] = [sh, tc]
@@ -830,7 +911,7 @@ class GainsTab(QWidget):
         for ax in (self._ax1, self._ax2):
             ax.clear()
 
-        full = reconstruct(self._data)
+        full = reconstruct(with_transfers(self._data, self._account))
         if not full:
             for ax in (self._ax1, self._ax2):
                 ax.text(0.5, 0.5, "Import a TOS CSV in the Positions tab",
@@ -986,7 +1067,8 @@ class WeeklyRorTab(QWidget):
             return
 
         wk = _weekly_allocated_ror(
-            self._data, self._range_sel, self._range_from, self._range_to)
+            with_transfers(self._data, self._account),
+            self._range_sel, self._range_from, self._range_to)
         if not wk or not wk["weeks"]:
             self._empty("No data in selected range")
             return

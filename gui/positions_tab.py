@@ -32,6 +32,7 @@ _OPT_COLUMNS = [
     ("opened",     "Opened",            "edit"),
     ("lifecycle",  "Lifecycle",         "edit"),   # Put → Assigned → Sold, etc.
     ("qty",        "Qty",               "edit"),
+    ("unit",       "Unit",              "calc"),   # what Qty counts: contracts or shares
     ("strike",     "Strike",            "edit"),
     ("capital",    "Capital",           "calc"),   # at risk now; live rows only
     ("capital_pct","% of Book",         "calc"),
@@ -41,11 +42,39 @@ _OPT_COLUMNS = [
     ("weeks_held", "Weeks Held",        "calc"),
     ("fees",       "Fees",              "edit"),
     ("weekly_ror", "Avg Weekly RoR",    "calc"),
-    ("cost_basis", "Cost Basis/Recovery/P&L",  "calc"),
+    # Target prices for a position that is (or may become) shares:
+    #   Assn Price — what the shares cost at assignment (avg strike paid)
+    #   Cost Basis — assignment price less the put premium
+    #   Recovery   — cost basis less the call premium: the break-even exit price
+    ("assn_price", "Assn/Buy Price",    "calc"),
+    ("cost_basis", "Cost Basis",        "calc"),
+    ("recovery",   "Recovery",          "calc"),
     # Last, so the stretched final column absorbs variable-length tag lists.
     ("tags",       "Tags",              "calc"),   # durable-tags.json risk tags
 ]
 _OPT_FIELDS = [c[0] for c in _OPT_COLUMNS]
+
+# Closed tab: finished cycles only. Market price, capital and the target prices
+# describe a position you still hold, so they are left off; the same cost_basis
+# field carries total P&L for a completed row.
+_CLOSED_COLUMNS = [
+    ("symbol",     "Symbol"),
+    ("opened",     "Opened"),
+    ("lifecycle",  "Lifecycle"),
+    ("qty",        "Qty"),
+    ("unit",       "Unit"),
+    ("strike",     "Strike"),
+    ("premium",    "Premium ($)"),
+    ("expiration", "Ended"),
+    ("status",     "Status"),
+    ("weeks_held", "Weeks Held"),
+    ("fees",       "Fees"),
+    ("weekly_ror", "Avg Weekly RoR"),
+    ("cost_basis", "P&L"),
+    ("tags",       "Tags"),
+]
+_CLOSED_FIELDS = [c[0] for c in _CLOSED_COLUMNS]
+_C_STATUS_COL  = _CLOSED_FIELDS.index("status")
 _O_HDRS     = [c[1] for c in _OPT_COLUMNS]
 _OPT_HIDDEN_COLS = [i for i, c in enumerate(_OPT_COLUMNS) if c[2] == "hidden"]
 
@@ -64,19 +93,130 @@ _O_WEEKS_COL     = _oc("weeks_held")
 _O_ROR_COL       = _oc("weekly_ror")
 _O_PREMIUM_COL   = _oc("premium")
 
-# "Blended" shares Open's rank so a symbol's summary row stays with its legs
-# instead of collecting at one end of the table.
-_STATUS_SORT = {"Open": 0, "Blended": 0, "Holding": 1, "Closed": 2,
-                "Called away": 3, "Assigned": 4, "Sold": 5, "Expired": 6}
+# Live statuses share a rank so a symbol's puts, shares/calls and summary row
+# read as one group; _LIVE_LEG_SORT then orders them within the symbol.
+_STATUS_SORT = {"Open": 0, "Holding": 0, "Blended": 0, "Closed": 2,
+                "Called away": 3, "Assigned": 4, "Sold": 5, "Transferred": 5,
+                "Expired": 6}
+_LIVE_LEG_SORT = {"Open": 0, "Holding": 1, "Blended": 2}
+
+
+def _row_sort_key(r: dict) -> tuple:
+    """Wheel-cycle progression, then ticker, then a live symbol's legs in order."""
+    status = r.get("status", "")
+    # "opened" is MM/DD/YYYY; as a string 01/05/2027 sorts before 12/15/2026.
+    return (_STATUS_SORT.get(status, 99), r.get("symbol", ""),
+            _LIVE_LEG_SORT.get(status, 0),
+            _parse_mdy(r.get("opened", "")) or date.min)
 
 
 class _StatusItem(QTableWidgetItem):
-    """Table item that sorts Status by wheel-cycle progression, not alphabetically."""
+    """Table item that sorts Status by wheel-cycle progression, not alphabetically.
+
+    Carries the whole row key rather than just the status: Qt's sort is stable,
+    so ties would otherwise fall back on whatever column was sorted last, and
+    clicking the header could not put a symbol's legs back together.
+    """
+    def __init__(self, text: str, sort_key: tuple):
+        super().__init__(text)
+        self.sort_key = sort_key
+
     def __lt__(self, other):
         if isinstance(other, _StatusItem):
-            return (_STATUS_SORT.get(self.text(), 99) <
-                    _STATUS_SORT.get(other.text(), 99))
+            return self.sort_key < other.sort_key
         return super().__lt__(other)
+
+
+class _SymbolItem(QTableWidgetItem):
+    """Closed-tab Symbol cell: sorts by ticker, then oldest cycle first.
+
+    Sorting on the ticker text alone leaves a symbol's rows in whatever order
+    the previous sort left them. Within one ticker the order stays oldest first
+    whichever way the column is sorted: Qt sorts descending by swapping the
+    comparison, so the within-ticker part is swapped back. (The Positions table
+    doesn't use Qt sorting at all — see _grouped_order.)
+    """
+    def __init__(self, text: str, row: dict):
+        super().__init__(text)
+        opened = _parse_mdy(row.get("opened", ""))
+        self.ticker  = row.get("symbol", "")
+        # Blended's "— blended —" has no date; it sorts by its leg rank alone.
+        self.leg_key = (_LIVE_LEG_SORT.get(row.get("status", ""), 0),
+                        opened or date.min)
+
+    def __lt__(self, other):
+        if not isinstance(other, _SymbolItem):
+            return super().__lt__(other)
+        if self.ticker != other.ticker:
+            return self.ticker < other.ticker
+        table = self.tableWidget()
+        desc = (table is not None and table.horizontalHeader().sortIndicatorOrder()
+                == Qt.SortOrder.DescendingOrder)
+        if desc:
+            return other.leg_key < self.leg_key
+        return self.leg_key < other.leg_key
+
+
+def _sort_value(field: str, row: dict, prices: dict):
+    """Comparable value of one cell for the grouped live sort; None = blank.
+
+    Cells are display strings ('$28,800', '7.8%', '+12.00', '08/14/2026'), so
+    they are read back as dates or numbers where they parse; text sorts after
+    numbers and case-blind. '—' and empty cells are blank and always go last.
+    """
+    if field == "market":
+        price = prices.get(row.get("symbol", ""))
+        return (0, float(price)) if isinstance(price, (int, float)) else None
+    if field == "status":
+        return (0, _LIVE_LEG_SORT.get(row.get("status", ""), 0))
+    raw = str(row.get(field, "")).strip()
+    if not raw or raw.startswith("—"):
+        return None
+    d = _parse_mdy(raw)
+    if d is not None:
+        return (0, d.toordinal())
+    try:
+        return (0, float(raw.replace("$", "").replace(",", "")
+                         .replace("%", "").replace("+", "")))
+    except ValueError:
+        return (1, raw.lower())
+
+
+def _grouped_order(rows: list[dict], field: str, desc: bool,
+                   prices: dict) -> list[list[dict]]:
+    """Live rows as ticker groups, sorted on ``field`` without splitting a ticker.
+
+    Within a group the legs sort on the column (blanks last) and Blended stays
+    at the bottom — it summarises the rows above it. Groups order by their
+    leading row, so sorting on Expiration puts the ticker with the nearest
+    expiration first; tickers break ties, and a group with no value goes last.
+    Sorting on Symbol itself orders the groups by ticker and keeps each one's
+    legs in their natural order (puts → shares → Blended, oldest first).
+    """
+    groups: dict[str, list[dict]] = {}
+    for r in sorted(rows, key=_row_sort_key):
+        groups.setdefault(r.get("symbol", ""), []).append(r)
+
+    keyed = []
+    for sym, g in groups.items():
+        legs    = [r for r in g if r.get("status") != "Blended"]
+        blended = [r for r in g if r.get("status") == "Blended"]
+        if field == "symbol":
+            keyed.append(((0, sym.lower()), sym, legs + blended))
+            continue
+        vals    = [(r, _sort_value(field, r, prices)) for r in legs]
+        present = [rv for rv in vals if rv[1] is not None]
+        present.sort(key=lambda rv: rv[1], reverse=desc)
+        missing = [r for r, v in vals if v is None]
+        head    = present[0][1] if present else None
+        keyed.append((head, sym, [r for r, _ in present] + missing + blended))
+
+    with_val = [k for k in keyed if k[0] is not None]
+    no_val   = sorted((k for k in keyed if k[0] is None), key=lambda k: k[1])
+    # Two stable passes: ticker always ascending as the tie-break, then value.
+    with_val.sort(key=lambda k: k[1])
+    with_val.sort(key=lambda k: k[0], reverse=desc)
+    return [k[2] for k in with_val + no_val]
 
 
 def _fmt_price(price) -> str:
@@ -110,11 +250,13 @@ class _PriceWorker(QThread):
 class PortfolioTab(QWidget):
     csv_imported    = pyqtSignal(str, str)   # (file path, account) after a successful import
     account_changed = pyqtSignal(str)        # account label text
+    closed_count_changed = pyqtSignal(int)   # rows on the Closed tab, for its title
     status_changed  = pyqtSignal(str)        # status bar text
 
     def __init__(self):
         super().__init__()
         self._events, self._outcomes, self._account = [], {}, ""
+        self._holdings: dict = {}   # newest statement's Equities snapshot
         self._exposure   = {}     # last _annotate_tags_and_capital() result
         self._range_sel  = None   # None → all time; int → days back; "custom"
         self._range_from = None   # ISO date string when custom
@@ -143,9 +285,11 @@ class PortfolioTab(QWidget):
                 outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
                 events = data.get("events", [])
                 _drop_split_roll_duplicates(events)
+                self._holdings = data.get("holdings", {})
                 return events, outcomes
             except Exception:
                 pass
+        self._holdings = {}
         return [], {}
 
     def _save_events(self):
@@ -153,12 +297,16 @@ class PortfolioTab(QWidget):
             "account":  self._account,
             "events":   self._events,
             "outcomes": {_outcome_key(k): v for k, v in self._outcomes.items()},
+            "holdings": self._holdings,
         }, indent=2))
 
     def load_account(self, acct: str):
         """Switch the active account: load its events and rebuild the table."""
         self._account = acct
-        self._events, self._outcomes = self._read_events(acct) if acct else ([], {})
+        if acct:
+            self._events, self._outcomes = self._read_events(acct)
+        else:
+            self._events, self._outcomes, self._holdings = [], {}, {}
         self._rebuild_options_table()
         self.account_changed.emit(self._account)
 
@@ -171,19 +319,26 @@ class PortfolioTab(QWidget):
 
     def _rebuild_options_table(self):
         from datetime import timedelta
-        rows = _reconstruct_wheels(self._events, self._outcomes)
+        rows = _reconstruct_wheels(self._events, self._outcomes, self._holdings)
 
-        # Date-range filter — active (Open/Holding) positions always shown
+        # Date-range filter — active (Open/Holding) positions always shown.
+        # "opened" is MM/DD/YYYY and the bounds are ISO, so compare as ISO:
+        # comparing the raw strings put every closed row outside any range.
         sel = self._range_sel
         active = ("Open", "Holding", "Blended")
+
+        def _opened_iso(r):
+            d = _parse_mdy(r["opened"])
+            return d.isoformat() if d else ""
+
         if sel == "custom" and self._range_from and self._range_to:
             rows = [r for r in rows
                     if r["status"] in active
-                    or self._range_from <= r["opened"] <= self._range_to]
+                    or self._range_from <= _opened_iso(r) <= self._range_to]
         elif isinstance(sel, int):
             cutoff = (date.today() - timedelta(days=sel)).isoformat()
             rows = [r for r in rows
-                    if r["status"] in active or r["opened"] >= cutoff]
+                    if r["status"] in active or _opened_iso(r) >= cutoff]
 
         # Exposure is measured on what's on screen — with a range filter active
         # the table is the book you're looking at, and the panel must agree with
@@ -191,17 +346,84 @@ class PortfolioTab(QWidget):
         self._exposure = _annotate_tags_and_capital(rows)
         self._render_exposure()
 
-        rows.sort(key=lambda r: (_STATUS_SORT.get(r["status"], 99), r["symbol"], r["opened"]))
-        self._opt_table.setSortingEnabled(False)
-        self._opt_table.blockSignals(True)
-        self._opt_table.setRowCount(0)
-        for r in rows:
-            self._insert_option_row(r)
-        self._opt_table.blockSignals(False)
-        self._opt_table.setSortingEnabled(True)
-        self._opt_table.sortByColumn(_O_STATUS_COL, Qt.SortOrder.AscendingOrder)
-        self._opt_table.resizeColumnsToContents()
+        rows.sort(key=_row_sort_key)
+        live   = [r for r in rows if r["status"] in active]
+        closed = [r for r in rows if r["status"] not in active]
+        self._live_rows = live
+        self._render_live()
+        self._fill_table(self._closed_table, _CLOSED_FIELDS, closed, _C_STATUS_COL)
+        self.closed_count_changed.emit(len(closed))
         self._refresh_market_prices()
+
+    def _fill_table(self, table, fields, rows, status_col):
+        """Refill a Qt-sorted table, keeping whatever sort the user chose.
+
+        Status ascending is the default only until a header is clicked; a
+        rebuild (range change, import) re-applies the current indicator.
+        """
+        header = table.horizontalHeader()
+        if header.isSortIndicatorShown() and getattr(table, "_sorted_once", False):
+            col, order = header.sortIndicatorSection(), header.sortIndicatorOrder()
+        else:
+            col, order = status_col, Qt.SortOrder.AscendingOrder
+            table._sorted_once = True
+        table.setSortingEnabled(False)
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for r in rows:
+            self._insert_option_row(r, table, fields)
+        table.blockSignals(False)
+        header.setSortIndicator(col, order)
+        table.setSortingEnabled(True)       # sorts once, on the indicator
+        table.resizeColumnsToContents()
+
+    def _render_live(self):
+        """Fill the Positions table in grouped order, one Symbol cell per ticker.
+
+        Qt's own sorting is off for this table: it orders rows one at a time
+        and cannot keep a ticker's rows together, and it would scatter the row
+        spans. The header still shows and flips the indicator; each change
+        re-renders from the row dicts.
+        """
+        table  = self._opt_table
+        header = table.horizontalHeader()
+        field  = _OPT_FIELDS[header.sortIndicatorSection()]
+        desc   = header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+        groups = _grouped_order(self._live_rows, field, desc, self._price_cache)
+
+        table.blockSignals(True)
+        table.clearSpans()
+        table.setRowCount(0)
+        for g in groups:
+            start = table.rowCount()
+            for r in g:
+                self._insert_option_row(r, table, _OPT_FIELDS)
+            if len(g) > 1:
+                # Every row keeps its own Symbol/Market item (export and the
+                # price refresh read them per row); the span shows the first.
+                for col in (_O_SYM_COL, _O_MARKET_COL):
+                    table.setSpan(start, col, len(g), 1)
+            for col in (_O_SYM_COL, _O_MARKET_COL):
+                it = table.item(start, col)
+                if it is not None:
+                    it.setTextAlignment((Qt.AlignmentFlag.AlignLeft if col == _O_SYM_COL
+                                         else Qt.AlignmentFlag.AlignRight)
+                                        | Qt.AlignmentFlag.AlignVCenter)
+            sym_it = table.item(start, _O_SYM_COL)
+            if sym_it is not None:
+                f = sym_it.font()
+                f.setBold(True)
+                sym_it.setFont(f)
+        table.blockSignals(False)
+        table.resizeColumnsToContents()
+
+    def _on_live_sort_changed(self, _section: int, _order):
+        self._render_live()
+
+    def closed_widget(self) -> QWidget:
+        """The Closed tab's page. Owned here, since both tables come from one
+        reconstruction; the window only decides where it is shown."""
+        return self._closed_page
 
     # ── Tag exposure ──────────────────────────────────────────────────────────
 
@@ -269,13 +491,16 @@ class PortfolioTab(QWidget):
             live.append([
                 _cell(r, "symbol"),
                 _cell(r, "qty"),
+                _cell(r, "unit"),
                 _num(_cell(r, "strike")),
                 _num(_cell(r, "capital")),
                 _num(_cell(r, "capital_pct")),
                 _num(_cell(r, "premium")),
                 _cell(r, "expiration"),
                 _cell(r, "status"),
+                _num(_cell(r, "assn_price")),
                 _num(_cell(r, "cost_basis")),
+                _num(_cell(r, "recovery")),
                 _cell(r, "tags"),
             ])
 
@@ -285,8 +510,9 @@ class PortfolioTab(QWidget):
                 w.writerow(["Positions", self._account or "account",
                             str(date.today())])
                 w.writerow([])
-                w.writerow(["Symbol", "Qty", "Strike", "Capital", "Pct of Book",
-                            "Premium", "Expiration", "Status", "Basis", "Tags"])
+                w.writerow(["Symbol", "Qty", "Unit", "Strike", "Capital", "Pct of Book",
+                            "Premium", "Expiration", "Status", "Assn/Buy Price",
+                            "Basis", "Recovery", "Tags"])
                 w.writerows(live)
 
                 w.writerow([])
@@ -331,7 +557,9 @@ class PortfolioTab(QWidget):
         if generation != self._price_gen:
             return                                  # superseded by a newer fetch
         self._price_cache.update(prices)
-        self._opt_table.setSortingEnabled(False)
+        if _OPT_FIELDS[self._opt_table.horizontalHeader().sortIndicatorSection()] == "market":
+            self._render_live()           # the order itself depends on the prices
+            return
         for r in range(self._opt_table.rowCount()):
             sym_it = self._opt_table.item(r, _O_SYM_COL)
             if not sym_it:
@@ -340,7 +568,6 @@ class PortfolioTab(QWidget):
             mkt_it = self._opt_table.item(r, _O_MARKET_COL)
             if mkt_it is not None:
                 mkt_it.setText(_fmt_price(price))
-        self._opt_table.setSortingEnabled(True)
         self._opt_table.resizeColumnToContents(_O_MARKET_COL)
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -350,25 +577,39 @@ class PortfolioTab(QWidget):
         root.setSpacing(6)
 
         hint = QLabel(
-            "One line per wheel cycle (Put → Assigned → … ). "
-            "P&L and RoR include all premiums + stock outcome, net of fees. "
+            "Live wheel cycles (Put → Assigned → … ), one per line; finished ones "
+            "are on the Closed tab. RoR includes all premiums net of fees. "
             "Derived from imported TOS statements."
         )
         hint.setStyleSheet("color: grey; font-size: 11px;")
         root.addWidget(hint)
 
-        self._opt_table = QTableWidget(0, len(_O_HDRS))
-        self._opt_table.setHorizontalHeaderLabels(_O_HDRS)
-        self._opt_table.setSortingEnabled(True)
-        self._opt_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._opt_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _oh = self._opt_table.horizontalHeader()
-        _oh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        _oh.setStretchLastSection(True)
-        self._opt_table.verticalHeader().setVisible(False)
+        self._opt_table = self._make_table(_O_HDRS)
         for ci in _OPT_HIDDEN_COLS:
             self._opt_table.setColumnHidden(ci, True)
+        # Grouped sort (see _render_live): Qt sorting off, header indicator kept.
+        self._live_rows: list[dict] = []
+        self._opt_table.setSortingEnabled(False)
+        _oh = self._opt_table.horizontalHeader()
+        _oh.setSectionsClickable(True)
+        _oh.setSortIndicatorShown(True)
+        _oh.setSortIndicator(_O_SYM_COL, Qt.SortOrder.AscendingOrder)
+        _oh.sortIndicatorChanged.connect(self._on_live_sort_changed)
         root.addWidget(self._opt_table, 1)
+
+        # The Closed tab's page — finished cycles, kept off the live table.
+        self._closed_page = QWidget()
+        cl = QVBoxLayout(self._closed_page)
+        cl.setSpacing(6)
+        chint = QLabel(
+            "Completed wheel cycles: expired, closed, sold or called away. "
+            "P&L is all premiums + stock outcome, net of fees. "
+            "Filtered by the Range selector on the date each cycle opened."
+        )
+        chint.setStyleSheet("color: grey; font-size: 11px;")
+        cl.addWidget(chint)
+        self._closed_table = self._make_table([c[1] for c in _CLOSED_COLUMNS])
+        cl.addWidget(self._closed_table, 1)
 
         self._exposure_box = QGroupBox("Tag exposure — live positions")
         ebox = QVBoxLayout(self._exposure_box)
@@ -381,6 +622,18 @@ class PortfolioTab(QWidget):
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
+    def _make_table(self, headers: list[str]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setSortingEnabled(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        return table
+
     def _make_item(self, text: str, editable: bool = True) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
         if not editable:
@@ -389,23 +642,29 @@ class PortfolioTab(QWidget):
 
     # ── Options rows ──────────────────────────────────────────────────────────
 
-    def _insert_option_row(self, data: dict | None = None) -> int:
+    def _insert_option_row(self, data: dict | None = None, table=None,
+                           fields=None) -> int:
         """Insert one derived lifecycle row (all fields supplied; read-only)."""
-        row = self._opt_table.rowCount()
-        self._opt_table.insertRow(row)
+        table  = table if table is not None else self._opt_table
+        fields = fields or _OPT_FIELDS
+        row = table.rowCount()
+        table.insertRow(row)
         d = data or {}
-        for ci, field in enumerate(_OPT_FIELDS):
+        for ci, field in enumerate(fields):
             if field == "market":
                 price = self._price_cache.get(d.get("symbol", ""))
                 item = self._make_item(_fmt_price(price), editable=False)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             elif field == "status":
                 val = str(d.get(field, ""))
-                item = _StatusItem(val)
+                item = _StatusItem(val, _row_sort_key(d))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            elif field == "symbol":
+                item = _SymbolItem(str(d.get(field, "")), d)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             else:
                 item = self._make_item(str(d.get(field, "")), editable=False)
-            self._opt_table.setItem(row, ci, item)
+            table.setItem(row, ci, item)
         return row
 
     # ── persistence ───────────────────────────────────────────────────────────
@@ -487,10 +746,23 @@ class PortfolioTab(QWidget):
         added_evs -= _drop_split_roll_duplicates(self._events)
 
         self._outcomes.update(new_outcomes)
+        # Holdings as of the statement's end date. Only a newer statement
+        # replaces them: importing an old one must not roll the snapshot back.
+        asof = _parse_statement_end(rows)
+        cur  = _parse_mdy(self._holdings.get("asof", "")) if self._holdings else None
+        if asof and (cur is None or asof >= cur):
+            equities = {}
+            for h in stks:
+                try:
+                    equities[h["symbol"]] = {"shares": float(h["shares"]),
+                                             "price":  float(h["cost_basis"])}
+                except (KeyError, ValueError):
+                    continue
+            self._holdings = {"asof": asof.strftime("%m/%d/%Y"), "equities": equities}
         self._save_events()
         self._rebuild_options_table()
 
-        opt_rows = self._opt_table.rowCount()
+        opt_rows = self._opt_table.rowCount() + self._closed_table.rowCount()
         note = f"Imported {added_evs} new event(s) → {opt_rows} cycle(s)."
         if upgraded:
             note += f" Upgraded {upgraded} stored event(s)."
@@ -502,15 +774,19 @@ class PortfolioTab(QWidget):
 
     def _reset_data(self):
         """Wipe the active account's stored events (no confirmation)."""
-        self._opt_table.blockSignals(True)
-        self._opt_table.setRowCount(0)
-        self._opt_table.blockSignals(False)
+        self._live_rows = []
+        self._opt_table.clearSpans()
+        for table in (self._opt_table, self._closed_table):
+            table.blockSignals(True)
+            table.setRowCount(0)
+            table.blockSignals(False)
+        self.closed_count_changed.emit(0)
         if self._account:
             events_path(self._account).unlink(missing_ok=True)
         POSITIONS_FILE.unlink(missing_ok=True)
         STOCKS_FILE.unlink(missing_ok=True)
         SUPERSEDED_FILE.unlink(missing_ok=True)
-        self._events, self._outcomes = [], {}
+        self._events, self._outcomes, self._holdings = [], {}, {}
         self._exposure = {}
         self._render_exposure()
 
@@ -962,6 +1238,16 @@ def _drop_split_roll_duplicates(events: list[dict]) -> int:
     return len(drop)
 
 
+def _parse_statement_end(rows: list[list[str]]) -> date | None:
+    """The 'through M/D/YY' date in the statement header."""
+    for row in rows[:3]:
+        if row:
+            m = re.search(r'through\s+(\d{1,2}/\d{1,2}/\d{2,4})', row[0])
+            if m:
+                return _parse_mdy(m.group(1))
+    return None
+
+
 def _parse_account(rows: list[list[str]]) -> str:
     """Extract the account label from the statement header line."""
     for row in rows[:3]:
@@ -988,8 +1274,121 @@ def _outcome_unkey(s: str) -> tuple:
     return tuple(s.split("|"))
 
 
-def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[dict]:
-    """Group per-symbol events into wheel cycles → one display row per cycle."""
+def _reconcile_holdings(events: list[dict], holdings: dict | None) -> list[dict]:
+    """The events plus the transfers that square them with the statement."""
+    seeded, moved = holdings_adjustments(events, holdings)
+    return seeded + events + moved
+
+
+def holdings_adjustments(events: list[dict], holdings: dict | None
+                         ) -> tuple[list[dict], list[dict]]:
+    """Transfers that square the share count from the trades with the statement.
+
+    Returns (transfers in, transfers out) as synthetic stock events. Shared
+    with the P&L charts, which need the same shares in the same account.
+
+    The trades miss shares in both directions. Shares held from before the
+    earliest imported statement (or moved in from another account) have no
+    BOT row, so without an opening lot they don't exist here — and neither
+    does the position their covered calls belong to. Shares moved out to
+    another account have no SOLD row, so they'd be held here forever.
+
+    The newest statement's Equities section lists every holding with its
+    average cost. Shares it lists that the trades can't account for become one
+    opening lot at the start of the history; shares the trades hold that it
+    doesn't list leave on its date as a transfer at average cost — no gain or
+    loss, since nothing was sold. The stored events are not changed.
+    """
+    if not holdings or "equities" not in holdings or not events:
+        return [], []                      # no snapshot yet: trades only
+    snap = holdings["equities"]
+    asof = _parse_mdy(holdings.get("asof", "")) or date.max
+    first = min((_parse_mdy(e["date"]) or date.max) for e in events)
+    held: dict[str, list[float]] = {}           # sym → [shares, cost] from events
+    bought: dict[str, list] = {}                # sym → [outright shares, last buy date]
+    for e in sorted(events, key=lambda e: _parse_mdy(e["date"]) or date.min):
+        if e["kind"] != "stock" or (_parse_mdy(e["date"]) or date.min) > asof:
+            continue
+        sh, cost = held.get(e["sym"], [0.0, 0.0])
+        if e["action"] == "BOT" and not e["assigned"]:
+            b = bought.setdefault(e["sym"], [0.0, e["date"]])
+            b[0] += e["shares"]
+            b[1] = e["date"]
+        if e["action"] == "BOT":
+            sh, cost = sh + e["shares"], cost + abs(e["amount"])
+        elif sh > 0:
+            q = min(e["shares"], sh)
+            sh, cost = sh - q, cost - cost / sh * q
+        held[e["sym"]] = [sh, cost]
+    seeded = []
+    for sym, h in snap.items():
+        shares, price = float(h.get("shares", 0)), float(h.get("price", 0))
+        have, have_cost = held.get(sym, [0.0, 0.0])
+        missing = shares - have
+        if missing <= 0.0001 or price <= 0:
+            continue
+        # The snapshot's price averages every share held; the lot carries
+        # whatever part of that total the known purchases don't.
+        lot_cost = shares * price - have_cost
+        if lot_cost <= 0:
+            lot_cost = missing * price
+        seeded.append({"sym": sym, "date": first.strftime("%m/%d/%Y"),
+                       "kind": "stock", "action": "BOT", "shares": missing,
+                       "amount": -round(lot_cost, 2), "fees": 0.0,
+                       "assigned": False, "pre_history": True})
+    # When shares left isn't on the statement. Shares bought outright and moved
+    # to another account usually go soon after purchase, and leaving them on
+    # the books until the statement date would let them claim covered calls
+    # written on the shares that stayed — so outright shares leave right after
+    # the last outright buy, and only any excess beyond them on the statement
+    # date. The amount is filled in at the lot's own cost when it's applied.
+    moved = []
+    for sym, (have, _) in held.items():
+        listed = float((snap.get(sym) or {}).get("shares", 0))
+        excess = have - listed
+        if excess <= 0.0001 or have <= 0:
+            continue
+        out_sh, out_date = bought.get(sym, [0.0, None])
+        early = min(excess, out_sh)
+        for n, d in ((early, out_date), (excess - early, asof.strftime("%m/%d/%Y"))):
+            if n > 0.0001 and d:
+                moved.append({"sym": sym, "date": d, "kind": "stock",
+                              "action": "SOLD", "shares": n, "amount": 0.0,
+                              "fees": 0.0, "assigned": False, "transfer_out": True})
+
+    # What each transfer out carried: the average cost of the shares held when
+    # it left. (The Positions tab prices it off the lot it leaves instead; the
+    # two agree when, as usual, only outright-bought shares were held.)
+    pos: dict[str, list[float]] = {}
+    for e in sorted(seeded + events + moved, key=lambda e: _parse_mdy(e["date"]) or date.min):
+        if e["kind"] != "stock":
+            continue
+        sh, cost = pos.get(e["sym"], [0.0, 0.0])
+        if e["action"] == "BOT":
+            sh, cost = sh + e["shares"], cost + abs(e["amount"])
+        elif sh > 0:
+            q = min(e["shares"], sh)
+            if e.get("transfer_out"):
+                e["cost"] = round(cost / sh * q, 2)
+            sh, cost = sh - q, cost - cost / sh * q
+        pos[e["sym"]] = [sh, cost]
+    return seeded, moved
+
+
+def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
+                        holdings: dict | None = None) -> list[dict]:
+    """Group per-symbol events into positions → one display row per position.
+
+    Wheel cycles start from a short put; shares bought outright start a long
+    stock position (their covered calls join it); a bought option to open is a
+    long option position of its own.
+    """
+    events = _reconcile_holdings(events, holdings)
+    # Shares bought outright are shown only once a statement's holdings have
+    # been imported: without them, shares moved to another account look held
+    # here forever (no statement row records a transfer), so an account with
+    # no snapshot yet keeps the old behaviour and skips outright buys.
+    track_bought = bool(holdings and "equities" in holdings)
     by_sym: dict[str, list[dict]] = {}
     for e in events:
         by_sym.setdefault(e["sym"], []).append(e)
@@ -1007,7 +1406,11 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
         mine: list[dict] = []               # this symbol's cycles, in open order
 
         def _new(key, open_date):
+            # premium/fees cover every leg; call_premium/call_fees are the
+            # calls' part of them, kept apart because only put premium lowers
+            # the cost basis of assigned shares — calls lower the recovery price.
             c = {"sym": sym, "open_date": open_date, "premium": 0.0, "fees": 0.0,
+                 "call_premium": 0.0, "call_fees": 0.0,
                  "stock_pnl": 0.0, "stages": [], "put_strike": None, "put_exp": None,
                  "qty_by_exp": {}, "end_date": None, "shares": 0.0, "total_cost": 0.0,
                  "has_option": False, "has_put": False, "open_qty": 0,
@@ -1078,7 +1481,55 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
             return next((c for c in wrote if c["shares"] >= e["shares"]),
                         wrote[0] if wrote else holders[0])
 
+        # Contracts moved by each diagonal put roll, summed over its fills (one
+        # order often fills in pieces). Comparing that with what is open at
+        # the old strike tells a whole-position roll from a partial one.
+        def _diag(e):
+            return (e["date"], e["exp"], e["strike"], e.get("close_strike"))
+        diag_qty: dict[tuple, int] = {}
         for e in evs:
+            if (e["kind"] == "opt" and e.get("otype") == "PUT" and e.get("roll")
+                    and e.get("close_strike") and e["close_strike"] != e["strike"]):
+                diag_qty[_diag(e)] = diag_qty.get(_diag(e), 0) + e["qty"]
+        diag_done: set = set()
+
+        def _short_open(e) -> bool:
+            """Is a short contract open on this exact leg (so a BOT closes it)?"""
+            leg = (e["strike"], e["exp"])
+            if e["otype"] == "CALL":
+                return any(c["calls"].get(leg, 0) > 0 for c in mine)
+            c = live.get(e["strike"])
+            return bool(c and c["qty_by_exp"].get(e["exp"], 0) > 0)
+
+        for e in evs:
+            if e["kind"] == "opt" and not e.get("roll"):
+                # Long options: a buy that closes no short contract opens a
+                # long position, and a sale of that same contract closes it.
+                lk = f"long#{e['otype']}#{e['strike']}#{e['exp']}"
+                if e.get("action") == "SOLD" and lk in live:
+                    c = live[lk]
+                    c["premium"]  += e["amount"]
+                    c["fees"]     += e["fees"]
+                    c["long_qty"]  = max(c["long_qty"] - e["qty"], 0)
+                    c["stages"].append("Sold")
+                    if c["long_qty"] == 0:
+                        c["end_date"] = e["date"]
+                        _retire(lk)
+                    continue
+                if e.get("action") == "BOT" and not _short_open(e):
+                    c = live.get(lk) or _new(lk, e["date"])
+                    c["long"]        = {"type": e["otype"], "strike": e["strike"],
+                                        "exp": e["exp"]}
+                    c["has_option"]  = True
+                    c["premium"]    += e["amount"]
+                    c["fees"]       += e["fees"]
+                    c["long_qty"]    = c.get("long_qty", 0) + e["qty"]
+                    c["long_bought"] = c.get("long_bought", 0) + e["qty"]
+                    c["long_cost"]   = c.get("long_cost", 0.0) + abs(e["amount"]) + e["fees"]
+                    if not c["stages"]:
+                        c["stages"].append(f"Long {e['otype'].lower()}")
+                    c["end_date"] = e["exp"]
+                    continue
             if e["kind"] == "opt":
                 if e["otype"] == "PUT":
                     key    = e["strike"]
@@ -1096,6 +1547,20 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         rolled = next((c for k, c in live.items()
                                        if c["open_qty"] == 0 and c["shares"] <= 0
                                        and c["closed_date"] == e["date"]), None)
+                        # A diagonal roll closes and reopens in one row, so the
+                        # old strike is still open here — its to-close leg names
+                        # it. Without this the new strike starts a fresh cycle
+                        # and the old one's premium never reaches the shares.
+                        # Only a roll of the whole position carries the cycle
+                        # over; rolling part of it leaves the rest open at the
+                        # old strike (handled below) and starts a new line.
+                        closing = e.get("close_strike")
+                        if (rolled is None and e.get("roll") and closing
+                                and closing != key and closing in live
+                                and live[closing]["shares"] <= 0
+                                and diag_qty.get(_diag(e), 0)
+                                    >= live[closing]["open_qty"]):
+                            rolled = live[closing]
                         if rolled is not None:
                             _retire(rolled["live_key"])
                             live[key] = rolled
@@ -1129,6 +1594,9 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         cycle["roll_group"] = None
                     # Flat means closed as of this leg — and reopening clears it.
                     cycle["closed_date"] = e["date"] if cycle["open_qty"] == 0 else None
+                    # Most contracts ever open: what a bought-back row reports
+                    # once its open count is back to zero.
+                    cycle["peak_qty"] = max(cycle.get("peak_qty", 0), cycle["open_qty"])
                     signed = -e["qty"] if action == "BOT" else e["qty"]
                     cycle["qty_by_exp"][e["exp"]] = max(
                         cycle["qty_by_exp"].get(e["exp"], 0) + signed, 0)
@@ -1137,27 +1605,79 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                     # A diagonal moved this position off another strike; that
                     # cycle is closed by the same row, so retire it rather than
                     # leaving it open forever alongside its own replacement.
+                    # A partial diagonal takes only its contracts off the old
+                    # strike, once per order however many fills it came in.
                     closed = e.get("close_strike")
                     if closed and closed != key and closed in live:
-                        live[closed]["closed_date"] = e["date"]
-                        live[closed]["open_qty"]    = 0
-                        _retire(closed)
+                        old   = live[closed]
+                        moved = diag_qty.get(_diag(e), 0) if e.get("roll") else 0
+                        if moved and moved < old["open_qty"]:
+                            if _diag(e) not in diag_done:
+                                diag_done.add(_diag(e))
+                                old["open_qty"] -= moved
+                                exp = old["put_exp"]
+                                if exp in old["qty_by_exp"]:
+                                    old["qty_by_exp"][exp] = max(
+                                        old["qty_by_exp"][exp] - moved, 0)
+                        else:
+                            old["closed_date"] = e["date"]
+                            old["open_qty"]    = 0
+                            _retire(closed)
+                            if old is not cycle and old["shares"] <= 0:
+                                # Rolled whole into a position already open at
+                                # the new strike (IREN 38.5 → 38 on 10/14): the
+                                # two are one position now, so the old premium
+                                # lowers its basis instead of reading as profit
+                                # booked on a row of its own.
+                                for k in ("premium", "fees",
+                                          "call_premium", "call_fees"):
+                                    cycle[k] += old[k]
+                                od = _parse_mdy(old["open_date"])
+                                cd = _parse_mdy(cycle["open_date"])
+                                if od and cd and od < cd:
+                                    cycle["open_date"] = old["open_date"]
+                                old["merged"] = True
                 else:
                     # A call belongs to whichever position holds the shares it
                     # covers; with none assigned it rides the newest cycle.
-                    cycle = _call_holder(e) or (mine[-1] if mine else _new(e["strike"], e["date"]))
+                    wheel = [c for c in mine if not c.get("long")]
+                    cycle = _call_holder(e) or (wheel[-1] if wheel else _new(e["strike"], e["date"]))
                     # Open calls per (strike, exp), so a later close, roll or
                     # called-away sale can find the cycle that wrote them.
                     if e.get("action") in ("SOLD", "BOT"):
+                        leg = (e["strike"], e["exp"])
                         if e.get("roll") and e.get("close_exp"):
                             old = (e.get("close_strike") or e["strike"], e["close_exp"])
                             cycle["calls"][old] = max(cycle["calls"].get(old, 0) - e["qty"], 0)
-                        leg = (e["strike"], e["exp"])
+                        elif e.get("roll") and e.get("action") == "SOLD":
+                            # Events stored before close_exp was recorded name
+                            # the closing strike at most. Without retiring the
+                            # leg it replaced, every rolled call stays "open"
+                            # forever (SNPS showed its 11/20 call, rolled away
+                            # in September, as the nearest expiration). Take
+                            # the open leg at the closing strike that expires
+                            # soonest — what a roll out in time replaces. A leg
+                            # already past expiration is dead, not the one rolled.
+                            k = e.get("close_strike") or e["strike"]
+                            on = _parse_mdy(e["date"]) or date.min
+                            olds = sorted((l for l, q in cycle["calls"].items()
+                                           if q > 0 and l[0] == k and l != leg
+                                           and (_parse_mdy(l[1]) or date.max) >= on),
+                                          key=lambda l: _parse_mdy(l[1]) or date.max)
+                            left = e["qty"]
+                            for old in olds:
+                                if not left:
+                                    break
+                                used = min(cycle["calls"][old], left)
+                                cycle["calls"][old] -= used
+                                left -= used
                         signed = -e["qty"] if e["action"] == "BOT" else e["qty"]
                         cycle["calls"][leg] = max(cycle["calls"].get(leg, 0) + signed, 0)
                     cycle["has_option"] = True
                     cycle["premium"]   += e["amount"]
                     cycle["fees"]      += e["fees"]
+                    cycle["call_premium"] += e["amount"]
+                    cycle["call_fees"]    += e["fees"]
                     cycle["stages"].append("Call")
                     cycle["end_date"] = e["exp"]
             else:  # stock
@@ -1172,11 +1692,16 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                                       abs(float(c["put_strike"]) - px) < 0.005), None)
                         cycle = cycle or _holder()
                     if cycle is None:
-                        # A direct stock buy with no live cycle is a standalone
-                        # position — it lives in the Long Stock table, not here.
+                        # Shares bought outright with none already held start
+                        # a long stock position; its covered calls join it as
+                        # they would assigned shares.
                         cycle = _holder()
                         if cycle is None:
-                            continue
+                            if not track_bought:
+                                continue
+                            cycle = _new(f"stock#{e['date']}#{len(mine)}", e["date"])
+                            cycle["bought"]      = True
+                            cycle["pre_history"] = bool(e.get("pre_history"))
                     if e["assigned"] and cycle.get("open_qty"):
                         # Assignment retires the contracts it exercised — 300
                         # shares is three of them. Without this the puts stay on
@@ -1224,6 +1749,10 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                             stock["fees"]    += moved_fees
                             cycle["premium"] -= moved_prem
                             cycle["fees"]    -= moved_fees
+                            for k in ("call_premium", "call_fees"):
+                                moved = round(cycle[k] * share, 2)
+                                stock[k] += moved
+                                cycle[k] -= moved
                             if cycle["open_qty"] == 0:
                                 # The last of the puts joined the shares; this
                                 # row has nothing left to describe.
@@ -1234,14 +1763,22 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                             cycle = stock
                     cycle["fees"]       += e["fees"]
                     cycle["shares"]     += e["shares"]
+                    cycle["shares_in"]   = cycle.get("shares_in", 0) + e["shares"]
                     cycle["total_cost"] += abs(e["amount"])
                     # Contracts-equivalent of the stock taken on. Retiring the
                     # assigned puts above empties qty_by_exp, so this is what the
                     # row counts once the position is shares rather than options.
                     cycle["stock_qty"]  = cycle.get("stock_qty", 0) + int(e["shares"] // 100)
-                    cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
+                    if not (e.get("pre_history") and cycle["stages"]):
+                        cycle["stages"].append("Assigned" if e["assigned"] else "Bought")
                 else:  # SOLD
                     cycle = _sale_holder(e)
+                    if e.get("transfer_out"):
+                        cycle = next((c for c in _holders() if c.get("bought")), cycle)
+                        if cycle is not None and cycle["shares"] > 0:
+                            # Moved, not sold: out at cost, no gain or loss.
+                            q = min(e["shares"], cycle["shares"])
+                            e = {**e, "amount": cycle["total_cost"] / cycle["shares"] * q}
                     if cycle is None:
                         continue
                     if e["assigned"] and e["shares"]:
@@ -1262,7 +1799,8 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
                         cycle["shares"]      = shares - q
                     else:
                         cycle["stock_pnl"] += e["amount"]
-                    cycle["stages"].append("Called away" if e["assigned"] else "Sold")
+                    cycle["stages"].append("Transferred out" if e.get("transfer_out")
+                                           else "Called away" if e["assigned"] else "Sold")
                     cycle["end_date"] = e["date"]
                     if cycle["shares"] <= 0:
                         _retire(cycle["live_key"])
@@ -1270,11 +1808,78 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str]) -> list[
     # Only wheel cycles (those with at least one option leg) belong here;
     # pure stock buys/sells live in the Long Stock Positions table.
     rows = [_cycle_to_row(c, outcomes) for c in cycles
-            if c["has_option"] and not c.get("merged")]
+            if (c["has_option"] or c.get("bought")) and not c.get("merged")]
     return rows + _blended_rows(rows)
 
 
+def _unit(unit: str, n: float) -> str:
+    """'contracts'/'shares', singular for exactly one."""
+    return unit[:-1] if n == 1 else unit
+
+
+def _long_option_row(c: dict) -> dict:
+    """Display row for a bought option (a LEAP, or any long call/put).
+
+    Cash-basis like everything else: the purchase is a realized debit and the
+    sale a realized credit, so Premium is their net and the P&L follows. While
+    open, Cost Basis is what one contract cost per share (fees in) and
+    Recovery is the underlying price at which the option is worth that at
+    expiration — strike + cost for a call, strike − cost for a put. Neither is
+    a share price, so the row stays out of the symbol's blended basis.
+    """
+    L       = c["long"]
+    strike  = float(L["strike"])
+    premium = round(c["premium"], 2)
+    fees    = round(c["fees"], 2)
+    pnl     = round(premium - fees, 2)
+    bought  = c.get("long_bought", 0) or 1
+    open_q  = c.get("long_qty", 0)
+    cost    = c.get("long_cost", 0.0)
+    per_sh  = cost / (bought * 100)
+    exp_d   = _parse_mdy(L["exp"])
+    today   = date.today()
+    if open_q > 0:
+        status = "Expired" if exp_d and exp_d < today else "Open"
+    else:
+        status = "Sold"
+    live = status == "Open"
+
+    open_d = _parse_mdy(c["open_date"])
+    end_d  = (today if live else
+              exp_d if status == "Expired" else _parse_mdy(c["end_date"] or "")) or today
+    days   = (end_d - open_d).days if open_d else 0
+    ror = ""
+    if not live and cost > 0 and days > 0:
+        ror = f"{(pnl / cost) * (7 / days) * 100:.2f}%"
+    stages = c["stages"] + ([] if c["stages"][-1:] == ["Sold"] else [status])
+    capital = cost * open_q / bought if live else cost
+    recovery = strike + per_sh if L["type"] == "CALL" else strike - per_sh
+    return {
+        "symbol":     c["sym"],
+        "opened":     c["open_date"],
+        "lifecycle":  " → ".join(stages),
+        "qty":        str(open_q if live else bought),
+        "unit":       _unit("contracts", open_q if live else bought),
+        "strike":     L["strike"],
+        "premium":    f"{premium:.2f}",
+        "expiration": L["exp"] if status != "Sold" else (c["end_date"] or L["exp"]),
+        "status":     status,
+        "weeks_held": f"{days / 7:.1f}" if days >= 0 else "",
+        "fees":       f"{fees:.2f}",
+        "weekly_ror": ror,
+        "assn_price": "",
+        "cost_basis": f"{per_sh:.2f}" if live else f"{pnl:+,.2f}",
+        "recovery":   f"{recovery:.2f}" if live else "",
+        "_basis":     None,
+        "_recovery":  None,
+        "_shares":    0.0,
+        "_capital":   capital,
+    }
+
+
 def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
+    if c.get("long"):
+        return _long_option_row(c)
     strike = float(c["put_strike"]) if c["put_strike"] else 0.0
     qty    = c["qty_by_exp"].get(c["put_exp"], 0) or c.get("stock_qty", 0)
     premium    = round(c["premium"], 2)
@@ -1285,6 +1890,8 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     # Status
     if c["shares"] > 0:
         status = "Holding"
+    elif c["stages"][-1:] == ["Transferred out"]:
+        status = "Transferred"
     elif "Sold" in c["stages"]:
         status = "Sold"
     elif "Called away" in c["stages"]:
@@ -1313,11 +1920,30 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     for s in c["stages"]:
         if not path or path[-1] != s:
             path.append(s)
-    if path and path[-1] not in ("Sold", "Called away") and status not in path:
+    if path and path[-1] not in ("Sold", "Called away", "Transferred out") and status not in path:
         path.append(status)
+    if c.get("pre_history") and path and path[0] == "Bought":
+        path[0] = "Transferred in"
+    # Share rows count shares; option rows count contracts (a bought-back
+    # put reports the most it had open, not the zero it ended at).
+    if c.get("shares_in"):
+        shown_qty = c["shares"] if c["shares"] > 0 else c["shares_in"]
+    else:
+        shown_qty = qty or c.get("peak_qty", 0)
+
+    if status == "Holding" and path and path[-1] == "Holding" and "Call" in path:
+        # No call open on the shares any more: say how the last one ended,
+        # or the row reads as if a call were still written against them.
+        calls = c.get("calls", {})
+        if calls and not any(q > 0 and (_parse_mdy(exp) or date.max) >= date.today()
+                             for (_, exp), q in calls.items()):
+            ended = ("Call expired" if any(q > 0 for q in calls.values())
+                     else "Call closed")
+            i = len(path) - 1 - path[::-1].index("Call")
+            path[i] = ended
     lifecycle = " → ".join(path)
 
-    completed = status in ("Sold", "Called away", "Expired", "Closed")
+    completed = status in ("Sold", "Called away", "Expired", "Closed", "Transferred")
 
     # Timing. A bought-back cycle ends the day it went flat, not on the
     # expiration its last contract would have run to.
@@ -1325,10 +1951,34 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     end_str = c["closed_date"] if status == "Closed" and c.get("closed_date") else c["end_date"]
     close_d = _parse_mdy(end_str) if end_str else None
 
+    # Held shares show the nearest call still open, not the last call written:
+    # a call that expires worthless leaves no row on the statement (TOS posts
+    # its removal days later, if at all), so its date would sit here as if the
+    # shares were still covered. Past its expiration it's over. With no call
+    # open the shares are uncovered — capital is still at work through today.
+    # A bought-back cycle ended the day it went flat (the Closed tab's "Ended").
+    exp_cell = end_str or ""
+    if status == "Holding":
+        today = date.today()
+        open_exps = sorted(d for (_, exp), q in c.get("calls", {}).items()
+                           if q > 0 and (d := _parse_mdy(exp)) and d >= today)
+        if open_exps:
+            exp_cell = open_exps[0].strftime("%m/%d/%Y")
+            # Capital stays committed until the last open call expires; the
+            # last call *written* may be an earlier one, or already over.
+            close_d  = open_exps[-1]
+        else:
+            exp_cell = "uncovered" if c.get("calls") else ""
+            close_d  = None
+
     # Weeks Held = actual elapsed time (open → today for live, open → close for done)
     held_end  = date.today() if status in ("Open", "Holding") else (close_d or date.today())
     days_held = (held_end - open_d).days if open_d else 0
     weeks     = f"{days_held / 7:.1f}" if days_held >= 0 else ""
+    if c.get("pre_history"):
+        # The lot's real purchase date predates the statements, so elapsed
+        # time — and any rate built on it — would be invented.
+        weeks = ""
 
     # RoR denominator = full capital commitment: open → expiration for live positions,
     # open → close date for completed ones. Capital is locked until expiration, so
@@ -1341,39 +1991,61 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     # contract count can legitimately be zero if it was bought back.
     capital = c["total_cost"] if c["shares"] > 0 else strike * 100 * qty
     ror = ""
-    if capital > 0 and days_ror > 0:
+    if capital > 0 and days_ror > 0 and not c.get("pre_history"):
         ror = f"{(total_pnl / capital) * (7 / days_ror) * 100:.2f}%"
 
     # Cost Basis (open/holding) vs Total P&L (completed)
     # basis/shares are also kept numerically so concurrent positions on one
     # symbol can be blended into a summary row.
-    basis = None
+    #
+    # Three target prices for shares:
+    #   assn     — the price paid at assignment (average, if assigned in parts)
+    #   basis    — assn less the put premium, net of fees: what the shares cost
+    #              (also the IRS treatment — put premium reduces stock basis)
+    #   recovery — basis less the call premium, net of fees: the exit price that
+    #              gets the whole cycle back to even. Fees on the stock legs
+    #              themselves sit in fees with the puts, raising basis.
+    # An open put shows basis only: it is the price paid if assigned now, and
+    # with no shares there are no calls to bring a recovery below it.
+    assn = basis = recovery = None
     shares_eq = 0.0
+    call_net = c.get("call_premium", 0.0) - c.get("call_fees", 0.0)
+    put_net  = (premium - fees) - call_net
     if status == "Holding" and c["shares"] > 0:
-        basis = (c["total_cost"] - (premium - fees)) / c["shares"]
+        assn      = c["total_cost"] / c["shares"]
+        basis     = (c["total_cost"] - put_net) / c["shares"]
+        recovery  = basis - call_net / c["shares"]
         shares_eq = c["shares"]
-        pnl_cell = f"{basis:.2f}"
+        pnl_cell  = f"{basis:.2f}"
     elif status == "Open" and capital > 0:
-        basis = strike - (premium - fees) / (qty * 100)
+        basis     = strike - (premium - fees) / (qty * 100)
+        recovery  = basis
         shares_eq = qty * 100
-        pnl_cell = f"{basis:.2f}"
+        pnl_cell  = f"{basis:.2f}"
     else:
         pnl_cell = f"{total_pnl:+,.2f}"
 
     return {
         "symbol":     c["sym"],
-        "opened":     c["open_date"],
+        "opened":     "transferred" if c.get("pre_history") else c["open_date"],
         "lifecycle":  lifecycle,
-        "qty":        str(qty),
+        # Share rows count shares; option rows count contracts.
+        "qty":        f"{shown_qty:g}",
+        "unit":       _unit("shares" if c.get("shares_in") else "contracts", shown_qty),
         "strike":     c["put_strike"] or "",
         "premium":    f"{premium:.2f}",
-        "expiration": c["end_date"] or "",
+        "expiration": exp_cell,
         "status":     status,
         "weeks_held": weeks,
         "fees":       f"{fees:.2f}",
         "weekly_ror": ror,
+        "assn_price": f"{assn:.2f}" if assn is not None else "",
         "cost_basis": pnl_cell,
+        # Open puts carry recovery numerically (for the blend) but don't show
+        # it: it would only repeat the basis beside it.
+        "recovery":   f"{recovery:.2f}" if assn is not None else "",
         "_basis":     basis,
+        "_recovery":  recovery,
         "_shares":    shares_eq,
         "_capital":   capital,
     }
@@ -1399,11 +2071,22 @@ def _blended_rows(rows: list[dict]) -> list[dict]:
             continue
         shares = sum(r["_shares"] for r in live)
         value  = sum(r["_basis"] * r["_shares"] for r in live)
+        recov  = sum(r["_recovery"] * r["_shares"] for r in live)
+        held   = [r for r in live if r.get("assn_price")]
+        held_sh = sum(r["_shares"] for r in held)
+        assn   = (sum(float(r["assn_price"]) * r["_shares"] for r in held) / held_sh
+                  if held_sh else None)
         out.append({
             "symbol":     sym,
             "opened":     "— blended —",
             "lifecycle":  "",
-            "qty":        str(sum(int(r["qty"]) for r in live)),
+            # All options: contracts. Any shares: the share count the blended
+            # basis is averaged over (open puts as the shares they'd bring).
+            "qty":        (f"{sum(float(r['qty']) for r in live):g}"
+                           if all(r.get("unit", "").startswith("contract") for r in live)
+                           else f"{sum(r['_shares'] for r in live):g}"),
+            "unit":       ("contracts" if all(r.get("unit", "").startswith("contract")
+                                               for r in live) else "shares"),
             "strike":     "—",
             "premium":    f"{sum(float(r['premium']) for r in live):.2f}",
             "expiration": "—",
@@ -1411,7 +2094,11 @@ def _blended_rows(rows: list[dict]) -> list[dict]:
             "weeks_held": "—",
             "fees":       f"{sum(float(r['fees']) for r in live):.2f}",
             "weekly_ror": "—",
+            # Assn Price blends only the shares actually held; basis and
+            # recovery blend everything, as if the open puts were assigned too.
+            "assn_price": f"{assn:.2f}" if assn is not None else "",
             "cost_basis": f"{value / shares:.2f}",
+            "recovery":   f"{recov / shares:.2f}",
             # Summary of rows already counted individually — carried for display
             # only. Tag exposure skips Blended so capital isn't counted twice.
             "_capital":   sum(r.get("_capital") or 0.0 for r in live),
@@ -1516,7 +2203,7 @@ def _build_fee_lookup(rows: list[list[str]]) -> dict[tuple, float]:
         if "CALENDAR" in desc.upper():
             m = _TRD_CAL_RE.search(desc)
             if m:
-                sym, exp, strike, typ = m.groups()
+                sym, exp, _close_exp, strike, typ = m.groups()
                 key = (sym.upper(), _parse_exp(exp.strip()), _norm_strike(strike), typ.upper())
                 lookup[key] = round(lookup.get(key, 0.0) + total, 2)
         else:
