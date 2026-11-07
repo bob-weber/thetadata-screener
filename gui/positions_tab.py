@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 
 from core.lso_analyzer import tags_for
 
-from .account_store import DEFAULT_ACCT, events_path, safe_token
+from .account_store import DEFAULT_ACCT, events_path, keep_unreadable, safe_token, write_json
 from .sharebook import ShareBook
 
 POSITIONS_FILE   = Path("my_option_positions.json")     # legacy cache, rebuilt from events
@@ -288,18 +288,25 @@ class PortfolioTab(QWidget):
                 _drop_split_roll_duplicates(events)
                 self._holdings = data.get("holdings", {})
                 return events, outcomes
-            except Exception:
-                pass
+            except Exception as e:
+                # An empty account would be saved over this on the next
+                # import, losing the history — keep a copy and say so.
+                backup = keep_unreadable(path)
+                QMessageBox.warning(
+                    self, "Account file unreadable",
+                    f"{path.name} could not be read ({e}).\n\nA copy was saved as "
+                    f"{backup.name}. The account is shown empty; importing a "
+                    "full-history statement rebuilds it.")
         self._holdings = {}
         return [], {}
 
     def _save_events(self):
-        events_path(self._account).write_text(json.dumps({
+        write_json(events_path(self._account), {
             "account":  self._account,
             "events":   self._events,
             "outcomes": {_outcome_key(k): v for k, v in self._outcomes.items()},
             "holdings": self._holdings,
-        }, indent=2))
+        })
 
     def load_account(self, acct: str):
         """Switch the active account: load its events and rebuild the table."""
@@ -691,14 +698,10 @@ class PortfolioTab(QWidget):
         account      = (_parse_account(rows) or "").strip()
         new_events   = _collect_cash_events(rows)
         new_outcomes = _build_rad_outcomes(rows)
-        _, opt_warns, stks, stk_warns = _parse_tos_csv(Path(path))
+        stks = _parse_equities(rows)
 
         if not new_events and not stks:
-            all_warns = opt_warns + stk_warns
-            msg = "No option or equity positions found."
-            if all_warns:
-                msg += "\n\n" + "\n".join(all_warns[:5])
-            QMessageBox.warning(self, "Import", msg)
+            QMessageBox.warning(self, "Import", "No option or equity positions found.")
             return
 
         # Route to the statement's own account bucket. Importing a different
@@ -817,8 +820,6 @@ class PortfolioTab(QWidget):
 _MONTH = {m.upper(): i for i, m in enumerate(calendar.month_abbr) if m}
 
 # Section headers that end the Options block
-_SECTION_BREAKS = {"Profits and Losses", "Account Summary", "Equities",
-                   "Futures Statements", "Forex Statements"}
 
 # Cash Balance TRD description patterns
 # Calendar roll: "SOLD -4 CALENDAR GAP 100 (Weeklys) 29 MAY 26/22 MAY 26 22 PUT @.67 CBOE"
@@ -897,192 +898,12 @@ def _parse_exp(exp: str) -> str:
     return "/".join(slash) if len(slash) == 3 else exp
 
 
-def _build_equity_date_lookup(rows: list[list[str]]) -> dict[str, str]:
-    """Return {SYMBOL: oldest_open_date} for equity BUY TO OPEN from Account Trade History.
-
-    History is newest-first, so overwriting on each match leaves the oldest date.
-    """
-    lookup: dict[str, str] = {}
-    in_section = False
-    col: dict[str, int] = {}
-
-    for row in rows:
-        if not row:
-            continue
-        cells = [c.strip().strip('"') for c in row]
-        first = cells[0]
-
-        if first == "Account Trade History":
-            in_section = True
-            col = {}
-            continue
-
-        if not in_section:
-            continue
-        if first:
-            break
-        if not col:
-            col = {h.strip().lower(): i for i, h in enumerate(cells)}
-            continue
-
-        try:
-            exec_time  = cells[col["exec time"]].strip()
-            side       = cells[col["side"]].strip()
-            pos_effect = cells[col["pos effect"]].strip()
-            sym        = cells[col["symbol"]].strip().upper()
-            exp        = cells[col["exp"]].strip()
-            typ        = cells[col["type"]].strip().upper()
-        except (KeyError, IndexError):
-            continue
-
-        if side != "BUY" or pos_effect != "TO OPEN":
-            continue
-        if typ in ("PUT", "CALL") or exp:   # skip options
-            continue
-        if not sym or not exec_time:
-            continue
-
-        date_part = exec_time.split()[0]
-        parts = date_part.split("/")
-        if len(parts) == 3:
-            try:
-                m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
-                if y < 100:
-                    y += 2000
-                lookup[sym] = f"{m:02d}/{d:02d}/{y}"   # overwrite → keeps oldest
-            except ValueError:
-                pass
-
-    return lookup
 
 
-def _scan_option_legs(rows: list[list[str]]) -> dict:
-    """Scan Account Trade History SELL TO OPEN option legs and roll provenance.
-
-    Returns dict with:
-      prices  — {key: net credit/share for that leg}      (first = most recent)
-      opens   — {key: open date MM/DD/YYYY}               (last write = oldest)
-      qty     — {key: contract count}
-      rolled_from — {new_key: old_key}  roll provenance
-
-    History is newest-first.  A calendar (roll) trade is a SELL TO OPEN row
-    followed by a BUY TO CLOSE continuation row (empty Exec Time) naming the
-    expiration it rolled *from*.  key = (SYM, exp_MM/DD/YYYY, strike, TYPE).
-    """
-    prices:      dict[tuple, float] = {}
-    opens:       dict[tuple, str]   = {}
-    qty:         dict[tuple, int]   = {}
-    rolled_from: dict[tuple, tuple] = {}
-
-    in_section = False
-    col: dict[str, int] = {}
-    last_cal_key: tuple | None = None
-
-    for row in rows:
-        if not row:
-            continue
-        cells = [c.strip().strip('"') for c in row]
-        first = cells[0]
-
-        if first == "Account Trade History":
-            in_section = True
-            col = {}
-            last_cal_key = None
-            continue
-        if not in_section:
-            continue
-        if first:           # non-empty first cell = next section header
-            break
-        if not col:
-            col = {h.strip().lower(): i for i, h in enumerate(cells)}
-            continue
-
-        try:
-            exec_time  = cells[col["exec time"]].strip()
-            spread     = cells[col["spread"]].strip().upper()
-            side       = cells[col["side"]].strip()
-            pos_effect = cells[col["pos effect"]].strip()
-            sym        = cells[col["symbol"]].strip().upper()
-            exp        = cells[col["exp"]].strip()
-            strike     = cells[col["strike"]].strip()
-            typ        = cells[col["type"]].strip().upper()
-            net_price  = cells[col["net price"]].strip()
-            qty_raw    = cells[col["qty"]].strip()
-        except (KeyError, IndexError):
-            last_cal_key = None
-            continue
-
-        if typ not in ("PUT", "CALL"):
-            last_cal_key = None
-            continue
-
-        key = (sym, _parse_exp(exp), _norm_strike(strike), typ)
-
-        if side == "SELL" and pos_effect == "TO OPEN":
-            try:
-                price = float(net_price)
-            except ValueError:
-                last_cal_key = None
-                continue
-
-            opened    = ""
-            date_part = exec_time.split()[0] if exec_time else ""
-            d = _parse_mdy(date_part)
-            if d:
-                opened = f"{d.month:02d}/{d.day:02d}/{d.year}"
-
-            if key not in prices:                # first = most recent leg credit
-                prices[key] = price
-            if key not in qty:
-                try:
-                    qty[key] = abs(int(float(qty_raw)))
-                except ValueError:
-                    qty[key] = 0
-            if opened:
-                opens[key] = opened              # overwrite → last = oldest
-
-            last_cal_key = key if spread == "CALENDAR" else None
-
-        elif (side == "BUY" and pos_effect == "TO CLOSE"
-              and last_cal_key is not None and not exec_time):
-            rolled_from[last_cal_key] = key
-            last_cal_key = None
-        else:
-            last_cal_key = None
-
-    return {"prices": prices, "opens": opens, "qty": qty, "rolled_from": rolled_from}
 
 
-def _walk_chain(head: tuple, legs: dict, fees: dict) -> dict:
-    """Walk a roll chain back from its head, summing premium & fees, oldest open date."""
-    cur, seen = head, set()
-    total_prem = 0.0
-    total_fee  = 0.0
-    opened     = ""
-    while True:
-        total_prem += legs["prices"].get(cur, 0.0)
-        total_fee  += fees.get(cur, 0.0)
-        if cur in legs["opens"]:
-            opened = legs["opens"][cur]
-        if cur not in legs["rolled_from"] or cur in seen:
-            break
-        seen.add(cur)
-        cur = legs["rolled_from"][cur]
-    return {"premium": round(total_prem, 4), "fees": round(total_fee, 2), "opened": opened}
 
 
-def _build_premium_lookup(rows: list[list[str]]) -> dict[tuple, dict]:
-    """Return {key: {"price": str cumulative credit/share, "opened": MM/DD/YYYY}}
-    for every sold-to-open option leg, premium summed across its roll chain."""
-    legs = _scan_option_legs(rows)
-    lookup: dict[tuple, dict] = {}
-    for key in legs["prices"]:
-        chain = _walk_chain(key, legs, {})
-        lookup[key] = {
-            "price":  str(chain["premium"]),
-            "opened": chain["opened"] or legs["opens"].get(key, ""),
-        }
-    return lookup
 
 
 def _build_rad_outcomes(rows: list[list[str]]) -> dict[tuple, str]:
@@ -1227,7 +1048,11 @@ def _drop_split_roll_duplicates(events: list[dict]) -> int:
             continue
         if e.get("roll"):
             rolls.append(e)
-        elif not e.get("close_strike"):          # verticals carry one too
+        elif e.get("close_strike"):
+            # A vertical is a roll at one expiration: match it against the
+            # same two legs as one, read the way it trades.
+            rolls.append(_normalize_verticals([e])[0])
+        else:
             key = (e["date"], e["sym"], e["otype"], e["action"], e["qty"], e["strike"])
             singles.setdefault(key, []).append(i)
 
@@ -1250,6 +1075,42 @@ def _drop_split_roll_duplicates(events: list[dict]) -> int:
     if drop:
         events[:] = [e for i, e in enumerate(events) if i not in drop]
     return len(drop)
+
+
+def _parse_equities(rows: list[list[str]]) -> list[dict]:
+    """The statement's Equities section: [{symbol, shares, cost_basis}, …].
+
+    One row per holding, with the share count and TOS's average cost per
+    share ("Trade Price"). This is the holdings snapshot an import saves.
+    """
+    out: list[dict] = []
+    col: dict[str, int] = {}
+    inside = False
+    for row in rows:
+        cells = [c.strip().strip('"') for c in row]
+        if not cells or not any(cells):
+            if inside and col:
+                break                         # a blank line ends the section
+            continue
+        if cells[0] == "Equities":
+            inside, col = True, {}
+            continue
+        if not inside:
+            continue
+        if not col:
+            col = {h.strip().lower(): i for i, h in enumerate(cells)}
+            continue
+        if not cells[0] or "OVERALL" in " ".join(cells).upper():
+            continue
+        try:
+            sym = cells[col["symbol"]].upper()
+            shares = float(cells[col["qty"]].lstrip("+").replace(",", ""))
+            price = cells[col["trade price"]].replace("$", "").replace(",", "")
+        except (KeyError, IndexError, ValueError):
+            continue
+        if sym and shares > 0:
+            out.append({"symbol": sym, "shares": f"{shares:g}", "cost_basis": price})
+    return out
 
 
 def _parse_statement_end(rows: list[list[str]]) -> date | None:
@@ -1521,6 +1382,12 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                 diag_qty[_diag(e)] = diag_qty.get(_diag(e), 0) + e["qty"]
         diag_done: set = set()
 
+        def _expired_before(c, when: str) -> bool:
+            """Has every contract still counted open on ``c`` expired before ``when``?"""
+            d = _parse_mdy(when) or date.min
+            exps = [_parse_mdy(x) for x, q in c["qty_by_exp"].items() if q > 0]
+            return bool(exps) and all(x is not None and x < d for x in exps)
+
         def _short_open(e) -> bool:
             """Is a short contract open on this exact leg (so a BOT closes it)?"""
             leg = (e["strike"], e["exp"])
@@ -1609,6 +1476,15 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                         if cycle["closed_date"] != e["date"]:
                             _retire(key)
                             cycle = None
+                    if (cycle is not None and action == "SOLD" and cycle["shares"] <= 0
+                            and _expired_before(cycle, e["date"])):
+                        # Every contract it had open expired before today. Expiring
+                        # writes no statement row, so nothing else closes it — and
+                        # without this a new sale at the strike weeks later joins
+                        # the finished position (IRA RIOT 18: August's expired lot
+                        # folded into October's, opened 8/17 with its premium).
+                        _retire(key)
+                        cycle = None
                     if cycle is None and action == "SOLD":
                         # A cycle that went flat today at another strike is this
                         # position rolled — carry it over under the new strike.
@@ -1649,7 +1525,20 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                     # the last); a plain sale adds to it.
                     if action is None:
                         cycle["qty_known"] = False      # pre-upgrade event
+                    elif (e.get("roll") and action == "SOLD" and e.get("close_exp")
+                            and e.get("close_strike", key) == key
+                            and cycle["qty_by_exp"].get(e["close_exp"], 0) > 0):
+                        # A calendar roll that says which expiration it closed
+                        # moves exactly those contracts, so rolling part of a
+                        # position leaves the rest where they were.
+                        n = min(e["qty"], cycle["qty_by_exp"][e["close_exp"]])
+                        cycle["qty_by_exp"][e["close_exp"]] -= n
+                        cycle["open_qty"]  += e["qty"] - n
+                        cycle["roll_group"] = None
                     elif e.get("roll") and action == "SOLD":
+                        # Older events don't record the closed expiration; a
+                        # roll then replaces the open count (fills of one roll
+                        # share a date and new expiration, and add up).
                         group = (e["date"], e["exp"])
                         base  = cycle["open_qty"] if group == cycle["roll_group"] else 0
                         cycle["open_qty"]   = base + e["qty"]
@@ -1755,9 +1644,15 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                     px = abs(e["amount"]) / e["shares"] if e["shares"] else 0.0
                     cycle = None
                     if e["assigned"]:
-                        cycle = next((c for c in live.values()
-                                      if c["put_strike"] and
-                                      abs(float(c["put_strike"]) - px) < 0.005), None)
+                        # Prefer the cycle with puts still open at that strike:
+                        # an earlier assignment's share cycle keeps the strike
+                        # too, and would otherwise take these shares while the
+                        # put that was actually exercised stays on the books.
+                        at_strike = [c for c in live.values()
+                                     if c["put_strike"] and
+                                     abs(float(c["put_strike"]) - px) < 0.005]
+                        cycle = next((c for c in at_strike if c.get("open_qty", 0) > 0),
+                                     at_strike[0] if at_strike else None)
                         if cycle is None:
                             cycle = _exercise_long_call(e, px)
                         cycle = cycle or _holder()
@@ -1953,6 +1848,14 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
         return _long_option_row(c)
     strike = float(c["put_strike"]) if c["put_strike"] else 0.0
     qty    = c["qty_by_exp"].get(c["put_exp"], 0) or c.get("stock_qty", 0)
+    # Contracts open at this strike may sit at more than one expiration; a
+    # live row counts all that haven't passed, not just the latest.
+    if c["shares"] <= 0:
+        today = date.today()
+        live_qty = sum(q for x, q in c["qty_by_exp"].items()
+                       if q > 0 and (_parse_mdy(x) or date.min) >= today)
+        if live_qty and live_qty != qty:
+            qty = live_qty
     premium    = round(c["premium"], 2)
     fees       = round(c["fees"], 2)
     stock_pnl  = round(c["stock_pnl"], 2)
@@ -2240,212 +2143,5 @@ def _annotate_tags_and_capital(rows: list[dict]) -> dict:
     }
 
 
-def _build_fee_lookup(rows: list[list[str]]) -> dict[tuple, float]:
-    """Scan Cash Balance TRD rows and return total fees keyed by
-    (SYMBOL, exp_MM/DD/YYYY, strike_str, TYPE_UPPER).
-    """
-    lookup: dict[tuple, float] = {}
-
-    for row in rows:
-        cells = [c.strip().strip('"') for c in row]
-        # Cash Balance columns:
-        # DATE, TIME, TYPE, REF#, DESCRIPTION, Misc Fees, Commissions & Fees, AMOUNT, BALANCE
-        if len(cells) < 7 or cells[2] != "TRD":
-            continue
-
-        desc     = cells[4] if len(cells) > 4 else ""
-        misc_raw = cells[5] if len(cells) > 5 else ""
-        comm_raw = cells[6] if len(cells) > 6 else ""
-
-        try:
-            misc = abs(float(misc_raw.replace(",", ""))) if misc_raw else 0.0
-        except ValueError:
-            misc = 0.0
-        try:
-            comm = abs(float(comm_raw.replace(",", ""))) if comm_raw else 0.0
-        except ValueError:
-            comm = 0.0
-
-        total = round(misc + comm, 2)
-        if total == 0.0:
-            continue
-
-        # Calendar roll — use the TO-OPEN (first) expiration as the key
-        if "CALENDAR" in desc.upper():
-            m = _TRD_CAL_RE.search(desc)
-            if m:
-                sym, exp, _close_exp, strike, typ = m.groups()
-                key = (sym.upper(), _parse_exp(exp.strip()), _norm_strike(strike), typ.upper())
-                lookup[key] = round(lookup.get(key, 0.0) + total, 2)
-        else:
-            m = _TRD_SINGLE_RE.search(desc)
-            if m:
-                sym, exp, strike, typ = m.groups()
-                key = (sym.upper(), _parse_exp(exp.strip()), _norm_strike(strike), typ.upper())
-                lookup[key] = round(lookup.get(key, 0.0) + total, 2)
-
-    return lookup
 
 
-def _parse_tos_csv(
-    path: Path,
-) -> tuple[list[dict], list[str], list[dict], list[str]]:
-    """Parse a TOS Account Statement CSV. Returns (options, opt_warnings, equities, eq_warnings)."""
-    opt_results:  list[dict] = []
-    opt_warnings: list[str]  = []
-    eq_results:   list[dict] = []
-    eq_warnings:  list[str]  = []
-
-    try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except Exception as e:
-        return [], [str(e)], [], []
-
-    rows = list(csv.reader(io.StringIO(text)))
-
-    fee_lookup        = _build_fee_lookup(rows)
-    premium_lookup    = _build_premium_lookup(rows)
-    equity_date_lookup = _build_equity_date_lookup(rows)
-
-    # ── Options section ───────────────────────────────────────────────────────
-    in_options = False
-    col: dict[str, int] = {}
-
-    for row in rows:
-        if not row:
-            continue
-        cells = [c.strip().strip('"') for c in row]
-        first = cells[0]
-
-        if first == "Options":
-            in_options = True
-            col = {}
-            continue
-
-        if not in_options:
-            continue
-
-        if not col:
-            col = {h.strip().lower(): i for i, h in enumerate(cells)}
-            continue
-
-        if first in _SECTION_BREAKS:
-            break
-
-        joined = " ".join(cells)
-        if "OVERALL" in joined.upper() or not first:
-            continue
-
-        try:
-            sym    = cells[col["symbol"]].upper()
-            exp    = cells[col["exp"]]
-            strike = cells[col["strike"]]
-            typ    = cells[col["type"]].capitalize()
-            qty    = cells[col["qty"]]
-            price  = cells[col["trade price"]]
-        except (KeyError, IndexError) as e:
-            opt_warnings.append(f"Skipped row (missing column {e}): {cells[:5]}")
-            continue
-
-        if not sym or sym in ("SYMBOL",):
-            continue
-
-        exp_fmt      = _parse_exp(exp)
-        contract_key = (sym, exp_fmt, _norm_strike(strike), typ.upper())
-        fees         = f"{fee_lookup[contract_key]:.2f}" if contract_key in fee_lookup else ""
-        opened       = ""
-        if contract_key in premium_lookup:
-            entry  = premium_lookup[contract_key]
-            price  = entry["price"]
-            opened = entry["opened"]
-
-        opt_results.append({
-            "symbol":     sym,
-            "type":       typ,
-            "expiration": exp_fmt,
-            "strike":     strike,
-            "qty":        qty,
-            "premium":    price,
-            "fees":       fees,
-            "opened":     opened,
-        })
-
-    # ── Equities section ──────────────────────────────────────────────────────
-    _EQUITY_BREAKS = {
-        "Options", "Profits and Losses", "Account Summary",
-        "Futures Statements", "Forex Statements",
-        "Cash Balance", "Account Trade History",
-    }
-
-    in_equities = False
-    col = {}
-
-    for row in rows:
-        if not row:
-            continue
-        cells = [c.strip().strip('"') for c in row]
-        first = cells[0]
-
-        if first == "Equities":
-            in_equities = True
-            col = {}
-            continue
-
-        if not in_equities:
-            continue
-
-        if not col:
-            col = {h.strip().lower(): i for i, h in enumerate(cells)}
-            continue
-
-        if first in _EQUITY_BREAKS:
-            break
-
-        joined = " ".join(cells)
-        if "OVERALL" in joined.upper() or not first:
-            continue
-
-        try:
-            sym = cells[col["symbol"]].upper().strip()
-        except (KeyError, IndexError):
-            continue
-
-        if not sym or sym == "SYMBOL":
-            continue
-
-        try:
-            qty_raw = cells[col["qty"]].strip().lstrip("+").replace(",", "")
-            qty_f   = float(qty_raw)
-            if qty_f <= 0:
-                continue
-            shares = str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f)
-        except (KeyError, IndexError, ValueError):
-            eq_warnings.append(f"Skipped {sym}: could not parse qty")
-            continue
-
-        cost_basis = ""
-        try:
-            cost_basis = cells[col["trade price"]].strip().replace("$", "").replace(",", "")
-        except (KeyError, IndexError):
-            pass
-
-        current_price = ""
-        for name in ("mark", "close price", "last price", "last"):
-            if name in col:
-                try:
-                    val = cells[col[name]].strip().replace("$", "").replace(",", "")
-                    if val:
-                        current_price = val
-                        break
-                except IndexError:
-                    pass
-
-        eq_results.append({
-            "symbol":        sym,
-            "shares":        shares,
-            "cost_basis":    cost_basis,
-            "current_price": current_price,
-            "opened":        equity_date_lookup.get(sym, ""),
-        })
-
-    return opt_results, opt_warnings, eq_results, eq_warnings
