@@ -437,6 +437,8 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
     dep_cum = 0.0
 
     dep_series, realized_series, total_series = [], [], []
+    fees_series: list[float] = []
+    cum_fees = 0.0   # already inside realized; tracked so it can be shown
 
     for bd in timeline:
         # advance deposits
@@ -446,6 +448,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         # advance trades
         while ti < len(trades) and trades[ti]["date"] <= bd:
             t = trades[ti]
+            cum_fees += -t.get("fees", 0.0)
             if t["kind"] == "opt":
                 cum_opt += t["amount"]
             else:
@@ -483,6 +486,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
                 unreal += p * sh - tc
 
         dep_series.append(dep_cum)
+        fees_series.append(cum_fees)
         realized_series.append(realized)
         total_series.append(realized + unreal)
 
@@ -491,6 +495,7 @@ def reconstruct(data: dict, with_unrealized: bool = True) -> dict:
         "deposits": dep_series,
         "realized": realized_series,
         "total":    total_series,
+        "fees":     fees_series,
     }
 
 
@@ -889,7 +894,10 @@ class GainsTab(QWidget):
         self._lbl_dep      = QLabel("Net deposits: —")
         self._lbl_realized = QLabel("Realized: —")
         self._lbl_total    = QLabel("Total: —")
-        for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+        self._lbl_fees     = QLabel("Fees: —")
+        self._lbl_fees.setToolTip("Commissions and misc fees paid, from the statement's "
+                                  "fee columns. Already subtracted from Realized and Total.")
+        for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
             lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
             summary.addWidget(lbl)
         summary.addStretch()
@@ -985,7 +993,7 @@ class GainsTab(QWidget):
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=11, color="gray")
             self._canvas.draw()
-            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
                 lbl.setText(lbl.text().split(":")[0] + ": —")
             return
 
@@ -996,7 +1004,7 @@ class GainsTab(QWidget):
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=11, color="gray")
             self._canvas.draw()
-            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total):
+            for lbl in (self._lbl_dep, self._lbl_realized, self._lbl_total, self._lbl_fees):
                 lbl.setText(lbl.text().split(":")[0] + ": —")
             return
 
@@ -1041,6 +1049,7 @@ class GainsTab(QWidget):
         self._lbl_total.setStyleSheet(
             f"font-weight: bold; font-size: 13px; color: {'green' if total_pnl >= 0 else 'red'};")
         self._lbl_total.setText(f"Total: ${total_pnl:+,.2f} ({tot_ror:+.1f}%)")
+        self._lbl_fees.setText(f"Fees: ${series['fees'][-1]:,.2f}")
 
 
 def _bar_width(x: list[float]) -> float:

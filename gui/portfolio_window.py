@@ -86,6 +86,8 @@ outright aren't shown for it.</li>
 <ul>
 <li><b>Realized P&amp;L</b> = option premium cash flows + stock gains/losses
 (average-cost basis), recognized on the trade/sale date (cash basis).</li>
+<li><b>Fees</b> = commissions and misc fees from the statement's fee columns,
+already subtracted from Realized and Total; shown so you can check them.</li>
 <li><b>Total P&amp;L</b> = realized + unrealized. Unrealized marks open share
 holdings to market using yfinance closes.</li>
 <li><b>Net Deposits</b> is the blue base; gain/loss bars stack on top (green/red).
