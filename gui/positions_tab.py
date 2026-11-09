@@ -1932,12 +1932,19 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
     # open the shares are uncovered — capital is still at work through today.
     # A bought-back cycle ended the day it went flat (the Closed tab's "Ended").
     exp_cell = end_str or ""
+    # Strike follows the same leg as Expiration: on held shares that is the
+    # call, not the assigned put (whose strike is already Assn Price) — a 22
+    # put assigned and then covered by a 20 call read as a 22 call.
+    strike_cell = c["put_strike"] or ""
     if status == "Holding":
         today = date.today()
-        open_exps = sorted(d for (_, exp), q in c.get("calls", {}).items()
-                           if q > 0 and (d := _parse_mdy(exp)) and d >= today)
+        open_legs = [(d, k) for (k, exp), q in c.get("calls", {}).items()
+                     if q > 0 and (d := _parse_mdy(exp)) and d >= today]
+        open_exps = sorted(d for d, _ in open_legs)
         if open_exps:
             exp_cell = open_exps[0].strftime("%m/%d/%Y")
+            strike_cell = "/".join(sorted({k for d, k in open_legs if d == open_exps[0]},
+                                          key=float))
             # Capital stays committed until the last open call expires; the
             # last call *written* may be an earlier one, or already over.
             close_d  = open_exps[-1]
@@ -2006,7 +2013,7 @@ def _cycle_to_row(c: dict, outcomes: dict[tuple, str]) -> dict:
         # Share rows count shares; option rows count contracts.
         "qty":        f"{shown_qty:g}",
         "unit":       _unit("shares" if c.get("shares_in") else "contracts", shown_qty),
-        "strike":     c["put_strike"] or "",
+        "strike":     strike_cell,
         "premium":    f"{premium:.2f}",
         "expiration": exp_cell,
         "status":     status,

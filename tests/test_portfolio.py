@@ -354,6 +354,83 @@ class PutQuantities(unittest.TestCase):
         self.assertEqual([(r["status"], r["qty"], r["premium"]) for r in rows],
                          [("Holding", "200", "220.00")])
 
+    def test_held_shares_show_the_calls_strike_not_the_puts(self):
+        # LSO CHWY: assigned on the 22 put, covered by a call rolled to 20.
+        stock = {"sym": "Q", "date": "01/10/2026", "kind": "stock", "action": "BOT",
+                 "shares": 100.0, "amount": -2200.0, "fees": 0.0, "assigned": True}
+        call = {**_put("01/12/2026", 1, "12/31/2099", 50.0, strike="20"), "otype": "CALL"}
+        rows = p._reconstruct_wheels([_put("01/05/2026", 1, "01/09/2026", 100.0, strike="22"),
+                                      stock, call], {})
+        self.assertEqual([(r["status"], r["strike"], r["expiration"], r["assn_price"])
+                          for r in rows], [("Holding", "20", "12/31/2099", "22.00")])
+
+
+def _call(d, q, exp, amt, strike, action="SOLD", close_strike=None, close_exp=None):
+    e = {**_put(d, q, exp, amt, strike=strike, action=action,
+                roll=bool(close_exp), close_exp=close_exp), "otype": "CALL"}
+    if close_strike:
+        e["close_strike"] = close_strike
+    return e
+
+
+def _open_call_legs(events) -> dict[tuple, int]:
+    """Open calls per (strike, exp), worked out from the events alone — not
+    through the cycle routing under test, so the two can disagree."""
+    legs: dict[tuple, int] = {}
+    for e in events:
+        if e.get("otype") != "CALL":
+            continue
+        if e.get("roll") and e.get("close_exp"):
+            old = (e.get("close_strike") or e["strike"], e["close_exp"])
+            legs[old] = legs.get(old, 0) - e["qty"]
+        leg = (e["strike"], e["exp"])
+        legs[leg] = legs.get(leg, 0) + (e["qty"] if e["action"] == "SOLD" else -e["qty"])
+    today = date.today()
+    return {l: q for l, q in legs.items() if q > 0 and p._parse_mdy(l[1]) >= today}
+
+
+class HeldSharesShowTheirCall(unittest.TestCase):
+    """A Holding row's Strike and Expiration must name the same open call.
+
+    Each column was right by its own definition while the row as a whole was
+    wrong: Expiration moved to the covering call and Strike stayed on the
+    assigned put, so LSO CHWY (22 put, call rolled to 20) read as a 22 call.
+    A line-by-line review passed it. This checks the pair, not the columns.
+    """
+
+    SCENARIOS = {
+        "one call": [_call("01/12/2026", 2, "12/17/2099", 60.0, "23")],
+        "rolled to a new strike": [
+            _call("01/12/2026", 2, "12/17/2099", 60.0, "23"),
+            _call("01/20/2026", 2, "12/31/2099", 40.0, "20",
+                  close_strike="23", close_exp="12/17/2099")],
+        "two expirations": [_call("01/12/2026", 1, "12/31/2099", 30.0, "24"),
+                            _call("01/12/2026", 1, "12/17/2099", 30.0, "23")],
+        "two strikes, one expiration": [_call("01/12/2026", 1, "12/17/2099", 30.0, "21"),
+                                        _call("01/12/2026", 1, "12/17/2099", 30.0, "20")],
+        "bought back": [_call("01/12/2026", 2, "12/17/2099", 60.0, "23"),
+                        _call("01/15/2026", 2, "12/17/2099", -20.0, "23", action="BOT")],
+    }
+
+    def test_strike_and_expiration_name_one_open_call(self):
+        assigned = [_put("01/05/2026", 2, "01/09/2026", 100.0, strike="22"),
+                    {"sym": "Q", "date": "01/10/2026", "kind": "stock", "action": "BOT",
+                     "shares": 200.0, "amount": -4400.0, "fees": 0.0, "assigned": True}]
+        for name, calls in self.SCENARIOS.items():
+            with self.subTest(name):
+                events = assigned + calls
+                [row] = [r for r in p._reconstruct_wheels(events, {})
+                         if r["status"] == "Holding"]
+                legs = _open_call_legs(events)
+                if not legs:
+                    self.assertEqual(row["expiration"], "uncovered")
+                    continue
+                nearest = min(legs, key=lambda l: p._parse_mdy(l[1]))[1]
+                strikes = sorted((k for k, x in legs if x == nearest), key=float)
+                self.assertEqual((row["strike"], row["expiration"]),
+                                 ("/".join(strikes), nearest))
+                self.assertEqual(row["assn_price"], "22.00")
+
 
 class Storage(_InTempDir):
     def test_vertical_and_its_split_legs_count_once(self):
