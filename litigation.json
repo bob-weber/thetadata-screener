@@ -97,6 +97,21 @@
     "severity": "overhang",
     "source": "https://www.sec.gov/Archives/edgar/data/1800/000162828026050134/abt-20260630.htm"
   },
+  "ACI": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "named case caption",
+      "broken-out legal heading",
+      "government investigation on file"
+    ],
+    "filing": "10-Q 2026-10-20",
+    "note": "named case caption; broken-out legal heading; government investigation on file",
+    "review_by": "2027-03-01",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/1646972/000164697226000065/aci-20260912.htm"
+  },
   "ACMR": {
     "asof": "2026-09-06",
     "auto": true,
@@ -390,6 +405,20 @@
     "review_by": "2027-01-25",
     "severity": "clear",
     "source": "https://www.sec.gov/Archives/edgar/data/1596532/000159653226000175/anet-20260630.htm"
+  },
+  "ANF": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "loss not estimable",
+      "legal text present but no decisive signal"
+    ],
+    "filing": "10-Q 2026-09-04",
+    "note": "loss not estimable; legal text present but no decisive signal",
+    "review_by": "2027-03-01",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/1018840/000101884026000047/anf-20260801.htm"
   },
   "APA": {
     "asof": "2026-11-07",
@@ -1792,6 +1821,21 @@
     "severity": "overhang",
     "source": "https://www.sec.gov/Archives/edgar/data/1001250/000100125026000041/el-20260630.htm"
   },
+  "ELF": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "securities class action (10b-5)",
+      "shareholder derivative suit",
+      "loss not estimable"
+    ],
+    "filing": "10-Q 2026-11-05",
+    "note": "securities class action (10b-5); shareholder derivative suit; loss not estimable",
+    "review_by": "2027-03-01",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/1600033/000160003326000050/elf-20260930.htm"
+  },
   "EMR": {
     "asof": "2026-09-14",
     "auto": true,
@@ -2488,6 +2532,21 @@
     "review_by": "2026-12-15",
     "severity": "clear",
     "source": "https://www.sec.gov/Archives/edgar/data/47111/000162828026050900/hsy-20260628.htm"
+  },
+  "HUM": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "named case caption",
+      "broken-out legal heading",
+      "shareholder derivative suit"
+    ],
+    "filing": "10-Q 2026-11-06",
+    "note": "named case caption; broken-out legal heading; shareholder derivative suit",
+    "review_by": "2027-03-01",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/49071/000004907126000066/hum-20260930.htm"
   },
   "HUT": {
     "asof": "2026-09-06",
@@ -3228,6 +3287,35 @@
     "review_by": "2026-12-21",
     "severity": "overhang",
     "source": "https://www.sec.gov/Archives/edgar/data/1801368/000180136826000048/mp-20260630.htm"
+  },
+  "MRK": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "broken-out legal heading",
+      "heading only \u2014 no caption or case-type signal"
+    ],
+    "filing": "10-Q 2026-11-04",
+    "note": "broken-out legal heading; heading only \u2014 no caption or case-type signal",
+    "review_by": "2027-03-01",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/310158/000031015826000248/mrk-20260930.htm"
+  },
+  "MRNA": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "broken-out legal heading",
+      "securities class action (10b-5)",
+      "shareholder derivative suit"
+    ],
+    "filing": "10-Q 2026-11-06",
+    "note": "broken-out legal heading; securities class action (10b-5); shareholder derivative suit",
+    "review_by": "2027-03-01",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/1682852/000168285226000197/mrna-20260930.htm"
   },
   "MRVL": {
     "asof": "2026-10-17",
@@ -4490,6 +4578,23 @@
     "severity": "clear",
     "source": "https://www.sec.gov/Archives/edgar/data/97210/000119312526327715/ter-20260628.htm"
   },
+  "TEVA": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "broken-out legal heading",
+      "government investigation on file",
+      "quantified exposure ($ 235.5 million)"
+    ],
+    "exposure": "$ 235.5 million",
+    "exposure_only": true,
+    "filing": "10-Q 2026-11-03",
+    "note": "broken-out legal heading; government investigation on file; quantified exposure ($ 235.5 million)",
+    "review_by": "2027-03-01",
+    "severity": "overhang",
+    "source": "https://www.sec.gov/Archives/edgar/data/818686/000081868626000006/teva-20260930.htm"
+  },
   "TJX": {
     "asof": "2026-09-06",
     "auto": true,
@@ -4956,6 +5061,20 @@
     "review_by": "2026-12-27",
     "severity": "clear",
     "source": "https://www.sec.gov/Archives/edgar/data/732712/000073271226000046/vz-20260630.htm"
+  },
+  "WDAY": {
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "broken-out legal heading",
+      "heading only \u2014 no caption or case-type signal"
+    ],
+    "filing": "10-Q 2026-08-27",
+    "note": "broken-out legal heading; heading only \u2014 no caption or case-type signal",
+    "review_by": "2027-03-01",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/1327811/000132781126000044/wday-20260731.htm"
   },
   "WDC": {
     "asof": "2026-10-10",
