@@ -434,14 +434,20 @@
     "source": "https://www.sec.gov/Archives/edgar/data/1858681/000185868126000040/apo-20260630.htm"
   },
   "APP": {
-    "asof": "2026-08-29",
-    "auto": false,
-    "case": "Brownback v. AppLovin, N.D. Cal.",
-    "confirmed": true,
-    "note": "Securities class action (10b-5), class period 2024-11-07 to 2025-03-27; motion to dismiss fully briefed Feb 2026, ruling pending. No accrual; no SEC/DOJ matter and no restatement disclosed. Consolidated derivative suits stayed behind the MTD.",
-    "review_by": "2026-11-15",
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "broken-out legal heading",
+      "securities class action (10b-5)",
+      "shareholder derivative suit",
+      "loss not estimable"
+    ],
+    "filing": "10-Q 2026-11-04",
+    "note": "broken-out legal heading; securities class action (10b-5); shareholder derivative suit; loss not estimable",
+    "review_by": "2027-03-01",
     "severity": "overhang",
-    "source": "https://www.sec.gov/Archives/edgar/data/1751008/000175100826000059/app-20260630.htm"
+    "source": "https://www.sec.gov/Archives/edgar/data/1751008/000175100826000069/app-20260930.htm"
   },
   "AR": {
     "asof": "2026-09-25",
@@ -1506,6 +1512,20 @@
     "review_by": "2026-12-27",
     "severity": "overhang",
     "source": "https://www.sec.gov/Archives/edgar/data/1841408/000119312526335154/dave-20260630.htm"
+  },
+  "DBX": {
+    "asof": "2026-11-09",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "broken-out legal heading",
+      "heading only \u2014 no caption or case-type signal"
+    ],
+    "filing": "10-Q 2026-11-06",
+    "note": "broken-out legal heading; heading only \u2014 no caption or case-type signal",
+    "review_by": "2027-02-17",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/1467623/000146762326000061/dbx-20260930.htm"
   },
   "DDOG": {
     "asof": "2026-09-06",
@@ -3587,6 +3607,19 @@
     "severity": "review",
     "source": "https://www.sec.gov/Archives/edgar/data/797468/000162828026053388/oxy-20260630.htm"
   },
+  "PAA": {
+    "asof": "2026-11-09",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "ordinary-course language only"
+    ],
+    "filing": "10-Q 2026-11-09",
+    "note": "ordinary-course language only",
+    "review_by": "2027-02-17",
+    "severity": "clear",
+    "source": "https://www.sec.gov/Archives/edgar/data/1070423/000107042326000058/paa-20260930.htm"
+  },
   "PANW": {
     "asof": "2026-09-06",
     "auto": true,
@@ -3643,6 +3676,22 @@
     "review_by": "2026-12-15",
     "severity": "review",
     "source": "https://www.sec.gov/Archives/edgar/data/77476/000007747626000035/pep-20260613.htm"
+  },
+  "PFE": {
+    "asof": "2026-11-14",
+    "auto": true,
+    "confidence": "low",
+    "evidence": [
+      "broken-out legal heading",
+      "loss not estimable",
+      "government investigation on file",
+      "heading only \u2014 no caption or case-type signal"
+    ],
+    "filing": "10-Q 2026-11-03",
+    "note": "broken-out legal heading; loss not estimable; government investigation on file; heading only \u2014 no caption or case-type signal",
+    "review_by": "2027-02-22",
+    "severity": "review",
+    "source": "https://www.sec.gov/Archives/edgar/data/78003/000007800326000127/pfe-20260927.htm"
   },
   "PGR": {
     "asof": "2026-09-25",
@@ -3787,16 +3836,22 @@
     "source": "https://www.sec.gov/Archives/edgar/data/2078856/000119312526370281/purr-20260630.htm"
   },
   "PYPL": {
-    "asof": "2026-09-06",
-    "auto": false,
-    "auto_severity": "existential",
-    "case": "In re PayPal Branded Checkout Securities Litigation, N.D. Cal. No. 3:26-cv-01589",
-    "confirmed": true,
-    "filing": "10-Q 2026-07-28",
-    "note": "Live 10(b)/20(a) class action over branded-checkout growth disclosure and the 2027 targets; Darcy (2026-02-24) consolidated with Norfolk County RS (2026-04-02) on 2026-05-21, institutional lead plaintiffs appointed, class period Feb 2024\u2013Feb 2026. No MTD ruling yet, unspecified damages, no accrual disclosed. Five derivative suits (Goncalves, LR Trust, Stan, Lovoi, Haliburton) ride on the same facts. The earlier NNA action (In re PayPal Holdings Securities Litigation) was dismissed WITH prejudice 2026-03-31 and is on appeal to the 3rd Cir.; its derivative suits are stayed. Downgraded by hand from the automated `existential`: the credibility trigger was the phrase \"Civil Investigative Demand\", but the CIDs are FTC and CFPB conduct matters (merchant onboarding, Reg E, PayPal Credit) plus German FCO and UK FCA competition proceedings \u2014 no restatement, no material weakness, and no SEC or DOJ matter anywhere in the filing. The claim is about growth disclosure, not about the books.",
-    "review_by": "2026-11-15",
+    "asof": "2026-11-21",
+    "auto": true,
+    "confidence": "medium",
+    "evidence": [
+      "named case caption",
+      "broken-out legal heading",
+      "securities class action (10b-5)",
+      "shareholder derivative suit",
+      "loss not estimable",
+      "government investigation on file"
+    ],
+    "filing": "10-Q 2026-10-27",
+    "note": "named case caption; broken-out legal heading; securities class action (10b-5); shareholder derivative suit; loss not estimable; government investigation on file",
+    "review_by": "2027-03-01",
     "severity": "overhang",
-    "source": "https://www.sec.gov/Archives/edgar/data/1633917/000163391726000082/pypl-20260630.htm"
+    "source": "https://www.sec.gov/Archives/edgar/data/1633917/000163391726000088/pypl-20260930.htm"
   },
   "QBTS": {
     "asof": "2026-09-06",
