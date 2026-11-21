@@ -15,6 +15,9 @@ gui-env/bin/python run_portfolio.py
 
 # One-time Schwab login (creates schwab_token.json; refresh ~weekly)
 gui-env/bin/python -m core.schwab_client login
+
+# Quotes + open short options across all accounts → quotes_snapshot.json
+gui-env/bin/python quotes_snapshot.py [TICKER ...] [--stdout]
 ```
 
 Tests (stdlib `unittest`; no linting config):
@@ -59,7 +62,7 @@ The GUI tabs pass data forward via PyQt6 signals (`scan_finished`, `scan_finishe
   - Confirm-to-clear: auto entries carry `auto`/`evidence`/`confidence`/`filing`. An entry with `confirmed: true` can be *raised* by a later pass but never downgraded or cleared — the machine finding is recorded as `auto_severity` instead, so a parsing miss can't quietly un-gate a name you rejected on purpose.
   - Uses `screener._RateLimiter` but **not** `_concurrent_fetch`: that one is Schwab-wired (auth detection, and a circuit breaker that reports a hard block as "Schwab is blocking requests"), which would be a misleading error for an EDGAR failure.
 
-- **`schwab_client.py`** — read-only Schwab Market Data client (wraps schwab-py). `get_client()` (cached token + manual-login fallback), `quotes()`, `option_chain()`, `price_history_daily()`. Credentials in gitignored `schwab_creds.txt`; token cached in gitignored `schwab_token.json` (access ~30 min, refresh ~7 days).
+- **`schwab_client.py`** — Schwab API client (wraps schwab-py); the code only reads, and nothing calls an order endpoint. `get_client()` (cached token + manual-login fallback), `quotes()`, `option_chain()`, `price_history_daily()`. Credentials in gitignored `schwab_creds.txt`; token cached in gitignored `schwab_token.json` (access ~30 min, refresh ~7 days).
 
 - **`lso_analyzer.py`** — scores and grades symbols for LSO (wheel-strategy) suitability using yfinance metadata.
   - `analyze_symbol()` — fetches sector, beta, market cap, dividend, earnings date from `yf.Ticker.info` and `ticker.calendar`. Starts at base score 70; applies adjustments from `_SECTOR_SCORES`, `_INDUSTRY_EXTRA`, `_score_beta()`, `_score_market_cap()`.
@@ -104,4 +107,6 @@ Built with PyQt6. `run_screener.py` just creates the `QApplication` (no local te
 
 ### Market data (Schwab)
 
-All screener market data comes from the Schwab Market Data API (read-only), via `core/schwab_client.py` wrapping schwab-py. OAuth 2.0; the access token (cached in gitignored `schwab_token.json`) auto-refreshes, and the ~7-day refresh token requires re-running `python -m core.schwab_client login`. App key/secret live in gitignored `schwab_creds.txt` (template: `schwab_creds.txt.example`). The app is registered for **Market Data Production only**, so the token cannot touch accounts. yfinance still supplies LSO/portfolio metadata.
+All screener market data comes from the Schwab Market Data API, via `core/schwab_client.py` wrapping schwab-py. OAuth 2.0; the access token (cached in gitignored `schwab_token.json`) auto-refreshes, and the ~7-day refresh token requires re-running `python -m core.schwab_client login`. App key/secret live in gitignored `schwab_creds.txt` (template: `schwab_creds.txt.example`). The token **has account access**, not just market data: `quotes_snapshot.py` reads every account's positions through the Accounts API (`client.get_accounts`). Nothing in the code places, replaces or cancels orders, but the token itself isn't what prevents that — keep it that way, and treat `schwab_token.json` as a trading credential. The portfolio tracker still works from TOS statement CSVs, not the API. yfinance still supplies LSO/portfolio metadata.
+
+`quotes_snapshot.py` (repo root) dumps quotes for the given tickers, every held stock and every option underlying, plus each open **short** option with intrinsic and time value, to `quotes_snapshot.json` (gitignored — it holds live positions) for attaching to a chat: roll checks and the morning brief. It never prompts for login; exit code 2 means the refresh token has expired.
