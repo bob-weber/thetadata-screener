@@ -1,4 +1,4 @@
-"""Schwab Market Data API client (read-only).
+"""Schwab API client.
 
 Thin wrapper over schwab-py for the screener's pricing needs: stock quotes,
 option chains, and price history. Authentication is OAuth 2.0; the access token
@@ -13,8 +13,9 @@ Credentials live in ``SCHWAB_CREDS_FILE`` (gitignored), as key=value lines:
     app_secret=YOUR_APP_SECRET
     callback_url=https://127.0.0.1   # optional; this is the default
 
-The app is registered for Market Data Production only, so these tokens cannot
-touch accounts or place trades — read-only by construction.
+The token has account access as well as market data (quotes_snapshot.py reads
+positions through the Accounts API), so it is not read-only by construction:
+nothing here places, replaces or cancels orders, and nothing should.
 """
 
 from __future__ import annotations

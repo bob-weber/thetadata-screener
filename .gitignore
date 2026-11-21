@@ -18,6 +18,7 @@ watchlist.txt
 favorites.txt
 gains_history.json
 gains_history_*.json
+quotes_snapshot.json
 
 # Logs
 *.log
