@@ -7,7 +7,7 @@ from collections import Counter
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QGroupBox,
     QTableWidget, QTableWidgetItem,
@@ -282,11 +282,7 @@ class PortfolioTab(QWidget):
         path = events_path(acct)
         if path.exists():
             try:
-                data = json.loads(path.read_text())
-                outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
-                events = data.get("events", [])
-                _drop_split_roll_duplicates(events)
-                self._holdings = data.get("holdings", {})
+                events, outcomes, self._holdings = _load_account_file(path)
                 return events, outcomes
             except Exception as e:
                 # An empty account would be saved over this on the next
@@ -470,82 +466,62 @@ class PortfolioTab(QWidget):
                  "that tag.</span>")
         self._exposure_label.setText(html)
 
-    def export_for_chat(self):
+    def export_for_chat(self, accounts: list[str] | None = None):
         """Write live positions + tag exposure to a CSV, for uploading to a chat.
 
-        One file, two sections separated by a blank line — the same shape TOS's
-        own statements use. Numbers are written bare (no $, no %, no thousands
-        separators) so they arrive as numbers rather than strings; the on-screen
-        formatting is for reading, and a CSV is for parsing.
+        ``accounts`` picks which accounts go in (default: the one on screen).
+        Each account gets its own Positions and Tag Exposure sections, its % of
+        Book measured against that account alone; with more than one, a final
+        Tag Exposure section covers them all together. Sections are separated by
+        a blank line — the same shape TOS's own statements use.
         """
-        exp = self._exposure or {}
-        total = exp.get("total", 0.0)
+        accounts = [a for a in (accounts or [self._account]) if a]
+        if not accounts:
+            QMessageBox.information(self, "Export", "No account to export.")
+            return
 
-        default = (f"positions-{safe_token(self._account)}-{date.today()}.csv")
+        # A bare filename resolves against the working directory, so the dialog
+        # opened in the program folder every time. Start where the last export
+        # went instead — shared by every account, and kept across restarts.
+        settings = QSettings("lso-tools", "portfolio")
+        last_dir = settings.value("export_dir", "", type=str)
+        name = (safe_token(accounts[0]) if len(accounts) == 1
+                else f"{len(accounts)}-accounts")
+        default = f"positions-{name}-{date.today()}.csv"
+        if last_dir and Path(last_dir).is_dir():
+            default = str(Path(last_dir) / default)
         path, _ = QFileDialog.getSaveFileName(
             self, "Export positions for chat", default,
             "CSV files (*.csv);;All files (*)"
         )
         if not path:
             return
+        settings.setValue("export_dir", str(Path(path).parent))
 
-        def _cell(row, field):
-            it = self._opt_table.item(row, _oc(field))
-            return it.text() if it else ""
-
-        def _num(s):
-            """'$28,800' / '7.8%' → '28800' / '7.8'; anything else unchanged."""
-            return s.replace("$", "").replace(",", "").replace("%", "").strip()
-
-        live = []
-        for r in range(self._opt_table.rowCount()):
-            status = self._opt_table.item(r, _O_STATUS_COL)
-            if status is None or status.text() not in _LIVE_STATUSES:
-                continue
-            live.append([
-                _cell(r, "symbol"),
-                _cell(r, "qty"),
-                _cell(r, "unit"),
-                _num(_cell(r, "strike")),
-                _num(_cell(r, "capital")),
-                _num(_cell(r, "capital_pct")),
-                _num(_cell(r, "premium")),
-                _cell(r, "expiration"),
-                _cell(r, "status"),
-                _num(_cell(r, "assn_price")),
-                _num(_cell(r, "cost_basis")),
-                _num(_cell(r, "recovery")),
-                _cell(r, "tags"),
-            ])
+        books, skipped = [], []
+        for acct in accounts:
+            if acct == self._account:
+                events, outcomes, holdings = self._events, self._outcomes, self._holdings
+            else:
+                try:
+                    events, outcomes, holdings = _load_account_file(events_path(acct))
+                except Exception:
+                    skipped.append(acct)       # unreadable; the account view says why
+                    continue
+            books.append((acct, _reconstruct_wheels(events, outcomes, holdings)))
 
         try:
             with open(path, "w", newline="", encoding="utf-8") as fh:
-                w = csv.writer(fh)
-                w.writerow(["Positions", self._account or "account",
-                            str(date.today())])
-                w.writerow([])
-                w.writerow(["Symbol", "Qty", "Unit", "Strike", "Capital", "Pct of Book",
-                            "Premium", "Expiration", "Status", "Assn/Buy Price",
-                            "Basis", "Recovery", "Tags"])
-                w.writerows(live)
-
-                w.writerow([])
-                w.writerow(["Tag Exposure", f"{total:.0f}", "at risk"])
-                w.writerow([])
-                w.writerow(["Tag", "Capital", "Pct of Book"])
-                for t, c, p in exp.get("by_tag", []):
-                    w.writerow([t, f"{c:.0f}", f"{p:.1f}"])
-                w.writerow([])
-                w.writerow(["Note", "Tags overlap, so Pct of Book sums past 100%"])
-                if exp.get("untagged"):
-                    w.writerow(["Not in durable-tags.json",
-                                ", ".join(exp["untagged"])])
+                n_live = write_chat_export(fh, books)
         except OSError as e:
             QMessageBox.warning(self, "Export", f"Could not write {path}:\n{e}")
             return
 
-        self.status_changed.emit(
-            f"Exported {len(live)} live position(s) and tag exposure to {path}")
+        msg = (f"Exported {n_live} live position(s) and tag exposure from "
+               f"{len(books)} account(s) to {path}")
+        if skipped:
+            msg += f" — skipped unreadable: {', '.join(skipped)}"
+        self.status_changed.emit(msg)
 
     # ── Live market prices ──────────────────────────────────────────────────────
 
@@ -686,12 +662,19 @@ class PortfolioTab(QWidget):
     # ── CSV import ────────────────────────────────────────────────────────────
 
     def import_csv(self):
+        # Qt only remembers the last folder for the session; keep it across
+        # restarts, as the export does.
+        settings = QSettings("lso-tools", "portfolio")
+        last_dir = settings.value("import_dir", "", type=str)
+        if not Path(last_dir).is_dir():
+            last_dir = ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import TOS Account Statement", "",
+            self, "Import TOS Account Statement", last_dir,
             "CSV files (*.csv);;All files (*)"
         )
         if not path:
             return
+        settings.setValue("import_dir", str(Path(path).parent))
 
         rows = list(csv.reader(io.StringIO(
             Path(path).read_text(encoding="utf-8-sig", errors="replace"))))
@@ -763,9 +746,9 @@ class PortfolioTab(QWidget):
         added_evs -= _drop_split_roll_duplicates(self._events)
 
         self._outcomes.update(new_outcomes)
-        # Holdings as of the statement's end date. Only a newer statement
+        # Holdings as of the statement's last row. Only a newer statement
         # replaces them: importing an old one must not roll the snapshot back.
-        asof = _parse_statement_end(rows)
+        asof = _snapshot_asof(rows, new_events)
         cur  = _parse_mdy(self._holdings.get("asof", "")) if self._holdings else None
         if asof and (cur is None or asof >= cur):
             equities = {}
@@ -1123,6 +1106,22 @@ def _parse_statement_end(rows: list[list[str]]) -> date | None:
     return None
 
 
+def _snapshot_asof(rows: list[list[str]], events: list[dict]) -> date | None:
+    """The date a statement's Equities snapshot is current to.
+
+    Usually the header's "through" date, but TOS processes Friday's expirations
+    overnight and posts the assignment dated Saturday — inside a statement
+    "through" Friday, whose Equities already hold the shares. Dating the
+    snapshot Friday leaves that buy out of the reconciliation, which then
+    invents a transfer-in for the very shares the assignment brings (SERV,
+    11/20/26: 1,000 shares counted twice). The snapshot covers every row in
+    its own statement, so it is current to the latest of them.
+    """
+    end = _parse_statement_end(rows)
+    dates = [d for d in (_parse_mdy(e.get("date", "")) for e in events) if d]
+    return max([end] + dates) if end else None
+
+
 def _parse_account(rows: list[list[str]]) -> str:
     """Extract the account label from the statement header line."""
     for row in rows[:3]:
@@ -1201,8 +1200,16 @@ def holdings_adjustments(events: list[dict], holdings: dict | None
     if not holdings or "equities" not in holdings or not events:
         return [], []                      # no snapshot yet: trades only
     snap = holdings["equities"]
-    asof = _parse_mdy(holdings.get("asof", "")) or date.max
     first = min((_parse_mdy(e["date"]) or date.max) for e in events)
+    # Only the newest statement's snapshot is kept, so any row dated after it
+    # came from that same statement — TOS posts Friday's assignments dated
+    # Saturday, inside a statement "through" Friday — and is already in its
+    # Equities. Counting it as later would invent a transfer for those shares
+    # and then add them again (SERV, 11/20/26). Snapshots stored before
+    # _snapshot_asof() still carry the header date, so it's widened here too.
+    last = max((_parse_mdy(e["date"]) or date.min) for e in events)
+    asof = _parse_mdy(holdings.get("asof", "")) or date.max
+    asof = max(asof, last)
     book = ShareBook()                          # shares and cost from events
     bought: dict[str, list] = {}                # sym → [outright shares, last buy date]
     for e in sorted(events, key=lambda e: _parse_mdy(e["date"]) or date.min):
@@ -1329,33 +1336,53 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
             return sum(q for (_, exp), q in c["calls"].items()
                        if q > 0 and (_parse_mdy(exp) or date.max) >= on)
 
-        def _call_holder(e):
-            """The share cycle a call belongs to, when more than one holds shares.
+        def _call_split(e) -> list[tuple[dict, int]]:
+            """The share cycles a call order belongs to, with contracts for each.
 
-            A call can't say which lot it covers, so closing one goes to the
-            cycle that has it open, and a new one goes to the cycle with
-            uncovered shares — the one whose free contracts match exactly,
-            if any does.
+            A call can't say which lot it covers. Closing or rolling one goes to
+            the cycles that have that leg open, as many contracts each as they
+            hold; a new one goes to the cycle whose free contracts match exactly,
+            else one with room for all of it, else it is spread over the free
+            contracts. One order often spans lots: with 600 and 200 assigned
+            INTC shares, the 8-lot roll took all 8 calls onto the 600 and left
+            the 200's two "expiring" — uncovered while they were in fact rolled.
             """
             holders = _holders()
+            q = e["qty"]
             if len(holders) <= 1:
-                return holders[0] if holders else None
+                return [(holders[0], q)] if holders else []
+
+            def _spread(avail):
+                out, left = [], q
+                for c, n in avail:
+                    take = min(n, left)
+                    if take > 0:
+                        out.append([c, take])
+                        left -= take
+                if not out:
+                    return [(holders[0], q)]
+                out[0][1] += left               # more than the lots account for
+                return [tuple(x) for x in out]
+
             on = _parse_mdy(e["date"]) or date.min
             if e.get("action") == "BOT" or e.get("roll"):
                 # A roll's to-close leg says which call it replaces.
                 leg = ((e.get("close_strike") or e["strike"], e.get("close_exp"))
                        if e.get("roll") else (e["strike"], e["exp"]))
-                for c in holders:
-                    if c["calls"].get(leg, 0) > 0:
-                        return c
+                have = [(c, c["calls"].get(leg, 0)) for c in holders
+                        if c["calls"].get(leg, 0) > 0]
+                if have:
+                    return _spread(have)
                 if e.get("action") == "BOT":
-                    return holders[0]
+                    return [(holders[0], q)]
             free = [(int(c["shares"] // 100) - _open_calls(c, on), c) for c in holders]
             for f, c in free:
-                if f == e["qty"]:
-                    return c
-            return next((c for f, c in free if f >= e["qty"]),
-                        next((c for f, c in free if f > 0), holders[0]))
+                if f == q:
+                    return [(c, q)]
+            for f, c in free:
+                if f >= q:
+                    return [(c, q)]
+            return _spread([(c, f) for f, c in free if f > 0])
 
         def _sale_holder(e):
             """The share cycle a stock sale comes out of. Called away settles at
@@ -1596,47 +1623,59 @@ def _reconstruct_wheels(events: list[dict], outcomes: dict[tuple, str],
                                 old["merged"] = True
                 else:
                     # A call belongs to whichever position holds the shares it
-                    # covers; with none assigned it rides the newest cycle.
+                    # covers — split by contracts when one order spans lots;
+                    # with none assigned it rides the newest cycle.
                     wheel = [c for c in mine if not c.get("long")]
-                    cycle = _call_holder(e) or (wheel[-1] if wheel else _new(e["strike"], e["date"]))
-                    # Open calls per (strike, exp), so a later close, roll or
-                    # called-away sale can find the cycle that wrote them.
-                    if e.get("action") in ("SOLD", "BOT"):
-                        leg = (e["strike"], e["exp"])
-                        if e.get("roll") and e.get("close_exp"):
-                            old = (e.get("close_strike") or e["strike"], e["close_exp"])
-                            cycle["calls"][old] = max(cycle["calls"].get(old, 0) - e["qty"], 0)
-                        elif e.get("roll") and e.get("action") == "SOLD":
-                            # Events stored before close_exp was recorded name
-                            # the closing strike at most. Without retiring the
-                            # leg it replaced, every rolled call stays "open"
-                            # forever (SNPS showed its 11/20 call, rolled away
-                            # in September, as the nearest expiration). Take
-                            # the open leg at the closing strike that expires
-                            # soonest — what a roll out in time replaces. A leg
-                            # already past expiration is dead, not the one rolled.
-                            k = e.get("close_strike") or e["strike"]
-                            on = _parse_mdy(e["date"]) or date.min
-                            olds = sorted((l for l, q in cycle["calls"].items()
-                                           if q > 0 and l[0] == k and l != leg
-                                           and (_parse_mdy(l[1]) or date.max) >= on),
-                                          key=lambda l: _parse_mdy(l[1]) or date.max)
-                            left = e["qty"]
-                            for old in olds:
-                                if not left:
-                                    break
-                                used = min(cycle["calls"][old], left)
-                                cycle["calls"][old] -= used
-                                left -= used
-                        signed = -e["qty"] if e["action"] == "BOT" else e["qty"]
-                        cycle["calls"][leg] = max(cycle["calls"].get(leg, 0) + signed, 0)
-                    cycle["has_option"] = True
-                    cycle["premium"]   += e["amount"]
-                    cycle["fees"]      += e["fees"]
-                    cycle["call_premium"] += e["amount"]
-                    cycle["call_fees"]    += e["fees"]
-                    cycle["stages"].append("Call")
-                    cycle["end_date"] = e["exp"]
+                    parts = _call_split(e) or [
+                        (wheel[-1] if wheel else _new(e["strike"], e["date"]), e["qty"])]
+                    amt_left, fee_left = e["amount"], e["fees"]
+                    for i, (cycle, n) in enumerate(parts):
+                        if i == len(parts) - 1:     # last part takes the rounding
+                            amt, fee = round(amt_left, 2), round(fee_left, 2)
+                        else:
+                            amt = round(e["amount"] * n / e["qty"], 2)
+                            fee = round(e["fees"] * n / e["qty"], 2)
+                        amt_left -= amt
+                        fee_left -= fee
+                        ce = dict(e, qty=n, amount=amt, fees=fee)
+                        # Open calls per (strike, exp), so a later close, roll or
+                        # called-away sale can find the cycle that wrote them.
+                        if ce.get("action") in ("SOLD", "BOT"):
+                            leg = (ce["strike"], ce["exp"])
+                            if ce.get("roll") and ce.get("close_exp"):
+                                old = (ce.get("close_strike") or ce["strike"], ce["close_exp"])
+                                cycle["calls"][old] = max(cycle["calls"].get(old, 0) - ce["qty"], 0)
+                            elif ce.get("roll") and ce.get("action") == "SOLD":
+                                # Events stored before close_exp was recorded name
+                                # the closing strike at most. Without retiring the
+                                # leg it replaced, every rolled call stays "open"
+                                # forever (SNPS showed its 11/20 call, rolled away
+                                # in September, as the nearest expiration). Take
+                                # the open leg at the closing strike that expires
+                                # soonest — what a roll out in time replaces. A leg
+                                # already past expiration is dead, not the one rolled.
+                                k = ce.get("close_strike") or ce["strike"]
+                                on = _parse_mdy(ce["date"]) or date.min
+                                olds = sorted((l for l, q in cycle["calls"].items()
+                                               if q > 0 and l[0] == k and l != leg
+                                               and (_parse_mdy(l[1]) or date.max) >= on),
+                                              key=lambda l: _parse_mdy(l[1]) or date.max)
+                                left = ce["qty"]
+                                for old in olds:
+                                    if not left:
+                                        break
+                                    used = min(cycle["calls"][old], left)
+                                    cycle["calls"][old] -= used
+                                    left -= used
+                            signed = -ce["qty"] if ce["action"] == "BOT" else ce["qty"]
+                            cycle["calls"][leg] = max(cycle["calls"].get(leg, 0) + signed, 0)
+                        cycle["has_option"] = True
+                        cycle["premium"]   += ce["amount"]
+                        cycle["fees"]      += ce["fees"]
+                        cycle["call_premium"] += ce["amount"]
+                        cycle["call_fees"]    += ce["fees"]
+                        cycle["stages"].append("Call")
+                        cycle["end_date"] = ce["exp"]
             else:  # stock
                 if e["action"] == "BOT":
                     # An assignment settles at the put's strike, which is how it
@@ -2090,6 +2129,84 @@ def _blended_rows(rows: list[dict]) -> list[dict]:
 # Statuses that still tie up capital. "Blended" is a per-symbol summary of rows
 # already in this set, so it displays capital but never contributes to exposure.
 _LIVE_STATUSES = ("Open", "Holding")
+
+
+def _load_account_file(path: Path) -> tuple[list[dict], dict, dict]:
+    """(events, outcomes, holdings) from an account's events file.
+
+    Raises on a missing or unreadable file; the caller decides what that means.
+    """
+    data = json.loads(path.read_text())
+    outcomes = {_outcome_unkey(k): v for k, v in data.get("outcomes", {}).items()}
+    events = data.get("events", [])
+    _drop_split_roll_duplicates(events)
+    return events, outcomes, data.get("holdings", {})
+
+
+_EXPORT_HEADER = ["Symbol", "Qty", "Unit", "Strike", "Capital", "Pct of Book",
+                  "Premium", "Expiration", "Status", "Assn/Buy Price",
+                  "Basis", "Recovery", "Tags"]
+_EXPORT_FIELDS = ["symbol", "qty", "unit", "strike", "capital", "capital_pct",
+                  "premium", "expiration", "status", "assn_price",
+                  "cost_basis", "recovery", "tags"]
+_EXPORT_NUMERIC = {"strike", "capital", "capital_pct", "premium",
+                   "assn_price", "cost_basis", "recovery"}
+
+
+def _export_num(s: str) -> str:
+    """'$28,800' / '7.8%' → '28800' / '7.8'; anything else unchanged."""
+    return s.replace("$", "").replace(",", "").replace("%", "").strip()
+
+
+def _write_exposure(w, title: str, exp: dict) -> None:
+    w.writerow([title, f"{exp.get('total', 0.0):.0f}", "at risk"])
+    w.writerow([])
+    w.writerow(["Tag", "Capital", "Pct of Book"])
+    for t, c, pct in exp.get("by_tag", []):
+        w.writerow([t, f"{c:.0f}", f"{pct:.1f}"])
+    w.writerow([])
+    w.writerow(["Note", "Tags overlap, so Pct of Book sums past 100%"])
+    if exp.get("untagged"):
+        w.writerow(["Not in durable-tags.json", ", ".join(exp["untagged"])])
+
+
+def write_chat_export(fh, books: list[tuple[str, list[dict]]]) -> int:
+    """Write the "Export for Chat" CSV for ``books`` [(account, rows), …].
+
+    ``rows`` are _reconstruct_wheels() output. Live positions only — exposure
+    counts nothing else, so the on-screen range filter can't change them.
+    Numbers are written bare (no $, no %, no thousands separators) so they
+    arrive as numbers rather than strings. Returns the live positions written.
+    """
+    w = csv.writer(fh)
+    n_live = 0
+    all_live: list[dict] = []
+    for i, (acct, rows) in enumerate(books):
+        rows = [dict(r) for r in rows]          # annotation writes into them
+        exp = _annotate_tags_and_capital(rows)
+        live = sorted((r for r in rows if r["status"] in _LIVE_STATUSES),
+                      key=_row_sort_key)
+        all_live += live
+        n_live += len(live)
+        if i:
+            w.writerow([])
+            w.writerow([])
+        w.writerow(["Positions", acct or "account", str(date.today())])
+        w.writerow([])
+        w.writerow(_EXPORT_HEADER)
+        for r in live:
+            w.writerow([_export_num(str(r.get(f, ""))) if f in _EXPORT_NUMERIC
+                        else str(r.get(f, "")) for f in _EXPORT_FIELDS])
+        w.writerow([])
+        _write_exposure(w, "Tag Exposure", exp)
+
+    if len(books) > 1:
+        combined = _annotate_tags_and_capital([dict(r) for r in all_live])
+        w.writerow([])
+        w.writerow([])
+        _write_exposure(w, "Tag Exposure (all " + str(len(books)) + " accounts)",
+                        combined)
+    return n_live
 
 
 def _annotate_tags_and_capital(rows: list[dict]) -> dict:

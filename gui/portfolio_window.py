@@ -1,9 +1,10 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QDateEdit, QMessageBox,
-    QDialog, QTextBrowser, QDialogButtonBox,
+    QDialog, QTextBrowser, QDialogButtonBox, QToolButton, QMenu,
+    QWidgetAction, QCheckBox,
 )
-from PyQt6.QtCore import QDate
+from PyQt6.QtCore import QDate, QSettings
 
 from . import account_store
 from .positions_tab import PortfolioTab
@@ -163,9 +164,19 @@ class PortfolioWindow(QMainWindow):
 
         # ── Shared top bar ────────────────────────────────────────────────────
         import_btn   = QPushButton("Import TOS CSV…")
-        export_btn   = QPushButton("Export for Chat…")
-        export_btn.setToolTip("Write live positions and tag exposure to a CSV "
-                              "file, ready to upload to a chat.")
+        # A drop-down rather than a button: tick the accounts to include, then
+        # Export. The menu is rebuilt each time it opens, so it always lists
+        # the current accounts.
+        export_btn   = QToolButton()
+        export_btn.setText("Export for Chat ▾")
+        export_btn.setToolTip("Write live positions and tag exposure for the "
+                              "ticked accounts to a CSV file, ready to upload "
+                              "to a chat.")
+        export_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_menu = QMenu(export_btn)
+        self._export_menu.aboutToShow.connect(self._build_export_menu)
+        export_btn.setMenu(self._export_menu)
+        self._export_checks: list[QCheckBox] = []
         clear_btn    = QPushButton("Clear Account")
         account_lbl  = QLabel("Account:")
         account_lbl.setStyleSheet("font-weight: bold;")
@@ -199,7 +210,6 @@ class PortfolioWindow(QMainWindow):
         self._date_to.dateChanged.connect(self._emit_range)
 
         import_btn.clicked.connect(self._positions_tab.import_csv)
-        export_btn.clicked.connect(self._positions_tab.export_for_chat)
         clear_btn.clicked.connect(self._clear_account)
 
         self._positions_tab.status_changed.connect(status_lbl.setText)
@@ -284,6 +294,54 @@ class PortfolioWindow(QMainWindow):
         if self._range_combo.currentData() != "custom":
             self._init_custom_dates()
         self._emit_range()
+
+    # ── Export for Chat ───────────────────────────────────────────────────────
+    def _build_export_menu(self):
+        """List every account as a checkbox, then an Export action.
+
+        Checkboxes (not checkable actions) so the menu stays open while you
+        tick several. The ticked set is remembered across runs; with nothing
+        remembered, the account on screen starts ticked.
+        """
+        menu = self._export_menu
+        menu.clear()
+        self._export_checks = []
+        accounts = account_store.list_accounts()
+        if not accounts:
+            menu.addAction("No accounts imported").setEnabled(False)
+            return
+
+        saved = QSettings("lso-tools", "portfolio").value(
+            "export_accounts", [], type=list)
+        chosen = set(saved) & set(accounts) or {self._account_combo.currentData()}
+        for acct in accounts:
+            box = QCheckBox(acct)
+            box.setChecked(acct in chosen)
+            box.setStyleSheet("QCheckBox { padding: 3px 12px; }")
+            box.toggled.connect(self._save_export_choice)
+            act = QWidgetAction(menu)
+            act.setDefaultWidget(box)
+            menu.addAction(act)
+            self._export_checks.append(box)
+
+        menu.addSeparator()
+        menu.addAction("Export…", self._export_selected)
+
+    def _ticked_accounts(self) -> list[str]:
+        return [b.text() for b in self._export_checks if b.isChecked()]
+
+    def _save_export_choice(self):
+        # Saved on every tick, so closing the menu without exporting keeps it.
+        QSettings("lso-tools", "portfolio").setValue(
+            "export_accounts", self._ticked_accounts())
+
+    def _export_selected(self):
+        accounts = self._ticked_accounts()
+        if not accounts:
+            QMessageBox.information(self, "Export for Chat",
+                                    "Tick at least one account to export.")
+            return
+        self._positions_tab.export_for_chat(accounts)
 
     # ── Account selection ─────────────────────────────────────────────────────
     def _activate_account(self, acct: str):

@@ -18,6 +18,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QSettings                                     # noqa: E402
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox   # noqa: E402
 
 from gui import gains_tab as g                                         # noqa: E402
@@ -94,6 +95,10 @@ class _InTempDir(unittest.TestCase):
         self._cwd = os.getcwd()
         self.tmp = tempfile.mkdtemp(prefix="lso-portfolio-test-")
         os.chdir(self.tmp)
+        # The import/export dialogs remember their folders in QSettings; keep
+        # that in the temp dir too, not the user's ~/.config.
+        QSettings.setPath(QSettings.Format.NativeFormat,
+                          QSettings.Scope.UserScope, self.tmp)
         self.stmt = Path(self.tmp) / "statement.csv"
         self.stmt.write_text(_statement())
 
@@ -432,6 +437,54 @@ class HeldSharesShowTheirCall(unittest.TestCase):
                 self.assertEqual(row["assn_price"], "22.00")
 
 
+class CallsSpanningTwoLots(unittest.TestCase):
+    """One call order can cover shares from two assignments.
+
+    IRA INTC: 600 shares from the 98 puts, 200 from the 90s, 8 calls written
+    and rolled as one order. Each order went whole to one lot, so the 200
+    read "Call expired → uncovered" while all 8 calls were open on 70s.
+    """
+
+    def test_order_is_split_by_the_contracts_each_lot_holds(self):
+        def _assigned(d, sh, k):
+            return {"sym": "Q", "date": d, "kind": "stock", "action": "BOT",
+                    "shares": float(sh), "amount": -sh * float(k), "fees": 0.0,
+                    "assigned": True}
+        events = [
+            _put("01/05/2026", 6, "01/09/2026", 600.0, strike="98"),
+            _put("01/06/2026", 2, "01/09/2026", 200.0, strike="90"),
+            _assigned("01/10/2026", 600, "98"),
+            _assigned("01/10/2026", 200, "90"),
+            # More than the 600 can cover: 6 go there, 1 to the 200.
+            _call("01/12/2026", 7, "01/16/2026", 70.0, "69"),
+            _call("01/12/2026", 1, "01/16/2026", 10.0, "69"),
+            # New calls after those expire; the 2 match the 200 exactly.
+            _call("01/20/2026", 2, "01/23/2026", 20.0, "64"),
+            _call("01/20/2026", 6, "01/23/2026", 60.0, "64"),
+            # A roll in partial fills: the last one spans both lots.
+            _call("01/21/2026", 1, "01/30/2026", 4.0, "67", close_strike="64", close_exp="01/23/2026"),
+            _call("01/21/2026", 3, "01/30/2026", 12.0, "67", close_strike="64", close_exp="01/23/2026"),
+            _call("01/21/2026", 4, "01/30/2026", 16.0, "67", close_strike="64", close_exp="01/23/2026"),
+            # Then all 8 roll as one order.
+            _call("01/22/2026", 8, "12/31/2099", 80.0, "70", close_strike="67", close_exp="01/30/2026"),
+        ]
+        rows = {r["qty"]: r for r in p._reconstruct_wheels(events, {})
+                if r["status"] == "Holding"}
+        self.assertEqual(set(rows), {"600", "200"})
+        for r in rows.values():
+            self.assertEqual((r["strike"], r["expiration"]), ("70", "12/31/2099"),
+                             r["lifecycle"])
+        # Every dollar of premium lands on one lot or the other, split by contracts.
+        total = 600.0 + 200.0 + 70 + 10 + 20 + 60 + 4 + 12 + 16 + 80
+        self.assertAlmostEqual(sum(float(r["premium"]) for r in rows.values()), total)
+        self.assertAlmostEqual(float(rows["200"]["premium"]),
+                               200.0         # its put
+                               + 10 + 10     # 1 of the 7-lot 69s, and the 1-lot
+                               + 20          # the 2-lot 64s
+                               + 8           # 2 of the 4-lot fill
+                               + 20)         # 2 of the 8-lot roll
+
+
 class Storage(_InTempDir):
     def test_vertical_and_its_split_legs_count_once(self):
         rows = list(csv.reader(io.StringIO(
@@ -468,6 +521,57 @@ class Storage(_InTempDir):
         a.migrate_legacy()
         self.assertFalse(a._LEGACY_EVENTS.exists())
         self.assertEqual(len(list(Path(self.tmp).glob("my_option_events.json.migrated-*"))), 1)
+
+
+class OvernightPosting(_InTempDir):
+    def test_row_dated_after_the_header_is_in_the_snapshot_not_a_transfer(self):
+        # TOS posts Friday's assignments dated Saturday, inside a statement
+        # "through" Friday whose Equities already reflect them. SERV's 1,000
+        # assigned shares came out twice: once invented as a transfer-in to
+        # match Equities, once from the assignment itself. Here ABC's
+        # called-away row (3/20) falls after a "through 3/19" header.
+        self.stmt.write_text(_statement().replace("through 3/31/26", "through 3/19/26", 1))
+        tab = self._import_positions()
+        self.assertEqual(tab._holdings["asof"], "03/20/2026")
+        rows = p._reconstruct_wheels(tab._events, tab._outcomes, tab._holdings)
+        abc = [(r["status"], r["lifecycle"]) for r in rows
+               if r["symbol"] == "ABC" and r["status"] != "Blended"]
+        self.assertEqual(len(abc), 1, abc)
+        self.assertEqual(abc[0][0], "Called away")
+
+        # A snapshot saved before the fix still carries the header date.
+        stale = dict(tab._holdings, asof="03/19/2026")
+        rows = p._reconstruct_wheels(tab._events, tab._outcomes, stale)
+        self.assertEqual(len([r for r in rows if r["symbol"] == "ABC"
+                              and r["status"] != "Blended"]), 1)
+
+
+class ChatExport(_InTempDir):
+    def _export(self, tab, accounts):
+        out = Path(self.tmp) / "export.csv"
+        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (str(out), ""))
+        tab.export_for_chat(accounts)
+        return list(csv.reader(io.StringIO(out.read_text())))
+
+    def test_exports_every_ticked_account_not_just_the_one_on_screen(self):
+        from gui.account_store import events_path
+        tab = self._import_positions()
+        other = "22222222SCHW (OTHER)"
+        events_path(other).write_text(events_path(ACCT).read_text())
+
+        one = self._export(tab, [ACCT])
+        both = self._export(tab, [ACCT, other])
+
+        self.assertEqual([r[1] for r in both if r and r[0] == "Positions"],
+                         [ACCT, other])
+        live = [r for r in one if len(r) == 13 and r[0] != "Symbol"]
+        self.assertTrue(live)
+        self.assertEqual(len([r for r in both if len(r) == 13 and r[0] != "Symbol"]),
+                         2 * len(live))
+        single = next(float(r[1]) for r in one if r and r[0] == "Tag Exposure")
+        combined = next(float(r[1]) for r in both
+                        if r and r[0].startswith("Tag Exposure (all"))
+        self.assertAlmostEqual(combined, 2 * single, delta=1)   # written as whole $
 
 
 class ShareBookTests(unittest.TestCase):
