@@ -9,12 +9,14 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter, QDateEdit,
     QRadioButton, QButtonGroup, QApplication, QCheckBox,
-    QFileDialog, QMessageBox,
+    QMessageBox,
 )
 
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal
 
 from . import column_help
+from .filedialogs import save_path
+from .sizing import elastic
 from .collapsible import CollapsibleGroupBox
 from .workers import OptionsWorker
 
@@ -340,6 +342,7 @@ class OptionsScannerTab(QWidget):
         # ── Buttons + status ──────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         self._candidates_label = QLabel("Run the Stock Scanner first.")
+        elastic(self._candidates_label)
         self._run_btn    = QPushButton("Run Options Scanner")
         self._stop_btn   = QPushButton("Stop")
         self._export_btn = QPushButton("Export for Claude…")
@@ -382,6 +385,7 @@ class OptionsScannerTab(QWidget):
         self._log_box.expanded_changed.connect(self._resize_for_log)
 
         self._results_box = QGroupBox("Results — 0 contracts")
+        elastic(self._results_box)
         rl = QVBoxLayout(self._results_box)
         self._table = QTableWidget(0, len(_HEADERS))
         self._table.setHorizontalHeaderLabels(_HEADERS)
@@ -511,11 +515,9 @@ class OptionsScannerTab(QWidget):
         except Exception:
             meta = {}
 
-        default = f"options-scan-{date.today()}.csv"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export options scan", default,
-            "CSV files (*.csv);;All files (*)"
-        )
+        path = save_path(self, "screener", "export_dir", "Export options scan",
+                         f"options-scan-{date.today()}.csv",
+                         "CSV files (*.csv);;All files (*)")
         if not path:
             return
 

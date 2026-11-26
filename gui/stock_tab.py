@@ -12,6 +12,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 
 from . import column_help
+from .sizing import elastic
 from .collapsible import CollapsibleGroupBox
 from .workers import StockScanWorker, UniverseWorker
 
@@ -325,6 +326,7 @@ class StockScannerTab(QWidget):
         # ── Universe ──────────────────────────────────────────────────────────
         uni_row = QHBoxLayout()
         self._universe_label = QLabel("Universe: —")
+        elastic(self._universe_label)
         self._universe_btn = QPushButton("Update Universe")
         self._universe_btn.setToolTip(
             "Refresh the scan universe from SEC EDGAR, validated against Schwab "
@@ -383,6 +385,7 @@ class StockScannerTab(QWidget):
         results_split = QSplitter(Qt.Orientation.Horizontal)
 
         self._price_box = QGroupBox("Price-Screened — 0 symbols")
+        elastic(self._price_box)          # titles carry counts and scan times
         self._price_box.setProperty("_base", "Price-Screened")
         prl = QVBoxLayout(self._price_box)
         self._price_table = _new_table(_PRICE_HEADERS, _PRICE_COLS)
@@ -390,6 +393,7 @@ class StockScannerTab(QWidget):
         results_split.addWidget(self._price_box)
 
         self._cand_box = QGroupBox("Technical Candidates — 0 candidates")
+        elastic(self._cand_box)
         self._cand_box.setProperty("_base", "Technical Candidates")
         cl = QVBoxLayout(self._cand_box)
         self._cand_table = _new_table(_HEADERS, _COLS)
