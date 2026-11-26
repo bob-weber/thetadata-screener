@@ -7,16 +7,17 @@ from collections import Counter
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QGroupBox,
     QTableWidget, QTableWidgetItem,
-    QHeaderView, QLabel, QFileDialog, QMessageBox,
+    QHeaderView, QLabel, QMessageBox,
     QAbstractItemView, QApplication,
 )
 
 from core.lso_analyzer import tags_for
 
+from .filedialogs import open_path, save_path
 from .account_store import DEFAULT_ACCT, events_path, keep_unreadable, safe_token, write_json
 from .sharebook import ShareBook
 
@@ -480,23 +481,14 @@ class PortfolioTab(QWidget):
             QMessageBox.information(self, "Export", "No account to export.")
             return
 
-        # A bare filename resolves against the working directory, so the dialog
-        # opened in the program folder every time. Start where the last export
-        # went instead — shared by every account, and kept across restarts.
-        settings = QSettings("lso-tools", "portfolio")
-        last_dir = settings.value("export_dir", "", type=str)
+        # Opens where the last export went — shared by every account.
         name = (safe_token(accounts[0]) if len(accounts) == 1
                 else f"{len(accounts)}-accounts")
-        default = f"positions-{name}-{date.today()}.csv"
-        if last_dir and Path(last_dir).is_dir():
-            default = str(Path(last_dir) / default)
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export positions for chat", default,
-            "CSV files (*.csv);;All files (*)"
-        )
+        path = save_path(self, "portfolio", "export_dir", "Export positions for chat",
+                         f"positions-{name}-{date.today()}.csv",
+                         "CSV files (*.csv);;All files (*)")
         if not path:
             return
-        settings.setValue("export_dir", str(Path(path).parent))
 
         books, skipped = [], []
         for acct in accounts:
@@ -662,19 +654,10 @@ class PortfolioTab(QWidget):
     # ── CSV import ────────────────────────────────────────────────────────────
 
     def import_csv(self):
-        # Qt only remembers the last folder for the session; keep it across
-        # restarts, as the export does.
-        settings = QSettings("lso-tools", "portfolio")
-        last_dir = settings.value("import_dir", "", type=str)
-        if not Path(last_dir).is_dir():
-            last_dir = ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import TOS Account Statement", last_dir,
-            "CSV files (*.csv);;All files (*)"
-        )
+        path = open_path(self, "portfolio", "import_dir", "Import TOS Account Statement",
+                         "CSV files (*.csv);;All files (*)")
         if not path:
             return
-        settings.setValue("import_dir", str(Path(path).parent))
 
         rows = list(csv.reader(io.StringIO(
             Path(path).read_text(encoding="utf-8-sig", errors="replace"))))

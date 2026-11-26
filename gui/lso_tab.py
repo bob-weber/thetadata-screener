@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QPushButton, QProgressBar, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QSplitter,
-    QFileDialog, QMessageBox,
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
@@ -16,6 +16,8 @@ from .claude_dialog import ClaudeAnalysisDialog
 from .chart_window import ChartWindow
 
 from . import column_help
+from .filedialogs import save_path
+from .sizing import elastic
 from .workers import LsoWorker, OPTIONS_RESULTS_CACHE
 
 _COLS    = ["grade", "symbol", "risk_tier", "max_allocation",
@@ -221,6 +223,7 @@ class LsoAnalysisTab(QWidget):
         # ── Controls ──────────────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
         self._status_label = QLabel("Run the Options Scanner first.")
+        elastic(self._status_label)       # lists untagged symbols, export paths
         self._run_btn    = QPushButton("Analyze for LSO")
         self._stop_btn   = QPushButton("Stop")
         self._export_btn = QPushButton("Export for Claude…")
@@ -259,6 +262,7 @@ class LsoAnalysisTab(QWidget):
         splitter.addWidget(log_box)
 
         self._results_box = QGroupBox("Results — 0 symbols analyzed")
+        elastic(self._results_box)
         rl = QVBoxLayout(self._results_box)
 
         legend = QLabel(
@@ -403,11 +407,9 @@ class LsoAnalysisTab(QWidget):
         except Exception:
             meta = {}
 
-        default = f"lso-analysis-{date.today()}.csv"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export LSO analysis", default,
-            "CSV files (*.csv);;All files (*)"
-        )
+        path = save_path(self, "screener", "export_dir", "Export LSO analysis",
+                         f"lso-analysis-{date.today()}.csv",
+                         "CSV files (*.csv);;All files (*)")
         if not path:
             return
 
